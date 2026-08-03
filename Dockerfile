@@ -1,9 +1,21 @@
-FROM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+ARG VERSION=dev
+ARG COMMIT=unknown
+# TARGETOS/TARGETARCH are set automatically by buildx per requested
+# --platform. Building on $BUILDPLATFORM (the host) and cross-compiling
+# via GOOS/GOARCH, instead of emulating the whole build under QEMU, is what
+# makes multi-arch builds (e.g. linux/amd64 and linux/arm64 from the same
+# amd64 CI runner) fast: only the final, do-nothing-but-COPY stage below
+# needs the target architecture at all.
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -o /out/keep-at ./cmd/keep-at
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
+    -ldflags "-X github.com/tweedge/keep-at/internal/buildinfo.Version=${VERSION} -X github.com/tweedge/keep-at/internal/buildinfo.Commit=${COMMIT}" \
+    -o /out/keep-at ./cmd/keep-at
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates

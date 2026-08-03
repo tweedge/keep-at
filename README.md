@@ -1,22 +1,41 @@
 # keep-at
 
-keep-at is a standalone Go daemon that seeds [Academic Torrents](https://academictorrents.com) automatically - the name is "keep academic torrents at seeding." Point it at some disk space, and it fills that space with whatever's most in need of seeding right now, favoring torrents with few seeds over torrents that are already healthy. The goal is to spread seeding load across the AT catalog instead of everyone piling onto the same popular torrents while obscure datasets rot with one seed.
+keep-at is a standalone Go daemon that seeds [Academic Torrents](https://academictorrents.com) automatically. Point it at some disk space, and it fills that space with whatever's most in need of seeding right now, favoring torrents with few seeds over torrents that are already healthy. The goal is to spread seeding load across the AT catalog instead of everyone piling onto the same popular torrents while obscure datasets rot with one seed (or fall to zero seeds and are lost).
 
-It's built on [anacrolix/torrent](https://github.com/anacrolix/torrent) and runs on whatever you've got: a Raspberry Pi, a home server, a Debian VM, or a container.
+It's built on [anacrolix/torrent](https://github.com/anacrolix/torrent) and runs on whatever you've got: a Raspberry Pi, a whole server, a VM, or a container.
 
-## Using keep-at
+## Usage
 
 ### Installing
 
-Prebuilt binaries for common platforms (Linux amd64/arm64/arm/386, macOS amd64/arm64, Windows amd64) come from `scripts/build-release.sh`, which cross-compiles and packages each target the same way `keep-at self-update` expects to find them on GitHub releases.
+The easiest way, on Linux or macOS:
 
-To build from source, you need Go 1.26+:
+```
+curl -fsSL https://raw.githubusercontent.com/tweedge/keep-at/main/scripts/install.sh | sh
+```
+
+That fetches the latest [release](https://github.com/tweedge/keep-at/releases), picks the right binary for your OS/architecture, and installs it to `/usr/local/bin` (or `~/.local/bin` if you're not root and can't write there). Pass `VERSION=v1.2.3` before the pipe to install a specific version instead of the latest. Prebuilt binaries cover Linux (amd64/arm64/arm/386), macOS (amd64/arm64), and Windows (amd64); the install script itself only handles Linux and macOS, since it's meant to be piped straight into `sh`. On Windows, download the `.tar.gz` for your architecture from the [releases page](https://github.com/tweedge/keep-at/releases) and extract it manually.
+
+Or run the prebuilt image in Docker, no Go toolchain needed:
+
+```
+docker run -v ./data:/data -v ./storage:/storage ghcr.io/tweedge/keep-at:latest --storage-limit 500G
+```
+
+Building from source (needs Go 1.26+) is only necessary if you're modifying keep-at itself:
 
 ```
 go build -o keep-at ./cmd/keep-at
 ```
 
-### Quick start
+or to build the Docker image locally instead of pulling it:
+
+```
+docker build -t keep-at .
+docker run -v ./data:/data -v ./storage:/storage keep-at --storage-limit 500G
+```
+
+### Quick Start
 
 A config file is optional. Every setting has a flag, and there's a sensible default storage location for your OS already - the only thing keep-at won't guess is how much space you're willing to give it:
 
@@ -24,14 +43,7 @@ A config file is optional. Every setting has a flag, and there's a sensible defa
 keep-at run --storage-limit 500G
 ```
 
-That's enough to get going. `keep-at run --help` lists every other flag (port, aggressiveness, scan interval, rate limit, and so on), all with reasonable defaults.
-
-Run it in Docker instead:
-
-```
-docker build -t keep-at .
-docker run -v ./data:/data -v ./storage:/storage keep-at --storage-limit 500G
-```
+That's the only variable you need to set to start. `keep-at run --help` lists every other flag (port, aggressiveness, scan interval, rate limit, and so on), all with reasonable defaults.
 
 Inside a container, `start` automatically runs in the foreground instead of daemonizing - daemonizing would just exit the entrypoint and kill the container.
 
@@ -117,3 +129,14 @@ KEEPAT_SMOKE_TEST=1 go test ./internal/engine/...        # full scan against a c
 ```
 
 The smoke test downloads two real files from Academic Torrents (a few KB each) into a temp directory under a 1GB cap and confirms they land on disk compressed and correct.
+
+## Releasing
+
+Pushing a version tag is all it takes:
+
+```
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+Two GitHub Actions workflows watch for tags matching `v*.*.*`: `.github/workflows/release.yml` cross-compiles every platform in `scripts/build-release.sh` and publishes them as a GitHub release, and `.github/workflows/docker.yml` builds a multi-arch (amd64/arm64) image and pushes it to `ghcr.io/tweedge/keep-at` tagged with the version, the `major.minor`, and `latest`. Neither needs any repo secrets - both run entirely on the `GITHUB_TOKEN` Actions provides automatically.

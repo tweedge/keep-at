@@ -1,0 +1,57 @@
+name: docker
+
+# Builds and publishes a multi-arch (amd64 + arm64) keep-at image to the
+# GitHub Container Registry whenever a version tag is pushed, e.g.:
+#
+#   git tag v1.2.3 && git push origin v1.2.3
+#
+# Needs no repo secrets: GITHUB_TOKEN is provided automatically by
+# Actions, and the `packages: write` permission below is what lets this
+# workflow push to ghcr.io/<owner>/<repo>.
+#
+# The first image ever pushed to a new GHCR package is private by
+# default; see the README for the one-time step to make it public.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}

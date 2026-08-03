@@ -2,13 +2,13 @@
 
 This is the authoritative explanation of *why* keep-at behaves the way it does: the selection math, the deliberate simplifications, and what's still missing. The README covers how to run it; this covers how it thinks.
 
-## How it decides what to seed
+## Deciding what to seed
 
 Every scan, keep-at pulls Academic Torrents' catalog (`database.xml`), filters out anything keyword-blocked or too young (see "Age, precisely" below), and checks the remaining candidates' tracker scrape data. A torrent needs at least one live seed to be considered "available" - keep-at won't start a download that can never finish.
 
 Among available candidates, fewer seeds means higher priority. If keep-at has free space, it fills it with the highest-priority candidate it can. If space is full, it'll displace currently-held torrents for a new candidate, but only if the candidate has at least `min_seed_margin` (default 3) fewer seeds than everything it would replace.
 
-## The anti-cascade check
+## Avoiding herd mentality
 
 Before committing to a download, keep-at checks how many other keep-at nodes are already in that torrent's swarm (it identifies itself in the BitTorrent extended handshake, and looks for peers reporting the same string). This exists to stop every keep-at node globally from swapping to the same under-seeded torrent at once and just moving the problem somewhere else. The chance keep-at proceeds is:
 
@@ -32,13 +32,15 @@ A candidate can be bigger than any single held torrent. When that happens, keep-
 
 This is a greedy selection, not a minimal one - it doesn't search for the smallest possible subset that would fit, just the first prefix (by seeders descending) that does. That keeps the logic simple and predictable at the cost of occasionally evicting one more torrent than a smarter bin-packing solution would need.
 
-## Availability, precisely
+## Reasoning quickly about availability (for choosing torrents)
 
 A torrent could theoretically be "available" with zero full seeds, if enough partial peers between them happen to cover 100% of the data. keep-at doesn't attempt to detect that case: verifying it means inspecting every peer's piece map across the whole swarm, which is expensive to do for every catalog candidate on every scan. keep-at uses the cheaper, conservative signal instead - at least one live seed - and accepts that this misses the rare fragmented-but-complete swarm.
 
-## Age, precisely
+**Note: I'm not wedded to this, and might make availability checks more expensive in the future**
 
-Academic Torrents' `database.xml` doesn't include an upload date, and neither does their API - the closest thing, a paper's publication date, isn't the same thing and would make the moderation delay meaningless. Instead, keep-at reads the `creation date` field baked into each `.torrent` file at fetch time, which is stable and set when the torrent was created (verified against torrents from 2013 through 2026 while building this). A torrent needs to be at least `moderation_delay` old (default 7 days) before keep-at will touch it, giving Academic Torrents' moderators time to catch anything that shouldn't be there. If keep-at can't determine a torrent's age at all, it treats that as not yet eligible rather than assuming it's fine.
+## Reasoning conservatively about age (for moderation)
+
+Academic Torrents' `database.xml` doesn't include an upload date, and neither does their API - the closest thing, a paper's publication date, isn't the same thing and would make the moderation delay meaningless. Instead, keep-at reads the `creation date` field baked into each `.torrent` file at fetch time, which is set when the torrent was created (verified against torrents from 2013 through 2026 while building this). A torrent needs to be at least `moderation_delay` old (default 7 days) before keep-at will touch it, giving Academic Torrents' staff time to catch anything that shouldn't be there and boot it off the platform - helping ensure your keep-at node never picks up data you don't want it to seed. If keep-at can't determine a torrent's age at all, it treats that as not yet eligible rather than assuming it's fine.
 
 ## Network-wide stats
 
@@ -54,11 +56,13 @@ Progress reporting (`processed/total candidates`) is based on how many catalog e
 
 ## Storage
 
-keep-at stores each verified piece as its own gzip-compressed file, keyed by piece index under a directory named after the torrent's infohash. There's no attempt to reconstruct the original file layout on disk - stored data doesn't need to be locally readable, and giving up on that constraint is what makes per-piece compression simple. Deleting a torrent just removes its directory.
+keep-at stores each verified piece as its own gzip-compressed file, keyed by piece index under a directory named after the torrent's infohash. There's no attempt to reconstruct the original file layout on disk - keep-at prioritized conflict-free, efficient local storage, rather than being locally readable. Giving up on that constraint makes per-piece compression simple. Deleting a torrent just removes its directory and pieces.
 
-Cross-torrent deduplication (storing identical pieces once even if they appear in multiple torrents) was considered and deliberately left out. Exact piece-level duplicates across unrelated academic datasets are rare enough that the added complexity (a content-addressable store with reference counting and garbage collection) wasn't worth it for the space it'd actually save. Compression alone still helps a lot with the kind of data Academic Torrents hosts - text, tabular data, and other formats that compress well.
+To download torrents you *personally want* from AT - use your torrent client normally.
 
-## What's not implemented yet
+Cross-torrent deduplication (storing identical pieces once even if they appear in multiple torrents) was considered and deliberately left out. Exact piece-level duplicates across unrelated academic datasets are rare enough that the added complexity (a content-addressable store with reference counting and garbage collection) wasn't worth it for the space it'd actually save. Compression alone still helps for the occasional torrent which is textual data.
+
+## Todos
 
 * **macOS and Windows service management.** The binary runs fine on both; `keep-at service install` doesn't (systemd/Linux only).
 * **Peer-map availability.** See "Availability, precisely" above.
