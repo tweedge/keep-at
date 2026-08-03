@@ -127,11 +127,11 @@ The smoke test downloads two real files from Academic Torrents (a few KB each) i
 
 ## Releasing
 
-Pushing a version tag is all it takes:
+Update `RELEASE_NOTES.md` at the repo root with what's actually in the release, commit it, then push a matching version tag:
 
 ```
 git tag v1.2.3
 git push origin v1.2.3
 ```
 
-Two GitHub Actions workflows watch for tags matching `v*.*.*`: `.github/workflows/release.yml` cross-compiles every platform in `scripts/build-release.sh` and publishes them as a GitHub release, and `.github/workflows/docker.yml` builds a multi-arch (amd64/arm64) image and pushes it to `ghcr.io/tweedge/keep-at` tagged with the version, the `major.minor`, and `latest`. Neither needs any repo secrets - both run entirely on the `GITHUB_TOKEN` Actions provides automatically.
+Two GitHub Actions workflows watch for tags matching `v*.*.*`: `.github/workflows/release.yml` cross-compiles every platform in `scripts/build-release.sh` and publishes them as a GitHub release using `RELEASE_NOTES.md` as the release notes, and `.github/workflows/docker.yml` builds a multi-arch (amd64/arm64) image and pushes it to `ghcr.io/tweedge/keep-at` tagged with the version, the `major.minor`, and `latest`. Neither needs any repo secrets - both run entirely on the `GITHUB_TOKEN` Actions provides automatically.

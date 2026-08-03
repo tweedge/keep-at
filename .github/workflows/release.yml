@@ -21,8 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # need the full annotated tag object for --notes-from-tag below
 
       - uses: actions/setup-go@v5
         with:
@@ -37,8 +35,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -x
           ls -la dist/
+          notes_file="RELEASE_NOTES.md"
+          if [ ! -f "$notes_file" ]; then
+            notes_file=/dev/null
+          fi
           gh release create "${{ github.ref_name }}" dist/*.tar.gz \
             -R "${{ github.repository }}" \
             --title "${{ github.ref_name }}" \
-            --notes-from-tag
+            --notes-file "$notes_file"
