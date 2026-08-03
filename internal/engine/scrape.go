@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -51,4 +52,32 @@ func isAcademicTorrentsHost(trackerURL string) bool {
 		return false
 	}
 	return strings.Contains(u.Host, "academictorrents.com")
+}
+
+// rateLimitedTrackerDialer wraps a plain net.Dialer with e's Academic
+// Torrents rate limiter, gated on the destination address rather than a
+// URL. anacrolix/torrent's own client re-announces to every tracker in a
+// torrent's spec on its own schedule, entirely outside scrapeSwarm and
+// attorrent.Fetcher - without this, that automatic announcing hits
+// academictorrents.com's tracker uncontrolled, which in real testing
+// against the full catalog got keep-at rate-limited (HTTP 429) by AT
+// itself. Passed to ClientConfig.TrackerDialContext on every torrent
+// client keep-at creates (see newTorrentClient) so every path to AT's
+// tracker - our own scrapes and the library's automatic announces alike -
+// shares one budget.
+func (e *Engine) rateLimitedTrackerDialer(ctx context.Context, network, addr string) (net.Conn, error) {
+	if isAcademicTorrentsAddr(addr) && e.torrentFetcher.Limiter != nil {
+		if err := e.torrentFetcher.Limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
+}
+
+func isAcademicTorrentsAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return strings.Contains(host, "academictorrents.com")
 }

@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
+	analog "github.com/anacrolix/log"
 	"github.com/anacrolix/torrent"
 	"golang.org/x/time/rate"
 
@@ -29,9 +31,18 @@ type Engine struct {
 	logger *slog.Logger
 
 	torrentClient *torrent.Client
-	stores        map[string]*piecestore.Client // keyed by storage location path
-	probeStore    *piecestore.Client            // scratch storage for swarm-probing candidates, see probe.go
-	state         *state.State
+
+	// probeTorrentClient is used only for swarm probing (see probe.go) and
+	// is recreated wholesale at the start of every scan (resetProbeClient)
+	// rather than having individual torrents dropped from it - see that
+	// method's comment for why. probeClientMu guards reassignment against
+	// the concurrent probes that read it during evaluateCandidates.
+	probeClientMu      sync.RWMutex
+	probeTorrentClient *torrent.Client
+
+	stores     map[string]*piecestore.Client // keyed by storage location path
+	probeStore *piecestore.Client            // scratch storage for swarm-probing candidates, see probe.go
+	state      *state.State
 
 	catalogFetcher *atcatalog.Fetcher
 	torrentFetcher *attorrent.Fetcher
@@ -130,11 +141,18 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		e.probeTimeout = opts.ProbeTimeout
 	}
 
-	torrentClient, err := e.newTorrentClient(cfg)
+	torrentClient, err := e.newTorrentClient(cfg.Port, false)
 	if err != nil {
 		return nil, err
 	}
 	e.torrentClient = torrentClient
+
+	// A second, DHT-disabled client used only for swarm probing - see
+	// resetProbeClient for why it's DHT-disabled and recreated wholesale
+	// rather than having individual torrents dropped from it.
+	if err := e.resetProbeClient(); err != nil {
+		return nil, fmt.Errorf("engine: starting probe torrent client: %w", err)
+	}
 
 	if err := e.resumeHeldTorrents(); err != nil {
 		return nil, fmt.Errorf("engine: resuming held torrents: %w", err)
@@ -143,13 +161,34 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 	return e, nil
 }
 
-func (e *Engine) newTorrentClient(cfg config.Config) (*torrent.Client, error) {
+func (e *Engine) newTorrentClient(listenPort int, noDHT bool) (*torrent.Client, error) {
 	tcfg := torrent.NewDefaultClientConfig()
-	tcfg.ListenPort = cfg.Port
+	tcfg.ListenPort = listenPort
 	tcfg.Seed = true
-	tcfg.DataDir = cfg.DataDir
+	tcfg.DataDir = e.cfg.DataDir
 	tcfg.ExtendedHandshakeClientVersion = buildinfo.ExtendedHandshakeVersion()
 	tcfg.Bep20 = buildinfo.PeerIDPrefix
+	tcfg.NoDHT = noDHT
+
+	// The torrent library re-announces to every tracker in a torrent's
+	// spec on its own schedule, independent of scrapeSwarm/attorrent's
+	// rate limiting. Routing tracker dials through the same limiter keeps
+	// that automatic traffic to academictorrents.com under the same
+	// budget as keep-at's own requests - see rateLimitedTrackerDialer.
+	tcfg.TrackerDialContext = e.rateLimitedTrackerDialer
+
+	// Academic Torrents' catalog spans over a decade of uploads: plenty of
+	// torrents have malformed webseed URLs or long-dead third-party
+	// trackers, and anacrolix/torrent logs a warning for every single
+	// failed attempt against either. At full-catalog scale that's an
+	// overwhelming volume of expected, non-actionable noise. Setting
+	// ClientConfig.Logger's filter level (not Slogger - the library's
+	// bridge from its own Logger to Slogger doesn't reliably route every
+	// internal warning through a wrapped Slogger, verified empirically)
+	// is what actually suppresses it. keep-at's own logging (scan
+	// progress, its own request failures) is unaffected - this only
+	// silences the underlying library's internal chatter.
+	tcfg.Logger = analog.Default.WithFilterLevel(analog.Error)
 
 	// Every torrent gets its storage assigned explicitly per-location in
 	// addTorrentToClient, but the library still wants a default in case
@@ -162,6 +201,60 @@ func (e *Engine) newTorrentClient(cfg config.Config) (*torrent.Client, error) {
 	}
 
 	return torrent.NewClient(tcfg)
+}
+
+// resetProbeClient closes any existing probe torrent client and starts a
+// fresh one. Called once at Engine startup and again at the start of
+// every scan (see ScanOnce).
+//
+// Probing works by adding a torrent to this client just long enough to
+// see who's in its swarm, then - in earlier versions of this code -
+// dropping it again immediately. anacrolix/torrent v1.61.0 has more than
+// one internal race between a torrent's background per-torrent goroutines
+// (DHT announcing, regular tracker announcing) and that same torrent
+// being dropped or re-added in quick succession; both surfaced as a fatal,
+// unrecoverable "sync: Unlock of unlocked RWMutex" that killed the whole
+// process, not just the affected torrent, during a real full-catalog scan.
+//
+// Rather than drop torrents individually (and keep finding new variations
+// of this race), probed torrents are simply never dropped - they
+// accumulate in this client for the rest of the current scan, which is
+// harmless since they hold no real data and never attempt one. The whole
+// client is discarded and replaced at the start of the next scan, which
+// releases everything at once through a code path that doesn't share the
+// per-torrent add/drop race. See DESIGN.md.
+//
+// DHT stays disabled specifically on this client (unlike the main one)
+// because DHT's own per-torrent announce goroutine was one of the two
+// concrete triggers found for this bug, and DHT isn't needed to answer
+// "who else is in this swarm right now" - regular trackers are enough for
+// that, and this client's torrents are never kept around long enough for
+// DHT's slower discovery to matter anyway.
+func (e *Engine) resetProbeClient() error {
+	e.probeClientMu.Lock()
+	defer e.probeClientMu.Unlock()
+
+	old := e.probeTorrentClient
+	newClient, err := e.newTorrentClient(0, true)
+	if err != nil {
+		return err
+	}
+	e.probeTorrentClient = newClient
+
+	if old != nil {
+		// Safe to close synchronously: this is only ever called once the
+		// previous scan's evaluateCandidates has fully returned (all of
+		// its probes finished), or at Engine startup when there's no old
+		// client at all.
+		old.Close()
+	}
+	return nil
+}
+
+func (e *Engine) currentProbeClient() *torrent.Client {
+	e.probeClientMu.RLock()
+	defer e.probeClientMu.RUnlock()
+	return e.probeTorrentClient
 }
 
 // networkStatsPath is where the current scan's network-wide stats are
@@ -177,13 +270,21 @@ func NetworkStatsPath(cfg config.Config) string {
 	return cfg.DataDir + "/network-stats.json"
 }
 
-// Close shuts down the BitTorrent client. It does not delete any data.
+// Close shuts down both BitTorrent clients. It does not delete any data.
 func (e *Engine) Close() error {
+	var errs []error
 	if e.torrentClient != nil {
-		errs := e.torrentClient.Close()
-		if len(errs) > 0 {
-			return fmt.Errorf("engine: closing torrent client: %v", errs)
+		for _, err := range e.torrentClient.Close() {
+			errs = append(errs, err)
 		}
+	}
+	if probeClient := e.currentProbeClient(); probeClient != nil {
+		for _, err := range probeClient.Close() {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("engine: closing torrent clients: %v", errs)
 	}
 	return nil
 }

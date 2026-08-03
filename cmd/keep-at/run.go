@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/tweedge/keep-at/internal/config"
 	"github.com/tweedge/keep-at/internal/engine"
@@ -39,15 +40,17 @@ func runForeground(cfg config.Config) error {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
+	startedAt := time.Now()
 	e, err := engine.New(cfg, engine.Options{Logger: logger})
 	if err != nil {
 		return fmt.Errorf("starting engine: %w", err)
 	}
 	defer e.Close()
+	startupDuration := time.Since(startedAt)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	logger.Info("keep-at started", "port", cfg.Port, "data_dir", cfg.DataDir)
+	logger.Info("keep-at started", "port", cfg.Port, "data_dir", cfg.DataDir, "startup_time", startupDuration.String())
 	return e.Run(ctx)
 }

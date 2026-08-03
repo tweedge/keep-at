@@ -2,8 +2,11 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tweedge/keep-at/internal/atcatalog"
@@ -13,6 +16,23 @@ import (
 	"github.com/tweedge/keep-at/internal/selector"
 	"github.com/tweedge/keep-at/internal/state"
 )
+
+// evaluateConcurrency bounds how many candidates keep-at evaluates (and,
+// for available ones, probes the swarm of) at once. Fetching a torrent
+// file and scraping a tracker are still globally rate-limited against
+// Academic Torrents regardless of this (see attorrent.Fetcher.Limiter) -
+// this only parallelizes the part of evaluation that isn't AT-bound, most
+// importantly the swarm probe, which can wait several seconds per
+// candidate for peer connections. Run sequentially, a catalog with a few
+// thousand available candidates would take hours; run with this much
+// concurrency, it's minutes.
+const evaluateConcurrency = 16
+
+// progressSaveInterval is how often ScanOnce persists a network-status
+// snapshot while candidates are being evaluated concurrently, rather than
+// after every single one (which would need its own synchronization for
+// no real benefit - nothing is watching that closely).
+const progressSaveInterval = 2 * time.Second
 
 // evaluatedCandidate is a catalog item keep-at has fetched metadata and a
 // fresh scrape (and, if anyone was around to scrape, a swarm probe) for,
@@ -32,8 +52,14 @@ type evaluatedCandidate struct {
 // network-wide stats gathered along the way are persisted incrementally so
 // `keep-at network-status` can report on a scan that's still running.
 func (e *Engine) ScanOnce(ctx context.Context) error {
-	snapshot := netstats.Snapshot{ScanStartedAt: time.Now().UTC()}
-	e.saveNetworkStats(snapshot)
+	scanStartedAt := time.Now().UTC()
+	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt})
+
+	// Fresh probe client per scan - see resetProbeClient for why this
+	// matters for stability, not just tidiness.
+	if err := e.resetProbeClient(); err != nil {
+		return fmt.Errorf("engine: resetting probe client: %w", err)
+	}
 
 	catalog, err := e.catalogFetcher.Load(ctx, e.cfg.Scan.Interval.AsDuration())
 	if err != nil && len(catalog.Items) == 0 {
@@ -42,6 +68,7 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	if err != nil {
 		e.logger.Warn("catalog refresh failed, continuing with stale cache", "err", err)
 	}
+	e.logger.Info("catalog loaded", "items", len(catalog.Items))
 
 	catalogHashes := make(map[string]bool, len(catalog.Items))
 	for _, item := range catalog.Items {
@@ -57,20 +84,26 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	e.removeDeletedTorrents(held, catalogHashes)
 	e.refreshHeldSeederCounts(ctx, held, catalogHashes)
 
-	snapshot.TotalCandidates = countPendingCandidates(catalog, heldHashes, e.blocklist)
-	e.saveNetworkStats(snapshot)
+	totalCandidates := countPendingCandidates(catalog, heldHashes, e.blocklist)
+	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt, TotalCandidates: totalCandidates})
+	e.logger.Info("evaluating candidates", "total", totalCandidates)
 
 	tracker := netstats.NewTracker()
-	candidates := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, &snapshot)
+	candidates, processedCount := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates)
+	e.logger.Info("candidates evaluated", "available", len(candidates), "processed", processedCount, "total", totalCandidates)
 
 	ranked := rankEvaluated(candidates)
 	actErr := e.actOnRanked(ctx, ranked)
 
-	snapshot.ScanCompletedAt = time.Now().UTC()
-	snapshot.NodeCount = tracker.NodeCount()
-	snapshot.SeedingBytes = tracker.SeedingBytes()
-	snapshot.LeechingBytes = tracker.LeechingBytes()
-	e.saveNetworkStats(snapshot)
+	e.saveNetworkStats(netstats.Snapshot{
+		ScanStartedAt:       scanStartedAt,
+		ScanCompletedAt:     time.Now().UTC(),
+		TotalCandidates:     totalCandidates,
+		ProcessedCandidates: processedCount,
+		NodeCount:           tracker.NodeCount(),
+		SeedingBytes:        tracker.SeedingBytes(),
+		LeechingBytes:       tracker.LeechingBytes(),
+	})
 
 	return actErr
 }
@@ -115,20 +148,23 @@ func (e *Engine) refreshHeldSeederCounts(ctx context.Context, held []state.Torre
 		if !catalogHashes[h.InfoHash.HexString()] {
 			continue // just removed above
 		}
-		md, err := e.fetchMetadata(ctx, h.InfoHash)
-		if err != nil {
-			e.logger.Warn("could not refresh metadata for held torrent", "title", h.Title, "err", err)
-			continue
-		}
-		swarm, err := e.scrapeSwarm(ctx, md.Trackers, h.InfoHash)
-		if err != nil {
-			e.logger.Warn("could not scrape held torrent", "title", h.Title, "err", err)
-			continue
-		}
-		h.LastKnownSeeders = swarm.Seeders
-		if err := e.state.Put(h); err != nil {
-			e.logger.Error("failed to persist refreshed seeder count", "title", h.Title, "err", err)
-		}
+		h := h
+		safely(e.logger, "refreshing seeder count for "+h.Title, func() {
+			md, err := e.fetchMetadata(ctx, h.InfoHash)
+			if err != nil {
+				e.logger.Warn("could not refresh metadata for held torrent", "title", h.Title, "err", err)
+				return
+			}
+			swarm, err := e.scrapeSwarm(ctx, md.Trackers, h.InfoHash)
+			if err != nil {
+				e.logger.Warn("could not scrape held torrent", "title", h.Title, "err", err)
+				return
+			}
+			h.LastKnownSeeders = swarm.Seeders
+			if err := e.state.Put(h); err != nil {
+				e.logger.Error("failed to persist refreshed seeder count", "title", h.Title, "err", err)
+			}
+		})
 	}
 }
 
@@ -138,14 +174,57 @@ func (e *Engine) refreshHeldSeederCounts(ctx context.Context, held []state.Torre
 // possible) and tracker scrape. Every candidate anyone at all is seeding
 // or leeching also gets a quick swarm probe, which feeds both the
 // anti-cascade decision later and the network-wide stats in tracker.
-func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, snapshot *netstats.Snapshot) []evaluatedCandidate {
+//
+// Candidates are evaluated concurrently (see evaluateConcurrency); order
+// doesn't matter here since rankEvaluated sorts the result afterward.
+func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, scanStartedAt time.Time, totalCandidates int) ([]evaluatedCandidate, int) {
 	now := time.Now().UTC()
 	minAge := e.cfg.Scan.ModerationDelay.AsDuration()
 
-	var out []evaluatedCandidate
+	var (
+		mu        sync.Mutex
+		out       []evaluatedCandidate
+		processed atomic.Int64
+		wg        sync.WaitGroup
+	)
+	sem := make(chan struct{}, evaluateConcurrency)
+
+	// currentSnapshot builds a fresh, self-contained snapshot from
+	// thread-safe sources only (an atomic counter and tracker's own
+	// mutex-guarded getters) - nothing here is a shared struct mutated by
+	// multiple goroutines, which is what let the periodic save below and
+	// the final save race safely.
+	currentSnapshot := func() netstats.Snapshot {
+		return netstats.Snapshot{
+			ScanStartedAt:       scanStartedAt,
+			TotalCandidates:     totalCandidates,
+			ProcessedCandidates: int(processed.Load()),
+			NodeCount:           tracker.NodeCount(),
+			SeedingBytes:        tracker.SeedingBytes(),
+			LeechingBytes:       tracker.LeechingBytes(),
+		}
+	}
+
+	stopProgress := make(chan struct{})
+	progressStopped := make(chan struct{})
+	go func() {
+		defer close(progressStopped)
+		ticker := time.NewTicker(progressSaveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopProgress:
+				return
+			case <-ticker.C:
+				e.saveNetworkStats(currentSnapshot())
+			}
+		}
+	}()
+
+catalogLoop:
 	for _, item := range catalog.Items {
 		if ctx.Err() != nil {
-			return out
+			break catalogLoop
 		}
 		if heldHashes[item.InfoHash.HexString()] {
 			continue
@@ -155,32 +234,54 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 			continue
 		}
 
-		out = e.evaluateOneCandidate(ctx, item, now, minAge, tracker, out)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break catalogLoop
+		}
 
-		snapshot.ProcessedCandidates++
-		snapshot.NodeCount = tracker.NodeCount()
-		snapshot.SeedingBytes = tracker.SeedingBytes()
-		snapshot.LeechingBytes = tracker.LeechingBytes()
-		e.saveNetworkStats(*snapshot)
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer processed.Add(1)
+
+			safely(e.logger, "evaluating "+item.Title, func() {
+				c, ok := e.evaluateOneCandidate(ctx, item, now, minAge, tracker)
+				if !ok {
+					return
+				}
+				mu.Lock()
+				out = append(out, c)
+				mu.Unlock()
+			})
+		}()
 	}
-	return out
+
+	wg.Wait()
+	close(stopProgress)
+	<-progressStopped
+
+	e.saveNetworkStats(currentSnapshot())
+	return out, int(processed.Load())
 }
 
-func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, now time.Time, minAge time.Duration, tracker *netstats.Tracker, out []evaluatedCandidate) []evaluatedCandidate {
+func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, now time.Time, minAge time.Duration, tracker *netstats.Tracker) (evaluatedCandidate, bool) {
 	md, err := e.fetchMetadata(ctx, item.InfoHash)
 	if err != nil {
 		e.logger.Warn("skipping candidate: could not fetch torrent metadata", "title", item.Title, "err", err)
-		return out
+		return evaluatedCandidate{}, false
 	}
 
 	if !filter.AgeEligible(md.CreatedAt, minAge, now) {
-		return out
+		return evaluatedCandidate{}, false
 	}
 
 	swarm, err := e.scrapeSwarm(ctx, md.Trackers, item.InfoHash)
 	if err != nil {
 		e.logger.Warn("skipping candidate: could not scrape trackers", "title", item.Title, "err", err)
-		return out
+		return evaluatedCandidate{}, false
 	}
 
 	keepAtPeerCount := 0
@@ -196,7 +297,7 @@ func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, 
 		keepAtPeerCount = len(observed)
 	}
 
-	return append(out, evaluatedCandidate{title: item.Title, metadata: md, swarm: swarm, keepAtPeers: keepAtPeerCount})
+	return evaluatedCandidate{title: item.Title, metadata: md, swarm: swarm, keepAtPeers: keepAtPeerCount}, true
 }
 
 func (e *Engine) saveNetworkStats(snapshot netstats.Snapshot) {
@@ -237,20 +338,23 @@ func (e *Engine) actOnRanked(ctx context.Context, ranked []evaluatedCandidate) e
 			return ctx.Err()
 		}
 
-		sizeBytes := c.metadata.Info.TotalLength()
+		c := c
+		safely(e.logger, "acting on "+c.title, func() {
+			sizeBytes := c.metadata.Info.TotalLength()
 
-		freeByPath := make(map[string]int64, len(e.cfg.Storage.Locations))
-		for _, loc := range e.cfg.Storage.Locations {
-			freeByPath[loc.Path] = e.freeBytes(loc)
-		}
-
-		if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
-			if e.tryAdd(c, sizeBytes, location, nil) {
-				continue
+			freeByPath := make(map[string]int64, len(e.cfg.Storage.Locations))
+			for _, loc := range e.cfg.Storage.Locations {
+				freeByPath[loc.Path] = e.freeBytes(loc)
 			}
-		}
 
-		e.trySwap(c, sizeBytes)
+			if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
+				if e.tryAdd(c, sizeBytes, location, nil) {
+					return
+				}
+			}
+
+			e.trySwap(c, sizeBytes)
+		})
 	}
 	return nil
 }

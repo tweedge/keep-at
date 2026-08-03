@@ -48,7 +48,14 @@ func (e *Engine) resumeHeldTorrents() error {
 // complete pieces (per the storage backend's own completion tracking) are
 // not re-downloaded.
 func (e *Engine) addTorrentSpec(mi *metainfo.MetaInfo, store *piecestore.Client) (*torrent.Torrent, error) {
-	spec := torrent.TorrentSpecFromMetaInfo(mi)
+	// TorrentSpecFromMetaInfoErr, not TorrentSpecFromMetaInfo: the latter
+	// panics on incomplete metainfo, and a decade-plus of Academic
+	// Torrents uploads means "malformed .torrent file" is an expected
+	// case to handle, not a reason to crash.
+	spec, err := torrent.TorrentSpecFromMetaInfoErr(mi)
+	if err != nil {
+		return nil, fmt.Errorf("engine: building torrent spec: %w", err)
+	}
 	spec.Storage = store
 
 	t, _, err := e.torrentClient.AddTorrentSpec(spec)

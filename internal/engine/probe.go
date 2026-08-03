@@ -29,20 +29,25 @@ const (
 // in each peer's BitTorrent extended handshake and piece bitfield, not in
 // any catalog or tracker response.
 //
-// The torrent is always dropped again before returning; callers that
-// decide to proceed re-add it properly (with real storage and transfer
-// allowed) via AddCandidate.
+// The torrent is deliberately never dropped from the probe client here -
+// see resetProbeClient for why. Callers that decide to proceed add the
+// torrent properly (with real storage and transfer allowed, on the main
+// client) via AddCandidate.
 func (e *Engine) probeSwarm(ctx context.Context, mi *metainfo.MetaInfo, timeout time.Duration) ([]peerObservation, error) {
-	spec := torrent.TorrentSpecFromMetaInfo(mi)
+	// TorrentSpecFromMetaInfoErr, not TorrentSpecFromMetaInfo - see
+	// torrents.go's addTorrentSpec for why.
+	spec, err := torrent.TorrentSpecFromMetaInfoErr(mi)
+	if err != nil {
+		return nil, err
+	}
 	spec.Storage = e.probeStore
 	spec.DisallowDataDownload = true
 	spec.DisallowDataUpload = true
 
-	t, _, err := e.torrentClient.AddTorrentSpec(spec)
+	t, _, err := e.currentProbeClient().AddTorrentSpec(spec)
 	if err != nil {
 		return nil, err
 	}
-	defer t.Drop()
 
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(probePollInterval)

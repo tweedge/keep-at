@@ -54,6 +54,46 @@ This is necessarily an estimate, not a census:
 
 Progress reporting (`processed/total candidates`) is based on how many catalog entries keep-at intends to walk through this scan (everything not already held and not keyword-blocked), computed before any network calls, so the denominator is stable even though which of those turn out to be age-eligible or scrapeable isn't known until each one is actually processed.
 
+## Running against the real catalog
+
+Testing against the entire live Academic Torrents catalog (rather than a hand-picked handful) surfaced problems that only show up at that scale. What follows is what broke and what changed.
+
+### A library bug that took the whole process down
+
+anacrolix/torrent v1.61.0 introduced a rewritten tracker-announce dispatcher (`client-tracker-announcer.go`) with an internal locking bug: under enough concurrent torrent churn, an assertion (`panicif.False`) inside it fails, which manifests as `fatal error: sync: Unlock of unlocked RWMutex` - a Go runtime fatal error, not a normal panic, so it can't be recovered from and kills the whole process outright. It reproduced consistently during a real full-catalog scan, triggered from more than one code path (adding a torrent, dropping one, and even a torrent's own periodic re-announce timer), which meant no single call site could be wrapped around to avoid it.
+
+keep-at pins `github.com/anacrolix/torrent` to **v1.60.0**, the release immediately before this dispatcher was introduced, which doesn't have the bug. This is a real dependency downgrade, not a config toggle - revisit it once a fixed version exists upstream.
+
+### Why probing uses a second, disposable torrent client
+
+Independent of the above, probing a candidate's swarm (see "Avoiding herd mentality") works by adding a torrent just to inspect its peers - and earlier versions of this code dropped it again immediately afterward. Rapid add-then-drop across thousands of candidates per scan is exactly the kind of churn that triggers bugs like the one above, library version notwithstanding.
+
+So probing now happens on a dedicated `*torrent.Client` that:
+
+* Is never used for anything else - real downloads (`AddCandidate`, resuming held torrents on startup) always go through the main client.
+* Has DHT disabled. DHT's own per-torrent announce goroutine was one of the two concrete triggers found for the v1.61.0 bug, and DHT isn't needed to answer "who else is in this swarm right now" - regular trackers are enough for that.
+* Never has individual torrents dropped from it. Probed torrents just accumulate for the rest of the current scan (harmless - they hold no real data and attempt no transfer) and the entire client is closed and replaced at the start of the next scan, which releases everything through a code path that doesn't share the add/drop race.
+
+DHT stays enabled on the main client: disabling it globally was tried first and measurably hurt real download connectivity (one torrent went from a 15-second download to not finishing within 90 seconds with DHT off). Isolating the churn to a disposable, DHT-free client keeps the crash risk contained without that cost.
+
+### Evaluating candidates concurrently
+
+Probing waits several seconds per candidate for peer connections to establish. Run sequentially across a catalog with hundreds or thousands of available candidates, that alone would take hours. `evaluateCandidates` now evaluates up to `evaluateConcurrency` (16) candidates at once; the actual requests to Academic Torrents (fetching `.torrent` files, scraping trackers) stay correctly rate-limited regardless, since they share one `rate.Limiter` across every goroutine.
+
+### Keeping automatic tracker announces inside the same rate limit
+
+`scrapeSwarm` and `attorrent.Fetcher` are careful to rate-limit keep-at's *own* requests to Academic Torrents. What isn't obvious: the underlying torrent client re-announces to every tracker in a torrent's spec on its own schedule, entirely outside that code - and in a real full-catalog run, that automatic traffic to `academictorrents.com`'s tracker was enough on its own to get keep-at rate-limited (HTTP 429) by AT. `ClientConfig.TrackerDialContext` is set to a dialer that routes connections to `academictorrents.com` through the same limiter (see `rateLimitedTrackerDialer`), so every path to AT's tracker - explicit scrapes and the library's automatic announces alike - shares one budget. Third-party trackers pulled from `.torrent` files aren't rate-limited this way, since they aren't Academic Torrents' infrastructure to protect.
+
+### A decade of catalog entries means a lot of dead trackers
+
+Many `.torrent` files reference third-party trackers that are now offline, blocking automated clients, or returning garbage - and webseed URLs that don't match what this version of anacrolix/torrent expects. Both are normal, not a keep-at problem, and logging every instance of them at full-catalog scale is overwhelming: one candidate can generate a dozen `"announce failed"` or `"webseed request error"` lines across its various dead trackers and webseeds.
+
+The library's internal chatter is now suppressed by setting `ClientConfig.Logger` to a filter-level-capped logger (`analog.Default.WithFilterLevel(analog.Error)`), which drops its warnings entirely rather than passing them through. This was not the first approach tried: wrapping `ClientConfig.Slogger` with a custom `slog.Handler` that selectively dropped specific messages looked like it should work, but empirically didn't - `"announce failed"` and `"webseed request error"` never reached the wrapped handler, for reasons in the library's `Logger`-to-`Slogger` bridging that weren't worth chasing further once a reliable alternative was found. The tradeoff of the level-based approach is coarser: it silences *all* of the library's internal warnings, not just the specific noisy ones, including a same-severity warning against Academic Torrents' own tracker specifically if one ever occurs. keep-at's own logging (scan progress, its own request failures like a failed `.torrent` download or scrape) is unaffected either way, since that's separate, application-level logging that never went through the torrent client's logger.
+
+### A scan doesn't act until it finishes evaluating
+
+Because ranking a candidate (see "Deciding what to seed") depends on comparing it against every other candidate found that scan, `ScanOnce` evaluates the *entire* pending candidate list before it starts adding or swapping anything. On the real catalog (a few thousand candidates, rate-limited against Academic Torrents), a first scan can take a long time before keep-at downloads anything at all, even with free space sitting idle the whole time. This is a real, currently-unaddressed tradeoff between "always pick the single most urgent candidate across the whole catalog" and "start using free space immediately" - not a bug, but a known cost of the current design worth revisiting.
+
 ## Storage
 
 keep-at stores each verified piece as its own gzip-compressed file, keyed by piece index under a directory named after the torrent's infohash. There's no attempt to reconstruct the original file layout on disk - keep-at prioritized conflict-free, efficient local storage, rather than being locally readable. Giving up on that constraint makes per-piece compression simple. Deleting a torrent just removes its directory and pieces.
@@ -67,3 +107,5 @@ Cross-torrent deduplication (storing identical pieces once even if they appear i
 * **macOS and Windows service management.** The binary runs fine on both; `keep-at service install` doesn't (systemd/Linux only).
 * **Peer-map availability.** See "Reasoning quickly about availability" above.
 * **Authenticated node identity.** The anti-cascade check and network-status both trust the BitTorrent extended handshake's claimed client name at face value.
+* **Incremental action during a scan.** See "A scan doesn't act until it finishes evaluating" above - a first full-catalog scan can leave configured storage unused for a long time before keep-at downloads anything.
+* **Pinned anacrolix/torrent version.** v1.61.0 has a crashing bug (see "Running against the real catalog"); keep-at is on v1.60.0 until a fix lands upstream.
