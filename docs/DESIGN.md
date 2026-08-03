@@ -90,6 +90,16 @@ Many `.torrent` files reference third-party trackers that are now offline, block
 
 The library's internal chatter is now suppressed by setting `ClientConfig.Logger` to a filter-level-capped logger (`analog.Default.WithFilterLevel(analog.Error)`), which drops its warnings entirely rather than passing them through. This was not the first approach tried: wrapping `ClientConfig.Slogger` with a custom `slog.Handler` that selectively dropped specific messages looked like it should work, but empirically didn't - `"announce failed"` and `"webseed request error"` never reached the wrapped handler, for reasons in the library's `Logger`-to-`Slogger` bridging that weren't worth chasing further once a reliable alternative was found. The tradeoff of the level-based approach is coarser: it silences *all* of the library's internal warnings, not just the specific noisy ones, including a same-severity warning against Academic Torrents' own tracker specifically if one ever occurs. keep-at's own logging (scan progress, its own request failures like a failed `.torrent` download or scrape) is unaffected either way, since that's separate, application-level logging that never went through the torrent client's logger.
 
+### Reporting progress during a long scrape
+
+A full-catalog scrape can run for a long time (see above), and a log that goes quiet for that long looks the same whether keep-at is working or stuck. Three log lines mark the phase:
+
+* `"starting scrape"`, once, right before evaluation begins - stating explicitly that it can take a while, and that keep-at won't add, swap, or remove anything until it's done (see below).
+* `"scrape in progress"`, every `progressLogInterval` (2 minutes) while it runs, with percent complete and an ETA.
+* `"scrape complete, updating what keep-at holds"`, once, when it finishes, right before acting on the results.
+
+The ETA is a straight-line extrapolation - elapsed time divided by candidates processed so far, multiplied by candidates remaining - not a measured prediction. It assumes the rest of the catalog behaves like what's already been seen, which mostly holds since Academic Torrents rate limiting dominates the per-candidate cost fairly evenly, but it's a rough guide, not a countdown to trust precisely.
+
 ### A scan doesn't act until it finishes evaluating
 
 Because ranking a candidate (see "Deciding what to seed") depends on comparing it against every other candidate found that scan, `ScanOnce` evaluates the *entire* pending candidate list before it starts adding or swapping anything. On the real catalog (a few thousand candidates, rate-limited against Academic Torrents), a first scan can take a long time before keep-at downloads anything at all, even with free space sitting idle the whole time. This is a real, currently-unaddressed tradeoff between "always pick the single most urgent candidate across the whole catalog" and "start using free space immediately" - not a bug, but a known cost of the current design worth revisiting.

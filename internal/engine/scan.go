@@ -34,6 +34,15 @@ const evaluateConcurrency = 16
 // no real benefit - nothing is watching that closely).
 const progressSaveInterval = 2 * time.Second
 
+// progressLogInterval is how often ScanOnce writes a human-readable
+// progress line (with an ETA) to the log while scraping. This is
+// deliberately much coarser than progressSaveInterval: that one just
+// writes a small JSON file for `network-status` to read on demand, while
+// this one is meant to reassure an operator watching the log that a
+// scrape that can run for a long time on a large catalog is still making
+// progress, without flooding the log while it does.
+const progressLogInterval = 2 * time.Minute
+
 // evaluatedCandidate is a catalog item keep-at has fetched metadata and a
 // fresh scrape (and, if anyone was around to scrape, a swarm probe) for,
 // and is ready to rank and possibly act on.
@@ -86,11 +95,14 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 
 	totalCandidates := countPendingCandidates(catalog, heldHashes, e.blocklist)
 	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt, TotalCandidates: totalCandidates})
-	e.logger.Info("evaluating candidates", "total", totalCandidates)
+	e.logger.Info("starting scrape: fetching torrent metadata and tracker data for every pending catalog candidate to work out what needs seeding most - this determines priority before anything is downloaded, so it can take a while on a large catalog, and keep-at won't start changing what it holds until it finishes",
+		"total", totalCandidates)
 
 	tracker := netstats.NewTracker()
+	scrapeStartedAt := time.Now()
 	candidates, processedCount := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates)
-	e.logger.Info("candidates evaluated", "available", len(candidates), "processed", processedCount, "total", totalCandidates)
+	e.logger.Info("scrape complete, updating what keep-at holds",
+		"available", len(candidates), "processed", processedCount, "total", totalCandidates, "elapsed", humanDuration(time.Since(scrapeStartedAt)))
 
 	ranked := rankEvaluated(candidates)
 	actErr := e.actOnRanked(ctx, ranked)
@@ -205,18 +217,24 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 		}
 	}
 
+	evalStartedAt := time.Now()
+
 	stopProgress := make(chan struct{})
 	progressStopped := make(chan struct{})
 	go func() {
 		defer close(progressStopped)
-		ticker := time.NewTicker(progressSaveInterval)
-		defer ticker.Stop()
+		saveTicker := time.NewTicker(progressSaveInterval)
+		defer saveTicker.Stop()
+		logTicker := time.NewTicker(progressLogInterval)
+		defer logTicker.Stop()
 		for {
 			select {
 			case <-stopProgress:
 				return
-			case <-ticker.C:
+			case <-saveTicker.C:
 				e.saveNetworkStats(currentSnapshot())
+			case <-logTicker.C:
+				e.logScrapeProgress(evalStartedAt, totalCandidates, int(processed.Load()))
 			}
 		}
 	}()
@@ -304,6 +322,39 @@ func (e *Engine) saveNetworkStats(snapshot netstats.Snapshot) {
 	if err := netstats.Save(e.networkStatsPath(), snapshot); err != nil {
 		e.logger.Warn("failed to persist network stats", "err", err)
 	}
+}
+
+// logScrapeProgress writes a human-readable progress line - percent done,
+// elapsed time, and an ETA extrapolated from the rate seen so far - while
+// a scrape is still running. The ETA is a straight-line extrapolation
+// (candidates processed so far / time elapsed), so it's only as good as
+// the assumption that the rest of the catalog behaves like what's been
+// seen already; it's meant to give a rough sense of progress, not a
+// precise countdown.
+func (e *Engine) logScrapeProgress(evalStartedAt time.Time, totalCandidates, processedCandidates int) {
+	elapsed := time.Since(evalStartedAt)
+
+	if totalCandidates <= 0 || processedCandidates <= 0 {
+		e.logger.Info("scrape in progress", "processed", processedCandidates, "total", totalCandidates, "elapsed", humanDuration(elapsed))
+		return
+	}
+
+	percent := float64(processedCandidates) / float64(totalCandidates) * 100
+	remaining := totalCandidates - processedCandidates
+	if remaining <= 0 {
+		e.logger.Info("scrape in progress", "processed", processedCandidates, "total", totalCandidates, "elapsed", humanDuration(elapsed))
+		return
+	}
+
+	perCandidate := elapsed / time.Duration(processedCandidates)
+	eta := perCandidate * time.Duration(remaining)
+
+	e.logger.Info("scrape in progress",
+		"processed", processedCandidates,
+		"total", totalCandidates,
+		"percent", fmt.Sprintf("%.0f%%", percent),
+		"elapsed", humanDuration(elapsed),
+		"eta", humanDuration(eta))
 }
 
 // rankEvaluated converts evaluated candidates into selector.Candidate and
