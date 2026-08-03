@@ -127,7 +127,7 @@ The smoke test downloads two real files from Academic Torrents (a few KB each) i
 
 ## Releasing
 
-Update `RELEASE_NOTES.md` at the repo root with what's actually in the release, commit it, then push a matching version tag:
+Update `RELEASE_NOTES.md` at the repo root with what's actually in the release, commit it, then push a matching version tag. Always soft-wrap `RELEASE_NOTES.md` - each paragraph or bullet on one line, no matter how long, letting the renderer wrap it - never hard-wrap with manual line breaks partway through a paragraph. GitHub's release view renders single trailing newlines as literal breaks, so a hard-wrapped paragraph shows up as a jagged staircase instead of a normal paragraph.
 
 ```
 git tag v1.2.3
