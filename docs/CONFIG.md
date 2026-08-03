@@ -1,0 +1,105 @@
+# Configuration reference
+
+Every setting below has both a YAML key (for a config file) and a CLI flag. Flags always take a `--` prefix (e.g. `--port`); YAML keys are lowercase with underscores, nested where noted.
+
+If you're just getting started, you probably only need `--storage-limit` (and optionally `--storage`) - see the README's Quick Start. This page documents everything else for when you want more control.
+
+Precedence, when more than one source could set a value:
+
+1. An explicit CLI flag always wins.
+2. Otherwise, a config file (`--config PATH`, or the one `service install` wrote to `/etc/keep-at/config.yaml`) is used if present.
+3. Otherwise, keep-at's built-in defaults apply.
+
+## Storage
+
+### `storage.locations` (config file only)
+
+A list of `{path, limit}` pairs. Each `limit` is a fixed integer followed by `M`, `G`, `T`, or `P` (binary units - `1G` is `1024^3` bytes, not `1000^3`). There's no default limit; keep-at always requires at least one explicit location with a positive limit before it will run.
+
+```yaml
+storage:
+  locations:
+    - path: /mnt/disk1/keep-at
+      limit: 500G
+    - path: /mnt/disk2/keep-at
+      limit: 2T
+```
+
+keep-at fills multiple locations proportionally to free space, not sequentially, so they fill up roughly evenly over time instead of one disk taking everything until it's full. See [DESIGN.md](DESIGN.md) for the weighting logic.
+
+Multiple locations are a config-file-only feature. The CLI flags below manage exactly one location; combining `--storage`/`--storage-limit` with `--config` is rejected outright (edit the file instead).
+
+### `--storage` (CLI only)
+
+The single storage location to use, when not using a config file. Defaults to an OS-appropriate location:
+
+* Linux: `$XDG_DATA_HOME/keep-at/storage`, or `~/.local/share/keep-at/storage` if `XDG_DATA_HOME` isn't set
+* macOS: `~/Library/Application Support/keep-at/storage`
+* Windows: `%LOCALAPPDATA%\keep-at\storage`
+
+### `--storage-limit` (CLI only)
+
+How much space `--storage` is allowed to use, e.g. `500G` or `2T`. Required whenever you're not using a config file - keep-at will not guess this.
+
+## Data directory
+
+### `data_dir` / `--data-dir`
+
+Where keep-at keeps its own bookkeeping: persisted state (what it's currently holding), the PID/log files `start`/`stop`/`status` use, cached `.torrent` files and catalog data, and network-status snapshots. This is separate from `storage.locations`, which is only for the torrent data itself.
+
+Defaults to the same OS-appropriate base directory as `--storage` (see above), under `.../keep-at` rather than `.../keep-at/storage`.
+
+## Scanning behavior
+
+### `scan.interval` / `--scan-interval`
+
+*Default: `168h` (one week).* How often keep-at rescans the full Academic Torrents catalog. A scan can take a while on a large catalog - see DESIGN.md - so shortening this a lot mostly just means overlapping or back-to-back scans, not more frequent decisions.
+
+### `scan.rate_limit_per_second` / `--rate-limit`
+
+*Default: `0.5`.* Caps requests specifically to Academic Torrents' own infrastructure: the catalog file, `.torrent` downloads, and their tracker's scrape endpoint. Third-party trackers listed inside a `.torrent` file aren't rate-limited by keep-at, since they aren't Academic Torrents' infrastructure to protect.
+
+### `scan.min_seed_margin` / `--min-seed-margin`
+
+*Default: `3`.* How many fewer seeds a candidate torrent needs, relative to a held torrent (or torrents), before keep-at will displace it to make room. Higher values make keep-at more conservative about swapping; `0` means any strictly-lower seed count qualifies.
+
+### `scan.moderation_delay` / `--moderation-delay`
+
+*Default: `168h` (one week).* Minimum age (from the `.torrent` file's creation date - see DESIGN.md for why not an upload date) before keep-at will consider downloading a torrent. Gives Academic Torrents' moderators time to catch anything that shouldn't be there.
+
+### `aggressiveness` / `--aggressiveness`
+
+*Default: `0.6`.* Must be strictly between 0 and 1. Base of the anti-cascade probability `aggressiveness ^ (other keep-at nodes already in the swarm)` - lower values make keep-at back off faster as more keep-at nodes pile onto the same torrent. See DESIGN.md for the full explanation and the math.
+
+## Filtering
+
+### `keyword_blocklist` / `--keyword-blocklist`
+
+*Default: none.* Case-insensitive substring match against a torrent's title and description (the only text fields Academic Torrents' bulk catalog file provides). Anything matching is skipped before any network calls are made for it. As a YAML list:
+
+```yaml
+keyword_blocklist:
+  - confidential
+  - draft
+```
+
+From the CLI, pass a comma-separated list: `--keyword-blocklist confidential,draft`.
+
+### `preserve_deleted_torrents` / `--preserve-deleted-torrents`
+
+*Default: `false`.* If Academic Torrents removes a torrent keep-at is seeding, keep-at removes its local copy too by default, on the theory that a takedown probably happened for a reason. Set this to `true` to keep seeding removed torrents anyway.
+
+## Network
+
+### `port` / `--port`
+
+*Default: `37550`* (picked randomly during development, checked against common well-known ports). The BitTorrent listen port. If you're running keep-at behind a VPN or router with port forwarding, this is the port to forward - see [VPN.md](VPN.md).
+
+## Flags that aren't config fields
+
+A few flags control CLI behavior rather than keep-at's own settings, and don't have a YAML equivalent:
+
+* `--config PATH` - use a config file (see precedence above).
+* `--foreground` (`start` only) - run attached instead of daemonizing. Implied automatically inside a container.
+* `--user` (`service install` only) - which user the systemd unit runs as (default `root`).
+* `--data-dir` (`stop`/`status`/`network-status` only) - override where to look for a running instance's PID/log/state, when you're not using `--config` and haven't installed keep-at as a service.

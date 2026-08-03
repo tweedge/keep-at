@@ -13,6 +13,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -166,17 +167,43 @@ func writeStarterConfig(path string) error {
 	starter.Storage.Locations = []StorageLocation{
 		{Path: DefaultStorageLocation(), Limit: 0},
 	}
-	out, err := yaml.Marshal(starter)
-	if err != nil {
-		return err
-	}
 	header := "# keep-at starter config. This is entirely optional - every field here has\n" +
 		"# a --flag equivalent (run `keep-at run --help`). Reach for a config file\n" +
 		"# once you want more than one storage location, or don't want to repeat\n" +
 		"# flags every time.\n" +
 		"#\n" +
 		"# At minimum, set a real limit (e.g. 500G, 2T) below.\n\n"
-	return os.WriteFile(path, append([]byte(header), out...), 0o644)
+	return writeYAML(path, header, starter)
+}
+
+// Save writes a fully-resolved config to path as YAML. Used by `keep-at
+// service install` to persist whatever combination of flags and/or config
+// file the operator used, alongside the systemd unit it installs, so
+// other commands (and the unit itself) have exactly one place to look.
+func Save(path string, cfg Config) error {
+	header := "# keep-at config, installed alongside the systemd service by\n" +
+		"# `keep-at service install`. Edit this file directly and run\n" +
+		"# `systemctl restart keep-at` (or `keep-at service install` again) to\n" +
+		"# apply changes.\n\n"
+	return writeYAML(path, header, cfg)
+}
+
+func writeYAML(path, header string, cfg Config) error {
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("config: marshalling: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("config: creating directory for %s: %w", path, err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append([]byte(header), out...), 0o644); err != nil {
+		return fmt.Errorf("config: writing %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("config: finalizing %s: %w", path, err)
+	}
+	return nil
 }
 
 // DefaultDataDir is where keep-at keeps its own bookkeeping (state,

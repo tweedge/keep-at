@@ -47,31 +47,27 @@ That's the only variable you need to set to start. `keep-at run --help` lists ev
 
 Inside a container, `start` automatically runs in the foreground instead of daemonizing - daemonizing would just exit the entrypoint and kill the container.
 
-### Running it day to day
+### Service Usage
 
-```
-keep-at start --storage-limit 500G   # daemonize, write logs to data_dir/keep-at.log
-keep-at stop
-keep-at status
-keep-at run --storage-limit 500G     # same thing, but stay in the foreground
-```
-
-`start` and `run` take the exact same flags - `start` just forks `run` into the background for you (or runs it in the foreground directly, inside a container). `stop` and `status` only need to know where to find the running instance, so they just take `--data-dir` (or `--config`, if you used one to start it).
-
-Check what keep-at has seen of the wider keep-at network while scanning:
-
-```
-keep-at network-status
-```
-
-As a systemd service (Linux only for now; the binary itself is built for every platform above, but service install/uninstall is Linux-first):
+keep-at is designed to be used as a long-running service on an always-on server, VM, or similar. Where `keep-at run` starts it in the foreground (good for seeing what's going on), `service install` is what you want for something that stays up. As a systemd service (Linux only for now; the binary itself is built for every platform above, but service install/uninstall is Linux-first):
 
 ```
 sudo keep-at service install --storage-limit 500G
 sudo keep-at service uninstall
 ```
 
-`service install` takes the same flags as `run` and bakes the resolved settings directly into the systemd unit, so the service doesn't depend on anything you typed at install time still being around later.
+`service install` takes the same flags as `run`, resolves them the same way, and writes the result to `/etc/keep-at/config.yaml` - installing the config alongside the service, rather than baking flags into the unit or requiring you to remember them. That's also what makes every other command below work with no arguments at all: once that file exists, `stop`, `status`, `network-status`, and even a bare `run`/`start` all check it automatically to find out where the running instance lives.
+
+```
+keep-at start
+keep-at stop
+keep-at status
+keep-at network-status
+```
+
+`start` and `run` take the exact same flags as `service install` - `start` just forks `run` into the background for you (or runs it in the foreground directly, inside a container). None of these commands need `--config` or `--data-dir` once keep-at is installed as a service; pass them explicitly only if you're managing a non-service instance, or one installed somewhere unusual.
+
+To change settings later, edit `/etc/keep-at/config.yaml` directly and run `sudo systemctl restart keep-at`, or just run `service install` again with new flags.
 
 And to update to the latest release:
 
@@ -81,7 +77,7 @@ keep-at self-update
 
 ### A config file, if you want one
 
-A config file is only worth reaching for once you want more than one storage location, or don't want to repeat flags every time. Point `--config` at a path that doesn't exist yet and keep-at will write a starter one there and tell you to edit it:
+A config file is only worth reaching for once you want more than one storage location, or don't want to repeat flags every time (`service install` writes one for you automatically - see above). Point `--config` at a path that doesn't exist yet and keep-at will write a starter one there and tell you to edit it:
 
 ```
 keep-at run --config ~/.config/keep-at/config.yaml
@@ -108,16 +104,15 @@ keyword_blocklist: []
 preserve_deleted_torrents: false
 ```
 
-Pass it with `--config path/to/config.yaml`. A couple of fields aren't self-explanatory:
+Every field here, plus its CLI flag equivalent and what it actually does, is documented in [docs/CONFIG.md](docs/CONFIG.md).
 
-* `storage.locations` - as many folders as you want, each with its own limit (`M`, `G`, `T`, or `P`, binary units). Multiple locations are a config-file-only feature; the CLI flags manage a single location. keep-at fills them proportionally to free space, not sequentially, so multiple disks fill roughly evenly instead of one disk taking everything until it's full.
-* `scan.rate_limit_per_second` - caps requests specifically to Academic Torrents' own infrastructure (the catalog, `.torrent` downloads, and their tracker's scrape endpoint). Third-party trackers listed in a `.torrent` file aren't rate-limited by keep-at, since they're not Academic Torrents' infrastructure to protect.
-* `keyword_blocklist` - case-insensitive substring match against a torrent's title and description (the only text fields the bulk catalog file actually provides; use `--keyword-blocklist a,b,c` from the CLI). Anything matching is skipped entirely, no network calls made.
-* `preserve_deleted_torrents` - if Academic Torrents removes a torrent keep-at is seeding, keep-at removes it too by default, on the theory that if it was taken down there was probably a reason. Set this to keep seeding it anyway.
+### Running behind a VPN
+
+Optional, and it comes with real tradeoffs (mainly around port forwarding and speed) that are worth understanding before turning one on - see [docs/VPN.md](docs/VPN.md) for a general guide covering both Docker (via [gluetun](https://github.com/passteque/gluetun)) and service-level (WireGuard) setups.
 
 ## How it works
 
-keep-at ranks candidates by seed count, checks for other keep-at nodes already piling onto the same torrent before committing to one, and can combine several smaller held torrents to make room for one bigger candidate. The full rationale for all of that - plus the parts that are deliberately simplified or not implemented yet - is in [DESIGN.md](DESIGN.md).
+keep-at ranks candidates by seed count, checks for other keep-at nodes already piling onto the same torrent before committing to one, and can combine several smaller held torrents to make room for one bigger candidate. The full rationale for all of that - plus the parts that are deliberately simplified or not implemented yet - is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Testing
 

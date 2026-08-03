@@ -4,9 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
 
-	"github.com/tweedge/keep-at/internal/config"
 	"github.com/tweedge/keep-at/internal/service"
 )
 
@@ -19,7 +17,7 @@ func cmdService(args []string) error {
 	case "install":
 		return cmdServiceInstall(args[1:])
 	case "uninstall":
-		return service.Uninstall()
+		return cmdServiceUninstall(args[1:])
 	default:
 		return fmt.Errorf("usage: keep-at service <install|uninstall>")
 	}
@@ -27,10 +25,12 @@ func cmdService(args []string) error {
 
 // cmdServiceInstall takes the same flags as `run`, resolves and validates
 // them up front (so a bad flag fails now, not after the service is
-// installed and systemd is silently restart-looping it), then bakes the
-// equivalent explicit flags into the systemd unit's ExecStart line. This
-// keeps a config file optional for services too: the unit is
-// self-contained, not dependent on flags remembered from install time.
+// installed and systemd is silently restart-looping it), then writes the
+// resolved config to service.ConfigPath and points the systemd unit at
+// it. That's what lets stop/status/network-status - and a bare
+// run/start - find a running keep-at without needing --config or
+// --data-dir passed every time: they check service.ConfigPath
+// automatically once it exists.
 func cmdServiceInstall(args []string) error {
 	fs := flag.NewFlagSet("service install", flag.ContinueOnError)
 	user := fs.String("user", "root", "user the systemd service runs as")
@@ -51,56 +51,26 @@ func cmdServiceInstall(args []string) error {
 
 	if err := service.Install(service.InstallOpts{
 		ExecPath: execPath,
-		RunArgs:  configToRunArgs(cfg, *cf.configPath),
+		Config:   cfg,
 		User:     *user,
 	}); err != nil {
 		return err
 	}
 
-	fmt.Println("keep-at service installed and started")
+	fmt.Printf("keep-at service installed and started, config at %s\n", service.ConfigPath)
 	return nil
 }
 
-// configToRunArgs reconstructs the `run` flags that reproduce cfg, so the
-// systemd unit is self-contained rather than depending on flags
-// remembered from install time.
-//
-// If a config file was used at install time, the unit just references
-// that same file path: multi-location storage setups only exist in config
-// files (see configFlagSet.resolve), and re-reading the file on every
-// service start means editing it (e.g. adding a disk) takes effect on the
-// next restart without reinstalling the service.
-func configToRunArgs(cfg config.Config, configPath string) []string {
-	if configPath != "" {
-		return []string{"run", "--config", configPath}
+func cmdServiceUninstall(args []string) error {
+	fs := flag.NewFlagSet("service uninstall", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
 
-	args := []string{
-		"run",
-		"--port", strconv.Itoa(cfg.Port),
-		"--data-dir", cfg.DataDir,
-		"--aggressiveness", strconv.FormatFloat(cfg.Aggressiveness, 'g', -1, 64),
-		"--min-seed-margin", strconv.Itoa(cfg.Scan.MinSeedMargin),
-		"--scan-interval", cfg.Scan.Interval.AsDuration().String(),
-		"--moderation-delay", cfg.Scan.ModerationDelay.AsDuration().String(),
-		"--rate-limit", strconv.FormatFloat(cfg.Scan.RateLimitPerSecond, 'g', -1, 64),
+	if err := service.Uninstall(); err != nil {
+		return err
 	}
-	if len(cfg.Storage.Locations) == 1 {
-		loc := cfg.Storage.Locations[0]
-		args = append(args, "--storage", loc.Path, "--storage-limit", loc.Limit.String())
-	}
-	if len(cfg.KeywordBlocklist) > 0 {
-		joined := ""
-		for i, kw := range cfg.KeywordBlocklist {
-			if i > 0 {
-				joined += ","
-			}
-			joined += kw
-		}
-		args = append(args, "--keyword-blocklist", joined)
-	}
-	if cfg.PreserveDeletedTorrents {
-		args = append(args, "--preserve-deleted-torrents")
-	}
-	return args
+
+	fmt.Printf("keep-at service uninstalled (config left in place at %s)\n", service.ConfigPath)
+	return nil
 }

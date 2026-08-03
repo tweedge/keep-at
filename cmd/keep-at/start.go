@@ -79,9 +79,16 @@ func daemonManagerAt(dataDir string) daemonctl.Manager {
 
 // resolveDataDir figures out where keep-at's PID/log files live without
 // requiring the full config (storage location and limit) that `run` and
-// `start` need - stop/status just need to find the same data_dir a running
-// instance was started with.
+// `start` need - stop/status/network-status just need to find the same
+// data_dir a running instance was started with. If neither configPath nor
+// dataDir is given, it checks for an installed service's config
+// (service.ConfigPath) before falling back to the plain OS default, so
+// these commands work with no arguments at all once keep-at is installed
+// as a service.
 func resolveDataDir(configPath, dataDir string) (string, error) {
+	if configPath == "" {
+		configPath = serviceConfigIfPresent()
+	}
 	if configPath != "" {
 		cfg, err := config.Load(configPath)
 		if err != nil {

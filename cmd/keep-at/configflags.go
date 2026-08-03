@@ -3,10 +3,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/tweedge/keep-at/internal/config"
+	"github.com/tweedge/keep-at/internal/service"
 )
 
 // configFlagSet mirrors every config.Config field as a command-line flag,
@@ -52,22 +54,42 @@ func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
 // at its default" apart from "flag explicitly set to the same value as the
 // default," so a loaded config file's fields aren't clobbered by flags the
 // user didn't touch.
+//
+// If neither --config nor any storage flag was passed at all, resolve
+// falls back to an installed service's config (service.ConfigPath), if
+// one exists. That's what lets `keep-at status`, a bare `keep-at start`,
+// and friends find a service-installed instance without being told where
+// to look.
 func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
+	visited := map[string]bool{}
+	fs.Visit(func(fl *flag.Flag) { visited[fl.Name] = true })
+	storageFlagsSet := visited["storage"] || visited["storage-limit"]
+
+	configPath := *cf.configPath
+	usingServiceConfig := false
+	if configPath == "" && !storageFlagsSet {
+		if p := serviceConfigIfPresent(); p != "" {
+			configPath = p
+			usingServiceConfig = true
+		}
+	}
+
 	cfg := config.Default()
 	configFileLoaded := false
-
-	if *cf.configPath != "" {
-		loaded, err := config.Load(*cf.configPath)
+	if configPath != "" {
+		loaded, err := config.Load(configPath)
 		if err != nil {
+			if usingServiceConfig {
+				return config.Config{}, fmt.Errorf("found an installed service config at %s but couldn't load it: %w", configPath, err)
+			}
 			return config.Config{}, err
 		}
 		cfg = loaded
 		configFileLoaded = true
 	}
 
-	storageFlagsSet := false
-	fs.Visit(func(fl *flag.Flag) {
-		switch fl.Name {
+	for name := range visited {
+		switch name {
 		case "port":
 			cfg.Port = *cf.port
 		case "data-dir":
@@ -86,10 +108,8 @@ func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
 			cfg.KeywordBlocklist = splitKeywords(*cf.keywordBlocklist)
 		case "preserve-deleted-torrents":
 			cfg.PreserveDeletedTorrents = *cf.preserveDeletedTorrents
-		case "storage", "storage-limit":
-			storageFlagsSet = true
 		}
-	})
+	}
 
 	if storageFlagsSet {
 		if configFileLoaded {
@@ -104,13 +124,26 @@ func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
 		}
 		cfg.Storage.Locations = []config.StorageLocation{{Path: *cf.storage, Limit: limit}}
 	} else if !configFileLoaded && len(cfg.Storage.Locations) == 0 {
-		return config.Config{}, fmt.Errorf("no storage configured; pass --storage-limit (e.g. --storage-limit 500G) or --config")
+		return config.Config{}, fmt.Errorf("no storage configured; pass --storage-limit (e.g. --storage-limit 500G), --config, or install keep-at as a service first")
 	}
 
 	if err := cfg.Validate(); err != nil {
 		return config.Config{}, err
 	}
 	return cfg, nil
+}
+
+// serviceConfigPath is a var, not service.ConfigPath used directly, so
+// tests can point it at a temp file instead of the real /etc path.
+var serviceConfigPath = service.ConfigPath
+
+// serviceConfigIfPresent returns serviceConfigPath if a config was
+// installed there (see `keep-at service install`), or "" otherwise.
+func serviceConfigIfPresent() string {
+	if _, err := os.Stat(serviceConfigPath); err == nil {
+		return serviceConfigPath
+	}
+	return ""
 }
 
 func splitKeywords(raw string) []string {

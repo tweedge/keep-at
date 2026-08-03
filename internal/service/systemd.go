@@ -8,9 +8,21 @@ import (
 	"os/exec"
 	"strings"
 	"text/template"
+
+	"github.com/tweedge/keep-at/internal/config"
 )
 
 const unitPath = "/etc/systemd/system/keep-at.service"
+
+// ConfigDir and ConfigPath are where `service install` writes the
+// resolved config, alongside the systemd unit itself. Once installed,
+// this is the one place every other command (stop/status/network-status,
+// and a bare `run`/`start` with no flags) looks for keep-at's settings, so
+// none of them need --config or --data-dir passed by hand.
+const (
+	ConfigDir  = "/etc/keep-at"
+	ConfigPath = ConfigDir + "/config.yaml"
+)
 
 const unitTemplateSrc = `[Unit]
 Description=keep-at - Academic Torrents smart seeding node
@@ -33,11 +45,12 @@ var unitTemplate = template.Must(template.New("keep-at.service").Parse(unitTempl
 // InstallOpts controls how the generated systemd unit runs keep-at.
 type InstallOpts struct {
 	ExecPath string
-	// RunArgs are the arguments to pass to ExecPath, typically starting
-	// with "run" followed by whatever flags reproduce the desired config -
-	// see cmd/keep-at's configToRunArgs.
-	RunArgs []string
-	User    string
+	// Config is written to ConfigPath and is what the installed unit
+	// runs with - see cmd/keep-at's `service install`, which resolves
+	// this from whatever combination of flags and/or an existing config
+	// file the operator passed.
+	Config config.Config
+	User   string
 }
 
 type unitTemplateData struct {
@@ -45,7 +58,8 @@ type unitTemplateData struct {
 	User          string
 }
 
-// Install writes a systemd unit for keep-at, then enables and starts it.
+// Install writes the resolved config to ConfigPath, writes a systemd unit
+// that runs keep-at against it, then enables and starts the service.
 // Requires root.
 func Install(opts InstallOpts) error {
 	if err := requireRoot(); err != nil {
@@ -55,6 +69,10 @@ func Install(opts InstallOpts) error {
 		return err
 	}
 
+	if err := config.Save(ConfigPath, opts.Config); err != nil {
+		return fmt.Errorf("service: writing %s: %w", ConfigPath, err)
+	}
+
 	f, err := os.Create(unitPath)
 	if err != nil {
 		return fmt.Errorf("service: creating %s: %w", unitPath, err)
@@ -62,7 +80,7 @@ func Install(opts InstallOpts) error {
 	defer f.Close()
 
 	data := unitTemplateData{
-		ExecStartLine: execStartLine(opts.ExecPath, opts.RunArgs),
+		ExecStartLine: execStartLine(opts.ExecPath, []string{"run", "--config", ConfigPath}),
 		User:          opts.User,
 	}
 	if err := unitTemplate.Execute(f, data); err != nil {
@@ -83,7 +101,9 @@ func Install(opts InstallOpts) error {
 }
 
 // Uninstall stops, disables, and removes keep-at's systemd unit. Requires
-// root. It does not delete any downloaded torrent data.
+// root. It does not delete any downloaded torrent data, and leaves
+// ConfigPath in place in case the operator wants to reinstall or refer
+// back to it.
 func Uninstall() error {
 	if err := requireRoot(); err != nil {
 		return err

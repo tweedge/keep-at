@@ -65,5 +65,5 @@ Cross-torrent deduplication (storing identical pieces once even if they appear i
 ## Todos
 
 * **macOS and Windows service management.** The binary runs fine on both; `keep-at service install` doesn't (systemd/Linux only).
-* **Peer-map availability.** See "Availability, precisely" above.
+* **Peer-map availability.** See "Reasoning quickly about availability" above.
 * **Authenticated node identity.** The anti-cascade check and network-status both trust the BitTorrent extended handshake's claimed client name at face value.
