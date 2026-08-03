@@ -1,0 +1,16 @@
+# Planning/voice documents used during development, not part of the project.
+PLAN.md
+VOICE.md
+VOICE_FINDER_LOG.md
+
+# Build artifacts
+/dist/
+/mimis
+*.tar.gz
+
+# Go
+*.test
+*.out
+
+# Local runtime state if mimis is ever run from the repo root during dev
+/mimisbaeti.yaml
