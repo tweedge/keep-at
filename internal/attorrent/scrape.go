@@ -13,7 +13,7 @@ import (
 	"github.com/anacrolix/torrent/types/infohash"
 )
 
-// SwarmCounts is what mimis actually cares about from a tracker: is anyone
+// SwarmCounts is what keep-at actually cares about from a tracker: is anyone
 // seeding, and how many. Selection logic in the selector package treats
 // Seeders as the availability signal and Leechers/Completed as tie-breakers.
 type SwarmCounts struct {
@@ -24,7 +24,7 @@ type SwarmCounts struct {
 
 // ScrapeHTTP queries a single HTTP(S) tracker for every hash in one request,
 // using the BEP 48 scrape convention (announce URL with "announce" replaced
-// by "scrape" in its final path segment). Batching every hash mimis cares
+// by "scrape" in its final path segment). Batching every hash keep-at cares
 // about into one request is what keeps a full catalog scan from turning
 // into thousands of individual tracker hits.
 func ScrapeHTTP(ctx context.Context, client *http.Client, announceURL string, hashes []metainfo.Hash) (map[metainfo.Hash]SwarmCounts, error) {

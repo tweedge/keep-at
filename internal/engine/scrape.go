@@ -9,7 +9,7 @@ import (
 
 	"github.com/anacrolix/torrent/metainfo"
 
-	"github.com/tweedge/mimisbaeti/internal/attorrent"
+	"github.com/tweedge/keep-at/internal/attorrent"
 )
 
 const scrapeTimeout = 15 * time.Second

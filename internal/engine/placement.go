@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/tweedge/mimisbaeti/internal/config"
+	"github.com/tweedge/keep-at/internal/config"
 )
 
 // freeBytes reports how much room is left in a storage location, given its
-// configured limit and what mimis' state already accounts as used there.
+// configured limit and what keep-at's state already accounts as used there.
 func (e *Engine) freeBytes(loc config.StorageLocation) int64 {
 	used := e.state.BytesUsed(loc.Path)
 	free := int64(loc.Limit) - used

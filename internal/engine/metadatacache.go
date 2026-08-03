@@ -9,19 +9,19 @@ import (
 
 	"github.com/anacrolix/torrent/metainfo"
 
-	"github.com/tweedge/mimisbaeti/internal/attorrent"
+	"github.com/tweedge/keep-at/internal/attorrent"
 )
 
-// cachedTorrentPath is where mimis keeps a local copy of a .torrent file
-// once fetched, regardless of whether mimis ends up downloading it. A
-// torrent's creation date never changes, so once fetched, mimis never
+// cachedTorrentPath is where keep-at keeps a local copy of a .torrent file
+// once fetched, regardless of whether keep-at ends up downloading it. A
+// torrent's creation date never changes, so once fetched, keep-at never
 // needs to ask Academic Torrents for that same .torrent file again just to
 // re-check a candidate's age on a later scan.
 func (e *Engine) cachedTorrentPath(infoHash metainfo.Hash) string {
 	return filepath.Join(e.cfg.DataDir, "torrent-cache", infoHash.HexString()+".torrent")
 }
 
-// fetchMetadata returns a torrent's metadata, preferring mimis' local cache
+// fetchMetadata returns a torrent's metadata, preferring keep-at's local cache
 // over a fresh request to Academic Torrents.
 func (e *Engine) fetchMetadata(ctx context.Context, infoHash metainfo.Hash) (*attorrent.Metadata, error) {
 	path := e.cachedTorrentPath(infoHash)

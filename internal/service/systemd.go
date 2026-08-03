@@ -1,25 +1,25 @@
-// Package service installs and uninstalls mimis as a systemd service on
-// Linux. Other init systems (launchd, Windows' SCM) aren't implemented yet;
-// see PLAN.md for why Linux is first-class in this version.
+// Package service installs and uninstalls keep-at as a systemd service on
+// Linux. Other init systems (launchd, Windows' SCM) aren't implemented yet.
 package service
 
 import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"text/template"
 )
 
-const unitPath = "/etc/systemd/system/mimisbaeti.service"
+const unitPath = "/etc/systemd/system/keep-at.service"
 
 const unitTemplateSrc = `[Unit]
-Description=mimis - Academic Torrents smart seeding node
+Description=keep-at - Academic Torrents smart seeding node
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={{.ExecPath}} run --config {{.ConfigPath}}
+ExecStart={{.ExecStartLine}}
 Restart=on-failure
 RestartSec=5
 User={{.User}}
@@ -28,16 +28,24 @@ User={{.User}}
 WantedBy=multi-user.target
 `
 
-var unitTemplate = template.Must(template.New("mimisbaeti.service").Parse(unitTemplateSrc))
+var unitTemplate = template.Must(template.New("keep-at.service").Parse(unitTemplateSrc))
 
-// InstallOpts controls how the generated systemd unit runs mimis.
+// InstallOpts controls how the generated systemd unit runs keep-at.
 type InstallOpts struct {
-	ExecPath   string
-	ConfigPath string
-	User       string
+	ExecPath string
+	// RunArgs are the arguments to pass to ExecPath, typically starting
+	// with "run" followed by whatever flags reproduce the desired config -
+	// see cmd/keep-at's configToRunArgs.
+	RunArgs []string
+	User    string
 }
 
-// Install writes a systemd unit for mimis, then enables and starts it.
+type unitTemplateData struct {
+	ExecStartLine string
+	User          string
+}
+
+// Install writes a systemd unit for keep-at, then enables and starts it.
 // Requires root.
 func Install(opts InstallOpts) error {
 	if err := requireRoot(); err != nil {
@@ -53,14 +61,18 @@ func Install(opts InstallOpts) error {
 	}
 	defer f.Close()
 
-	if err := unitTemplate.Execute(f, opts); err != nil {
+	data := unitTemplateData{
+		ExecStartLine: execStartLine(opts.ExecPath, opts.RunArgs),
+		User:          opts.User,
+	}
+	if err := unitTemplate.Execute(f, data); err != nil {
 		return fmt.Errorf("service: rendering unit file: %w", err)
 	}
 
 	for _, args := range [][]string{
 		{"daemon-reload"},
-		{"enable", "mimisbaeti"},
-		{"start", "mimisbaeti"},
+		{"enable", "keep-at"},
+		{"start", "keep-at"},
 	} {
 		if err := runSystemctl(args...); err != nil {
 			return err
@@ -70,7 +82,7 @@ func Install(opts InstallOpts) error {
 	return nil
 }
 
-// Uninstall stops, disables, and removes mimis' systemd unit. Requires
+// Uninstall stops, disables, and removes keep-at's systemd unit. Requires
 // root. It does not delete any downloaded torrent data.
 func Uninstall() error {
 	if err := requireRoot(); err != nil {
@@ -80,14 +92,33 @@ func Uninstall() error {
 		return err
 	}
 
-	_ = runSystemctl("stop", "mimisbaeti")
-	_ = runSystemctl("disable", "mimisbaeti")
+	_ = runSystemctl("stop", "keep-at")
+	_ = runSystemctl("disable", "keep-at")
 
 	if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("service: removing %s: %w", unitPath, err)
 	}
 
 	return runSystemctl("daemon-reload")
+}
+
+// execStartLine joins execPath and args into a single systemd ExecStart=
+// value, double-quoting any argument that contains whitespace (systemd
+// splits ExecStart on unquoted whitespace, same as a shell would).
+func execStartLine(execPath string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, quoteIfNeeded(execPath))
+	for _, a := range args {
+		parts = append(parts, quoteIfNeeded(a))
+	}
+	return strings.Join(parts, " ")
+}
+
+func quoteIfNeeded(s string) string {
+	if !strings.ContainsAny(s, " \t\"") {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
 }
 
 func runSystemctl(args ...string) error {

@@ -9,8 +9,8 @@ import (
 func TestStartStatusStop(t *testing.T) {
 	dir := t.TempDir()
 	m := Manager{
-		PIDFile: filepath.Join(dir, "mimis.pid"),
-		LogFile: filepath.Join(dir, "mimis.log"),
+		PIDFile: filepath.Join(dir, "keep-at.pid"),
+		LogFile: filepath.Join(dir, "keep-at.log"),
 	}
 
 	status, err := m.Status()
@@ -49,8 +49,8 @@ func TestStartStatusStop(t *testing.T) {
 func TestStartRejectsWhenAlreadyRunning(t *testing.T) {
 	dir := t.TempDir()
 	m := Manager{
-		PIDFile: filepath.Join(dir, "mimis.pid"),
-		LogFile: filepath.Join(dir, "mimis.log"),
+		PIDFile: filepath.Join(dir, "keep-at.pid"),
+		LogFile: filepath.Join(dir, "keep-at.log"),
 	}
 
 	if err := m.Start("/bin/sleep", []string{"30"}); err != nil {

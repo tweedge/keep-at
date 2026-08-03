@@ -5,12 +5,12 @@ VOICE_FINDER_LOG.md
 
 # Build artifacts
 /dist/
-/mimis
+/keep-at
 *.tar.gz
 
 # Go
 *.test
 *.out
 
-# Local runtime state if mimis is ever run from the repo root during dev
-/mimisbaeti.yaml
+# Local runtime state if keep-at is ever run from the repo root during dev
+/keep-at.yaml

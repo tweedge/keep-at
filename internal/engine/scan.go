@@ -6,27 +6,35 @@ import (
 	"sort"
 	"time"
 
-	"github.com/tweedge/mimisbaeti/internal/atcatalog"
-	"github.com/tweedge/mimisbaeti/internal/attorrent"
-	"github.com/tweedge/mimisbaeti/internal/filter"
-	"github.com/tweedge/mimisbaeti/internal/selector"
-	"github.com/tweedge/mimisbaeti/internal/state"
+	"github.com/tweedge/keep-at/internal/atcatalog"
+	"github.com/tweedge/keep-at/internal/attorrent"
+	"github.com/tweedge/keep-at/internal/filter"
+	"github.com/tweedge/keep-at/internal/netstats"
+	"github.com/tweedge/keep-at/internal/selector"
+	"github.com/tweedge/keep-at/internal/state"
 )
 
-// evaluatedCandidate is a catalog item mimis has fetched metadata and a
-// fresh scrape for, and is ready to rank and possibly act on.
+// evaluatedCandidate is a catalog item keep-at has fetched metadata and a
+// fresh scrape (and, if anyone was around to scrape, a swarm probe) for,
+// and is ready to rank and possibly act on.
 type evaluatedCandidate struct {
-	title    string
-	metadata *attorrent.Metadata
-	swarm    attorrent.SwarmCounts
+	title       string
+	metadata    *attorrent.Metadata
+	swarm       attorrent.SwarmCounts
+	keepAtPeers int // from probing the swarm once during evaluateCandidates; reused by tryAdd
 }
 
 // ScanOnce runs one full pass: refresh the catalog, drop anything Academic
-// Torrents has taken down, refresh seed counts for what mimis already
+// Torrents has taken down, refresh seed counts for what keep-at already
 // holds, and then look for new torrents to fill free space or displace
-// lower-priority ones. It's expected to take a while on a large catalog -
-// see PLAN.md - and is meant to be called periodically, not continuously.
+// lower-priority ones. It's expected to take a while on a large catalog,
+// and is meant to be called periodically, not continuously. Progress and
+// network-wide stats gathered along the way are persisted incrementally so
+// `keep-at network-status` can report on a scan that's still running.
 func (e *Engine) ScanOnce(ctx context.Context) error {
+	snapshot := netstats.Snapshot{ScanStartedAt: time.Now().UTC()}
+	e.saveNetworkStats(snapshot)
+
 	catalog, err := e.catalogFetcher.Load(ctx, e.cfg.Scan.Interval.AsDuration())
 	if err != nil && len(catalog.Items) == 0 {
 		return err
@@ -49,10 +57,42 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	e.removeDeletedTorrents(held, catalogHashes)
 	e.refreshHeldSeederCounts(ctx, held, catalogHashes)
 
-	candidates := e.evaluateCandidates(ctx, catalog, heldHashes)
-	ranked := rankEvaluated(candidates, e.cfg.Scan.MinSeedMargin)
+	snapshot.TotalCandidates = countPendingCandidates(catalog, heldHashes, e.blocklist)
+	e.saveNetworkStats(snapshot)
 
-	return e.actOnRanked(ctx, ranked)
+	tracker := netstats.NewTracker()
+	candidates := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, &snapshot)
+
+	ranked := rankEvaluated(candidates)
+	actErr := e.actOnRanked(ctx, ranked)
+
+	snapshot.ScanCompletedAt = time.Now().UTC()
+	snapshot.NodeCount = tracker.NodeCount()
+	snapshot.SeedingBytes = tracker.SeedingBytes()
+	snapshot.LeechingBytes = tracker.LeechingBytes()
+	e.saveNetworkStats(snapshot)
+
+	return actErr
+}
+
+// countPendingCandidates counts catalog items ScanOnce will actually walk
+// through this pass - excluding what's already held or keyword-blocked,
+// both of which are free to check without any network calls - so progress
+// reporting has a meaningful denominator before any fetching starts.
+func countPendingCandidates(catalog atcatalog.Catalog, heldHashes map[string]bool, blocklist interface {
+	Blocks(title, description string) (bool, string)
+}) int {
+	count := 0
+	for _, item := range catalog.Items {
+		if heldHashes[item.InfoHash.HexString()] {
+			continue
+		}
+		if blocked, _ := blocklist.Blocks(item.Title, item.Description); blocked {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 func (e *Engine) removeDeletedTorrents(held []state.Torrent, catalogHashes map[string]bool) {
@@ -92,11 +132,13 @@ func (e *Engine) refreshHeldSeederCounts(ctx context.Context, held []state.Torre
 	}
 }
 
-// evaluateCandidates walks the catalog and returns everything mimis
+// evaluateCandidates walks the catalog and returns everything keep-at
 // doesn't already hold, isn't keyword-blocked, and has aged past the
 // moderation delay - each with a fresh metadata fetch (cached where
-// possible) and tracker scrape.
-func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool) []evaluatedCandidate {
+// possible) and tracker scrape. Every candidate anyone at all is seeding
+// or leeching also gets a quick swarm probe, which feeds both the
+// anti-cascade decision later and the network-wide stats in tracker.
+func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, snapshot *netstats.Snapshot) []evaluatedCandidate {
 	now := time.Now().UTC()
 	minAge := e.cfg.Scan.ModerationDelay.AsDuration()
 
@@ -113,30 +155,59 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 			continue
 		}
 
-		md, err := e.fetchMetadata(ctx, item.InfoHash)
-		if err != nil {
-			e.logger.Warn("skipping candidate: could not fetch torrent metadata", "title", item.Title, "err", err)
-			continue
-		}
+		out = e.evaluateOneCandidate(ctx, item, now, minAge, tracker, out)
 
-		if !filter.AgeEligible(md.CreatedAt, minAge, now) {
-			continue
-		}
-
-		swarm, err := e.scrapeSwarm(ctx, md.Trackers, item.InfoHash)
-		if err != nil {
-			e.logger.Warn("skipping candidate: could not scrape trackers", "title", item.Title, "err", err)
-			continue
-		}
-
-		out = append(out, evaluatedCandidate{title: item.Title, metadata: md, swarm: swarm})
+		snapshot.ProcessedCandidates++
+		snapshot.NodeCount = tracker.NodeCount()
+		snapshot.SeedingBytes = tracker.SeedingBytes()
+		snapshot.LeechingBytes = tracker.LeechingBytes()
+		e.saveNetworkStats(*snapshot)
 	}
 	return out
 }
 
+func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, now time.Time, minAge time.Duration, tracker *netstats.Tracker, out []evaluatedCandidate) []evaluatedCandidate {
+	md, err := e.fetchMetadata(ctx, item.InfoHash)
+	if err != nil {
+		e.logger.Warn("skipping candidate: could not fetch torrent metadata", "title", item.Title, "err", err)
+		return out
+	}
+
+	if !filter.AgeEligible(md.CreatedAt, minAge, now) {
+		return out
+	}
+
+	swarm, err := e.scrapeSwarm(ctx, md.Trackers, item.InfoHash)
+	if err != nil {
+		e.logger.Warn("skipping candidate: could not scrape trackers", "title", item.Title, "err", err)
+		return out
+	}
+
+	keepAtPeerCount := 0
+	if swarm.Seeders+swarm.Leechers > 0 {
+		observed, err := e.probeSwarm(ctx, md.MetaInfo, e.probeTimeout)
+		if err != nil {
+			e.logger.Warn("could not probe swarm", "title", item.Title, "err", err)
+		}
+		sizeBytes := md.Info.TotalLength()
+		for _, obs := range observed {
+			tracker.Observe(obs.nodeKey, sizeBytes, obs.complete)
+		}
+		keepAtPeerCount = len(observed)
+	}
+
+	return append(out, evaluatedCandidate{title: item.Title, metadata: md, swarm: swarm, keepAtPeers: keepAtPeerCount})
+}
+
+func (e *Engine) saveNetworkStats(snapshot netstats.Snapshot) {
+	if err := netstats.Save(e.networkStatsPath(), snapshot); err != nil {
+		e.logger.Warn("failed to persist network stats", "err", err)
+	}
+}
+
 // rankEvaluated converts evaluated candidates into selector.Candidate and
 // orders them by seeding urgency.
-func rankEvaluated(candidates []evaluatedCandidate, _ int) []evaluatedCandidate {
+func rankEvaluated(candidates []evaluatedCandidate) []evaluatedCandidate {
 	sel := make([]selector.Candidate, len(candidates))
 	byHash := make(map[string]evaluatedCandidate, len(candidates))
 	for i, c := range candidates {
@@ -159,9 +230,7 @@ func rankEvaluated(candidates []evaluatedCandidate, _ int) []evaluatedCandidate 
 }
 
 // actOnRanked walks candidates in priority order, filling free space first
-// and falling back to displacing lower-priority held torrents (single for
-// single; combining several smaller held torrents to fit one larger
-// candidate isn't implemented in this version).
+// and falling back to displacing lower-priority held torrents.
 func (e *Engine) actOnRanked(ctx context.Context, ranked []evaluatedCandidate) error {
 	for _, c := range ranked {
 		if ctx.Err() != nil {
@@ -176,37 +245,32 @@ func (e *Engine) actOnRanked(ctx context.Context, ranked []evaluatedCandidate) e
 		}
 
 		if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
-			if e.tryAdd(ctx, c, sizeBytes, location, nil) {
+			if e.tryAdd(c, sizeBytes, location, nil) {
 				continue
 			}
 		}
 
-		e.trySwap(ctx, c, sizeBytes)
+		e.trySwap(c, sizeBytes)
 	}
 	return nil
 }
 
-// tryAdd probes the candidate's swarm for other mimis nodes, runs the
-// anti-cascade decision, and if it passes, starts downloading it into
-// location. displaced is nil for a plain free-space fill.
-func (e *Engine) tryAdd(ctx context.Context, c evaluatedCandidate, sizeBytes int64, location string, displaced []selector.Held) bool {
-	mimisPeers, err := e.probeMimisPeerCount(ctx, c.metadata.MetaInfo, e.probeTimeout)
-	if err != nil {
-		e.logger.Warn("could not probe swarm for mimis peers", "title", c.title, "err", err)
-	}
-
+// tryAdd runs the anti-cascade decision using the swarm probe already
+// gathered in evaluateCandidates, and if it passes, starts downloading the
+// candidate into location. displaced is nil for a plain free-space fill.
+func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, displaced []selector.Held) bool {
 	candidate := selector.Candidate{
-		InfoHash:   c.metadata.InfoHash,
-		Title:      c.title,
-		SizeBytes:  sizeBytes,
-		Seeders:    c.swarm.Seeders,
-		Leechers:   c.swarm.Leechers,
-		MimisPeers: mimisPeers,
+		InfoHash:    c.metadata.InfoHash,
+		Title:       c.title,
+		SizeBytes:   sizeBytes,
+		Seeders:     c.swarm.Seeders,
+		Leechers:    c.swarm.Leechers,
+		KeepAtPeers: c.keepAtPeers,
 	}
 
 	decision := selector.EvaluateSwap(candidate, displaced, e.cfg.Scan.MinSeedMargin, e.cfg.Aggressiveness, rand.Float64())
 	e.logger.Info("evaluated candidate", "title", c.title, "seeders", c.swarm.Seeders,
-		"mimis_peers", mimisPeers, "should_swap", decision.ShouldSwap, "reason", decision.Reason)
+		"keep_at_peers", c.keepAtPeers, "should_swap", decision.ShouldSwap, "reason", decision.Reason)
 
 	if !decision.ShouldSwap {
 		return false
@@ -219,25 +283,74 @@ func (e *Engine) tryAdd(ctx context.Context, c evaluatedCandidate, sizeBytes int
 	return true
 }
 
-// trySwap looks for a single held torrent, in a location with enough
-// room once freed, that this candidate can justifiably displace.
-func (e *Engine) trySwap(ctx context.Context, c evaluatedCandidate, sizeBytes int64) {
+// trySwap looks for held torrents, within a single storage location, that
+// this candidate can justifiably displace - one is enough if it's big
+// enough on its own, but if several smaller torrents each individually
+// clear the seed margin against this candidate, and their combined size
+// covers it, keep-at will remove all of them rather than only handling the
+// single-torrent case.
+func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64) {
 	held := e.state.All()
-	sort.SliceStable(held, func(i, j int) bool { return held[i].LastKnownSeeders > held[j].LastKnownSeeders })
 
+	byLocation := make(map[string][]state.Torrent)
 	for _, h := range held {
-		if h.SizeBytes < sizeBytes {
+		byLocation[h.StorageLocation] = append(byLocation[h.StorageLocation], h)
+	}
+
+	for location, inLocation := range byLocation {
+		displaced := selectDisplaceable(inLocation, c.swarm.Seeders, sizeBytes, e.cfg.Scan.MinSeedMargin)
+		if displaced == nil {
 			continue
 		}
-		displaced := []selector.Held{{InfoHash: h.InfoHash, Title: h.Title, SizeBytes: h.SizeBytes, Seeders: h.LastKnownSeeders}}
-		if !selector.MeetsSeedMargin(c.swarm.Seeders, displaced, e.cfg.Scan.MinSeedMargin) {
-			continue // cheap check first; skip the swarm probe entirely if this wouldn't qualify anyway
+
+		selHeld := make([]selector.Held, len(displaced))
+		for i, h := range displaced {
+			selHeld[i] = selector.Held{InfoHash: h.InfoHash, Title: h.Title, SizeBytes: h.SizeBytes, Seeders: h.LastKnownSeeders}
 		}
-		if e.tryAdd(ctx, c, sizeBytes, h.StorageLocation, displaced) {
-			if err := e.RemoveTorrent(h.InfoHash, h.StorageLocation); err != nil {
-				e.logger.Error("failed to remove displaced torrent", "title", h.Title, "err", err)
+
+		if e.tryAdd(c, sizeBytes, location, selHeld) {
+			for _, h := range displaced {
+				if err := e.RemoveTorrent(h.InfoHash, h.StorageLocation); err != nil {
+					e.logger.Error("failed to remove displaced torrent", "title", h.Title, "err", err)
+				}
 			}
 			return
 		}
 	}
+}
+
+// selectDisplaceable picks the smallest set of held torrents (within one
+// location) that the candidate can displace: each one individually must
+// clear the seed margin against the candidate (selector.MeetsSeedMargin
+// checks the whole set against its minimum, so requiring every member to
+// individually qualify - rather than relying on averaging - is what keeps
+// this from evicting a torrent that wouldn't qualify on its own just
+// because it's bundled with others that do), and their combined size must
+// cover what the candidate needs. Returns nil if this location can't
+// accommodate the swap even using every torrent that qualifies.
+func selectDisplaceable(inLocation []state.Torrent, candidateSeeders int, sizeNeeded int64, minSeedMargin int) []state.Torrent {
+	var qualifying []state.Torrent
+	for _, h := range inLocation {
+		if h.LastKnownSeeders-minSeedMargin >= candidateSeeders {
+			qualifying = append(qualifying, h)
+		}
+	}
+	if len(qualifying) == 0 {
+		return nil
+	}
+
+	// Displace the least valuable (most-seeded, i.e. least in need of
+	// keep-at specifically) torrents first.
+	sort.SliceStable(qualifying, func(i, j int) bool { return qualifying[i].LastKnownSeeders > qualifying[j].LastKnownSeeders })
+
+	var chosen []state.Torrent
+	var freed int64
+	for _, h := range qualifying {
+		chosen = append(chosen, h)
+		freed += h.SizeBytes
+		if freed >= sizeNeeded {
+			return chosen
+		}
+	}
+	return nil // even all qualifying torrents in this location aren't enough room
 }

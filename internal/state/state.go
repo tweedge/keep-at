@@ -1,6 +1,6 @@
-// Package state tracks what mimis currently holds and seeds, persisted as
+// Package state tracks what keep-at currently holds and seeds, persisted as
 // plain JSON so an operator can read it directly if something needs
-// investigating - mimis is meant to run hands-off, but "hands-off" doesn't
+// investigating - keep-at is meant to run hands-off, but "hands-off" doesn't
 // mean "opaque."
 package state
 
@@ -14,7 +14,7 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 )
 
-// Torrent is one item mimis currently stores and seeds.
+// Torrent is one item keep-at currently stores and seeds.
 type Torrent struct {
 	InfoHash        metainfo.Hash `json:"info_hash"`
 	Title           string        `json:"title"`
@@ -27,7 +27,7 @@ type Torrent struct {
 	LastKnownSeeders int `json:"last_known_seeders"`
 }
 
-// State is mimis' full persisted view of what it's holding. It's safe for
+// State is keep-at's full persisted view of what it's holding. It's safe for
 // concurrent use.
 type State struct {
 	mu      sync.Mutex

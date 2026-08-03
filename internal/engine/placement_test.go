@@ -3,7 +3,7 @@ package engine
 import (
 	"testing"
 
-	"github.com/tweedge/mimisbaeti/internal/config"
+	"github.com/tweedge/keep-at/internal/config"
 )
 
 func TestChooseLocationExcludesTooSmall(t *testing.T) {

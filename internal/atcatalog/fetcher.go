@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Fetcher wraps database.xml retrieval with an on-disk cache, so mimis only
+// Fetcher wraps database.xml retrieval with an on-disk cache, so keep-at only
 // hits Academic Torrents when the cache is missing or older than MaxAge.
 type Fetcher struct {
 	CachePath  string

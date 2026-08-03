@@ -6,7 +6,7 @@ import (
 )
 
 // Run scans immediately, then on every Scan.Interval tick thereafter,
-// until ctx is cancelled. It's the main loop for `mimis run`.
+// until ctx is cancelled. It's the main loop for `keep-at run`.
 func (e *Engine) Run(ctx context.Context) error {
 	if err := e.ScanOnce(ctx); err != nil {
 		e.logger.Error("initial scan failed", "err", err)

@@ -6,14 +6,14 @@ import (
 	"os"
 	"time"
 
-	"github.com/tweedge/mimisbaeti/internal/buildinfo"
-	"github.com/tweedge/mimisbaeti/internal/updater"
+	"github.com/tweedge/keep-at/internal/buildinfo"
+	"github.com/tweedge/keep-at/internal/updater"
 )
 
 func cmdSelfUpdate(args []string) error {
 	execPath, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("locating mimis executable: %w", err)
+		return fmt.Errorf("locating keep-at executable: %w", err)
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
@@ -27,6 +27,6 @@ func cmdSelfUpdate(args []string) error {
 	}
 
 	fmt.Printf("updated to %s\n", newVersion)
-	fmt.Println("restart mimis (or `mimis stop && mimis start`) to run the new version")
+	fmt.Println("restart keep-at (or `keep-at stop && keep-at start`) to run the new version")
 	return nil
 }

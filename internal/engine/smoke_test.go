@@ -11,12 +11,12 @@ import (
 
 	"github.com/anacrolix/torrent/metainfo"
 
-	"github.com/tweedge/mimisbaeti/internal/config"
+	"github.com/tweedge/keep-at/internal/config"
 )
 
 // smokeTestItem is a real, small, already-seeded Academic Torrents entry,
 // hand-picked so this test can complete in seconds instead of the
-// significant-time full-catalog scan PLAN.md describes. Picked by checking
+// significant-time full-catalog scan a real run does. Picked by checking
 // real scrape.php results for a handful of the smallest catalog entries
 // and keeping the ones with live seeders.
 type smokeTestItem struct {
@@ -30,14 +30,14 @@ var smokeTestItems = []smokeTestItem{
 	{"Multiple-Instance Learning of Real-Valued Data", "936a92932c01c3f5e9994ae8bd2115f4ccb4adc9", 7100},
 }
 
-// TestSmokeRealAcademicTorrents is the smoke test PLAN.md asks for: a real
-// run against the live Academic Torrents catalog, capped to a handful of
-// small, already-available torrents and 1GB of scratch space in /tmp. It's
-// skipped by default since it depends on live network access and real
-// third-party infrastructure; set MIMIS_SMOKE_TEST=1 to run it.
+// TestSmokeRealAcademicTorrents is a real run against the live Academic
+// Torrents catalog, capped to a handful of small, already-available
+// torrents and 1GB of scratch space in /tmp. It's skipped by default since
+// it depends on live network access and real third-party infrastructure;
+// set KEEPAT_SMOKE_TEST=1 to run it.
 func TestSmokeRealAcademicTorrents(t *testing.T) {
-	if os.Getenv("MIMIS_SMOKE_TEST") != "1" {
-		t.Skip("set MIMIS_SMOKE_TEST=1 to run the real Academic Torrents smoke test")
+	if os.Getenv("KEEPAT_SMOKE_TEST") != "1" {
+		t.Skip("set KEEPAT_SMOKE_TEST=1 to run the real Academic Torrents smoke test")
 	}
 
 	mux := http.NewServeMux()
@@ -54,20 +54,20 @@ func TestSmokeRealAcademicTorrents(t *testing.T) {
 <infohash>%s</infohash>
 <guid>https://academictorrents.com/details/%s</guid>
 <link>https://academictorrents.com/details/%s</link>
-<description>mimis smoke test fixture</description>
+<description>keep-at smoke test fixture</description>
 <size>%d</size>
 </item>`, item.title, item.infoHash, item.infoHash, item.infoHash, item.size)
 		}
 		fmt.Fprint(w, `</channel></rss>`)
 	})
 
-	dataDir, err := os.MkdirTemp("/tmp", "mimis-smoke-data-")
+	dataDir, err := os.MkdirTemp("/tmp", "keep-at-smoke-data-")
 	if err != nil {
 		t.Fatalf("creating data dir: %v", err)
 	}
 	defer os.RemoveAll(dataDir)
 
-	storageDir, err := os.MkdirTemp("/tmp", "mimis-smoke-storage-")
+	storageDir, err := os.MkdirTemp("/tmp", "keep-at-smoke-storage-")
 	if err != nil {
 		t.Fatalf("creating storage dir: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestSmokeRealAcademicTorrents(t *testing.T) {
 	if len(held) == 0 {
 		t.Fatalf("expected at least one smoke-test torrent to be selected and held")
 	}
-	t.Logf("mimis selected %d torrent(s) from the smoke-test catalog", len(held))
+	t.Logf("keep-at selected %d torrent(s) from the smoke-test catalog", len(held))
 
 	for _, h := range held {
 		t.Logf("held: %s (%s, %d bytes)", h.Title, h.InfoHash.HexString(), h.SizeBytes)

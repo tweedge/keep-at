@@ -1,6 +1,6 @@
-// Package filter implements mimis' pre-selection gates: keyword blocking and
+// Package filter implements keep-at's pre-selection gates: keyword blocking and
 // the moderation-age delay. Both answer the same kind of question - "should
-// mimis even consider this torrent?" - before the selector package gets to
+// keep-at even consider this torrent?" - before the selector package gets to
 // asking "how urgently does it need seeding?"
 package filter
 
@@ -10,7 +10,7 @@ import "strings"
 // contains any blocked keyword, case-insensitively. Academic Torrents'
 // database.xml only carries title, category, and description - there's no
 // separate author/abstract/keywords field in the bulk catalog file, so
-// that's what mimis actually has to filter on without making a per-item API
+// that's what keep-at actually has to filter on without making a per-item API
 // call for every single catalog entry (which would defeat the point of
 // downloading the catalog in bulk in the first place).
 type KeywordBlocklist struct {
@@ -31,7 +31,7 @@ func NewKeywordBlocklist(keywords []string) KeywordBlocklist {
 }
 
 // Blocks reports whether title or description matches a blocked keyword,
-// and if so, which one - useful for logging why mimis skipped something.
+// and if so, which one - useful for logging why keep-at skipped something.
 func (b KeywordBlocklist) Blocks(title, description string) (blocked bool, matched string) {
 	haystack := strings.ToLower(title + " " + description)
 	for _, kw := range b.keywords {

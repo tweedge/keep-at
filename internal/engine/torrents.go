@@ -2,19 +2,20 @@ package engine
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"time"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 
-	"github.com/tweedge/mimisbaeti/internal/attorrent"
-	"github.com/tweedge/mimisbaeti/internal/buildinfo"
-	"github.com/tweedge/mimisbaeti/internal/piecestore"
-	"github.com/tweedge/mimisbaeti/internal/state"
+	"github.com/tweedge/keep-at/internal/attorrent"
+	"github.com/tweedge/keep-at/internal/buildinfo"
+	"github.com/tweedge/keep-at/internal/piecestore"
+	"github.com/tweedge/keep-at/internal/state"
 )
 
-// resumeHeldTorrents re-adds every torrent mimis' state says it holds back
+// resumeHeldTorrents re-adds every torrent keep-at's state says it holds back
 // into the BitTorrent client on startup, so it resumes seeding immediately
 // rather than waiting for the next scan.
 func (e *Engine) resumeHeldTorrents() error {
@@ -59,7 +60,7 @@ func (e *Engine) addTorrentSpec(mi *metainfo.MetaInfo, store *piecestore.Client)
 }
 
 // AddCandidate starts downloading and seeding a newly-selected torrent,
-// recording it in mimis' persisted state. Callers are expected to have
+// recording it in keep-at's persisted state. Callers are expected to have
 // already fetched md via Engine.fetchMetadata, which caches the .torrent
 // file this depends on for resuming after a restart.
 func (e *Engine) AddCandidate(md *attorrent.Metadata, storageLocation string, sizeBytes int64, title string) error {
@@ -86,7 +87,7 @@ func (e *Engine) AddCandidate(md *attorrent.Metadata, storageLocation string, si
 }
 
 // RemoveTorrent stops seeding a held torrent, deletes its stored data, and
-// drops it from mimis' persisted state. Used both for swaps (displacing a
+// drops it from keep-at's persisted state. Used both for swaps (displacing a
 // lower-priority torrent) and for content removed from Academic Torrents.
 func (e *Engine) RemoveTorrent(infoHash metainfo.Hash, storageLocation string) error {
 	if t, ok := e.torrentClient.Torrent(infoHash); ok {
@@ -104,18 +105,36 @@ func (e *Engine) RemoveTorrent(infoHash metainfo.Hash, storageLocation string) e
 	return e.state.Remove(infoHash)
 }
 
-// mimisPeerCount counts currently-connected peers on t that self-identify
-// as mimis in the BitTorrent extended handshake. It's a lower bound: it
-// only sees peers we're actually connected to, not the whole swarm, and a
-// hostile peer could claim to be mimis when it isn't. See buildinfo for why
-// that's an accepted tradeoff.
-func mimisPeerCount(t *torrent.Torrent) int {
-	count := 0
+// peerObservation is one connected peer that self-identified as keep-at,
+// with enough detail to feed both the anti-cascade decision (just the
+// count) and network-wide stats (node identity and seed/leech state).
+type peerObservation struct {
+	nodeKey  string // best-effort node identity, see netstats.Tracker's doc comment
+	complete bool   // whether this peer has every piece of this torrent
+}
+
+// keepAtPeers returns one observation per currently-connected peer on t
+// that self-identifies as keep-at in the BitTorrent extended handshake.
+// It's a lower bound: it only sees peers we're actually connected to, not
+// the whole swarm, and a hostile peer could claim to be keep-at when it
+// isn't. See buildinfo for why that's an accepted tradeoff.
+func keepAtPeers(t *torrent.Torrent) []peerObservation {
+	var out []peerObservation
+	totalPieces := uint64(t.NumPieces())
+
 	for _, pc := range t.PeerConns() {
 		name, _ := pc.PeerClientName.Load().(string)
-		if len(name) >= len(buildinfo.ClientName) && name[:len(buildinfo.ClientName)] == buildinfo.ClientName {
-			count++
+		if len(name) < len(buildinfo.ClientName) || name[:len(buildinfo.ClientName)] != buildinfo.ClientName {
+			continue
 		}
+
+		nodeKey := pc.RemoteAddr.String()
+		if host, _, err := net.SplitHostPort(nodeKey); err == nil {
+			nodeKey = host
+		}
+
+		complete := totalPieces > 0 && pc.PeerPieces().GetCardinality() >= totalPieces
+		out = append(out, peerObservation{nodeKey: nodeKey, complete: complete})
 	}
-	return count
+	return out
 }

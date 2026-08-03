@@ -1,5 +1,5 @@
-// Package updater implements mimis' self-update command: check GitHub
-// releases for tweedge/mimisbaeti, download the asset matching the current
+// Package updater implements keep-at's self-update command: check GitHub
+// releases for tweedge/keep-at, download the asset matching the current
 // OS/architecture, and replace the running binary.
 package updater
 
@@ -15,11 +15,11 @@ import (
 	"runtime"
 )
 
-// ReleasesURL is GitHub's API endpoint for the latest mimis release.
+// ReleasesURL is GitHub's API endpoint for the latest keep-at release.
 // Release assets are expected to be named
-// mimisbaeti_<GOOS>_<GOARCH>.tar.gz, each containing a single "mimis"
+// keep-at_<GOOS>_<GOARCH>.tar.gz, each containing a single "keep-at"
 // binary - see the build scripts.
-const ReleasesURL = "https://api.github.com/repos/tweedge/mimisbaeti/releases/latest"
+const ReleasesURL = "https://api.github.com/repos/tweedge/keep-at/releases/latest"
 
 type release struct {
 	TagName string  `json:"tag_name"`
@@ -57,7 +57,7 @@ func applyFromURL(client *http.Client, userAgent, currentExecPath, releasesURL s
 		return "", err
 	}
 
-	assetName := fmt.Sprintf("mimisbaeti_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+	assetName := fmt.Sprintf("keep-at_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
 	var downloadURL string
 	for _, a := range rel.Assets {
 		if a.Name == assetName {
@@ -107,7 +107,7 @@ func fetchLatestRelease(client *http.Client, userAgent, releasesURL string) (*re
 }
 
 // downloadBinary fetches a .tar.gz release asset and extracts the single
-// "mimis" binary from it into memory.
+// "keep-at" binary from it into memory.
 func downloadBinary(client *http.Client, userAgent, url string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -135,12 +135,13 @@ func downloadBinary(client *http.Client, userAgent, url string) ([]byte, error) 
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
-			return nil, fmt.Errorf("updater: %s did not contain a mimis binary", url)
+			return nil, fmt.Errorf("updater: %s did not contain a keep-at binary", url)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("updater: reading tar archive: %w", err)
 		}
-		if filepath.Base(hdr.Name) != "mimis" {
+		base := filepath.Base(hdr.Name)
+		if base != "keep-at" && base != "keep-at.exe" {
 			continue
 		}
 		return io.ReadAll(tr)
@@ -157,7 +158,7 @@ func replaceExecutable(targetPath string, newBinary []byte) error {
 	}
 
 	dir := filepath.Dir(targetPath)
-	tmp, err := os.CreateTemp(dir, ".mimis-update-*")
+	tmp, err := os.CreateTemp(dir, ".keep-at-update-*")
 	if err != nil {
 		return fmt.Errorf("updater: creating temp file in %s: %w", dir, err)
 	}

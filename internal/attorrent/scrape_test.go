@@ -73,11 +73,11 @@ func TestScrapeHTTPParsesBencodeResponse(t *testing.T) {
 }
 
 // TestScrapeHTTPLiveAgainstAcademicTorrents is a smoke test against the
-// real academictorrents.com tracker. It only runs when MIMIS_LIVE_TEST=1 is
+// real academictorrents.com tracker. It only runs when KEEPAT_LIVE_TEST=1 is
 // set, so normal `go test` runs never depend on network access.
 func TestScrapeHTTPLiveAgainstAcademicTorrents(t *testing.T) {
-	if os.Getenv("MIMIS_LIVE_TEST") != "1" {
-		t.Skip("set MIMIS_LIVE_TEST=1 to run this against the real academictorrents.com tracker")
+	if os.Getenv("KEEPAT_LIVE_TEST") != "1" {
+		t.Skip("set KEEPAT_LIVE_TEST=1 to run this against the real academictorrents.com tracker")
 	}
 
 	var hash metainfo.Hash

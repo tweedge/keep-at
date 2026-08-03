@@ -14,7 +14,7 @@ import (
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
 
-	"github.com/tweedge/mimisbaeti/internal/config"
+	"github.com/tweedge/keep-at/internal/config"
 )
 
 // buildTestTorrent creates a small single-file torrent on disk and returns

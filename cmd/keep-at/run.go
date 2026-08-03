@@ -9,30 +9,30 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/tweedge/mimisbaeti/internal/config"
-	"github.com/tweedge/mimisbaeti/internal/engine"
+	"github.com/tweedge/keep-at/internal/config"
+	"github.com/tweedge/keep-at/internal/engine"
 )
 
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	configPath := fs.String("config", defaultConfigPath(), "path to mimis config file")
+	cf := addConfigFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	return runForeground(*configPath)
-}
-
-// runForeground loads config, builds the engine, and blocks running scans
-// until it receives SIGINT or SIGTERM. Both `mimis run` and a daemonized
-// `mimis start` end up here - the only difference is whether something
-// forked this process into the background first.
-func runForeground(configPath string) error {
-	cfg, err := config.Load(configPath)
+	cfg, err := cf.resolve(fs)
 	if err != nil {
-		return fmt.Errorf("loading config: %w", err)
+		return err
 	}
 
+	return runForeground(cfg)
+}
+
+// runForeground builds the engine from an already-resolved config and
+// blocks running scans until it receives SIGINT or SIGTERM. Both `keep-at
+// run` and a daemonized `keep-at start` end up here - the only difference
+// is whether something forked this process into the background first.
+func runForeground(cfg config.Config) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return fmt.Errorf("creating data dir %s: %w", cfg.DataDir, err)
 	}
@@ -48,6 +48,6 @@ func runForeground(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	logger.Info("mimis started", "config", configPath, "port", cfg.Port)
+	logger.Info("keep-at started", "port", cfg.Port, "data_dir", cfg.DataDir)
 	return e.Run(ctx)
 }

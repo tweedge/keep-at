@@ -1,7 +1,7 @@
 // Package atcatalog fetches and parses Academic Torrents' database.xml, the
 // full catalog of everything hosted there. AT explicitly recommends
 // downloading this file and searching it locally rather than hitting their
-// site per-query, so that's what mimis does: pull it once, cache it to
+// site per-query, so that's what keep-at does: pull it once, cache it to
 // disk, and only refetch when it's stale or missing.
 package atcatalog
 
@@ -21,7 +21,7 @@ import (
 const DefaultURL = "https://academictorrents.com/database.xml"
 
 // Item is one entry from the catalog. AT's database.xml doesn't carry a
-// seeder count or an upload date - see the attorrent package for how mimis
+// seeder count or an upload date - see the attorrent package for how keep-at
 // gets those from the .torrent file and tracker scrapes instead.
 type Item struct {
 	Title       string

@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// IsContainerized makes a best-effort guess at whether mimis is running
+// IsContainerized makes a best-effort guess at whether keep-at is running
 // inside a container, so the CLI can default to foreground mode there -
 // daemonizing (forking into the background and exiting) inside a container
 // just kills the container the moment the parent process exits.

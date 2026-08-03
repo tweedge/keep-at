@@ -1,7 +1,7 @@
-// Package daemonctl implements mimis' default start/stop/status behavior:
+// Package daemonctl implements keep-at's default start/stop/status behavior:
 // forking itself into the background with a PID file, independent of
 // whatever OS service manager (if any) is also managing it. This is what
-// makes `mimis start` work the same way on a laptop, a bare Raspberry Pi,
+// makes `keep-at start` work the same way on a laptop, a bare Raspberry Pi,
 // or inside a container that skips daemonization entirely and just runs in
 // the foreground.
 package daemonctl
@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// Manager owns one mimis process's PID file and log file.
+// Manager owns one keep-at process's PID file and log file.
 type Manager struct {
 	PIDFile string
 	LogFile string

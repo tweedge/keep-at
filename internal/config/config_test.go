@@ -82,7 +82,7 @@ func TestValidateRejectsBadAggressiveness(t *testing.T) {
 
 func TestLoadWritesStarterConfigWhenMissing(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "mimis.yaml")
+	path := filepath.Join(dir, "keep-at.yaml")
 
 	_, err := Load(path)
 	if err == nil {
@@ -95,7 +95,7 @@ func TestLoadWritesStarterConfigWhenMissing(t *testing.T) {
 
 func TestLoadParsesAndValidatesExistingConfig(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "mimis.yaml")
+	path := filepath.Join(dir, "keep-at.yaml")
 	contents := "port: 40000\n" +
 		"aggressiveness: 0.6\n" +
 		"storage:\n" +

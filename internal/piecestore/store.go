@@ -1,9 +1,9 @@
-// Package piecestore is mimis' storage backend for anacrolix/torrent. Every
+// Package piecestore is keep-at's storage backend for anacrolix/torrent. Every
 // piece is gzip-compressed once it's verified and stored under a per-torrent
 // directory named after the infohash; there's no attempt to reconstruct the
 // original file layout, since the plan explicitly says stored data doesn't
 // need to be locally readable. That constraint is what makes per-piece
-// compression simple: mimis owns the byte layout end to end.
+// compression simple: keep-at owns the byte layout end to end.
 package piecestore
 
 import (
@@ -18,8 +18,8 @@ import (
 )
 
 // DefaultDecompressCacheBytes bounds how much decompressed piece data
-// mimis keeps warm in memory to serve chunk requests without re-inflating
-// gzip streams repeatedly. Kept modest by default so mimis stays light on
+// keep-at keeps warm in memory to serve chunk requests without re-inflating
+// gzip streams repeatedly. Kept modest by default so keep-at stays light on
 // small boxes like a Raspberry Pi.
 const DefaultDecompressCacheBytes = 64 << 20 // 64 MiB
 
@@ -30,7 +30,7 @@ type Client struct {
 }
 
 // New creates a piece store rooted at baseDir. baseDir is one of the user's
-// configured storage locations, not mimis' data_dir.
+// configured storage locations, not keep-at's data_dir.
 func New(baseDir string) (*Client, error) {
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		return nil, fmt.Errorf("piecestore: creating base dir: %w", err)

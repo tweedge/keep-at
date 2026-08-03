@@ -1,6 +1,6 @@
-// Package selector implements mimis' two central decisions: which torrent
+// Package selector implements keep-at's two central decisions: which torrent
 // is most urgently in need of seeding, and whether swapping to it right now
-// would risk a cascade (every mimis node globally piling onto the same
+// would risk a cascade (every keep-at node globally piling onto the same
 // under-seeded torrent at once).
 package selector
 
@@ -11,15 +11,15 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 )
 
-// Candidate is a torrent mimis is considering downloading, combining
+// Candidate is a torrent keep-at is considering downloading, combining
 // catalog metadata with a fresh tracker scrape.
 type Candidate struct {
-	InfoHash   metainfo.Hash
-	Title      string
-	SizeBytes  int64
-	Seeders    int
-	Leechers   int
-	MimisPeers int // peers in the swarm that self-identified as mimis, see buildinfo.ClientName
+	InfoHash    metainfo.Hash
+	Title       string
+	SizeBytes   int64
+	Seeders     int
+	Leechers    int
+	KeepAtPeers int // peers in the swarm that self-identified as keep-at, see buildinfo.ClientName
 }
 
 // Available reports whether a candidate meets the availability bar: at
@@ -27,14 +27,14 @@ type Candidate struct {
 // (i.e. leechers whose combined pieces cover 100% of the torrent even with
 // zero full seeds) to count as available, but verifying that requires
 // per-peer piece-map inspection across the whole swarm, which is expensive
-// to do for every catalog candidate during a scan. mimis uses the cheaper,
+// to do for every catalog candidate during a scan. keep-at uses the cheaper,
 // conservative signal instead: a torrent isn't a candidate until someone
 // can serve 100% of it outright.
 func (c Candidate) Available() bool {
 	return c.Seeders >= 1
 }
 
-// Held is a torrent mimis currently stores and seeds.
+// Held is a torrent keep-at currently stores and seeds.
 type Held struct {
 	InfoHash  metainfo.Hash
 	Title     string
@@ -44,7 +44,7 @@ type Held struct {
 
 // RankCandidates orders candidates by seeding urgency: fewest seeds first,
 // with smaller torrents preferred as a tie-break (they're cheaper to try
-// first while mimis works down the list). Candidates that aren't Available
+// first while keep-at works down the list). Candidates that aren't Available
 // are excluded entirely, since they'd stall a download indefinitely.
 func RankCandidates(candidates []Candidate) []Candidate {
 	ranked := make([]Candidate, 0, len(candidates))
@@ -62,29 +62,28 @@ func RankCandidates(candidates []Candidate) []Candidate {
 	return ranked
 }
 
-// AntiCascadeChance is n from PLAN.md: the probability mimis proceeds with
-// a candidate given how many other mimis nodes are already on it.
+// AntiCascadeChance is n: the probability keep-at proceeds with a
+// candidate given how many other keep-at nodes are already on it. See
+// DESIGN.md for the full rationale.
 //
-// With zero other mimis nodes present, n is 1: go ahead confidently. As
-// more mimis nodes join the swarm, n shrinks toward zero, since
+// With zero other keep-at nodes present, n is 1: go ahead confidently. As
+// more keep-at nodes join the swarm, n shrinks toward zero, since
 // aggressiveness is strictly between 0 and 1. This is the direction that
-// actually prevents a cascade - later mimis nodes progressively back off
-// from a torrent the swarm has already piled onto. (PLAN.md's own text
-// describes rolling "higher than n" to swap, which would do the opposite -
-// see EvaluateSwap's doc comment for why mimis rolls the other way.)
-func AntiCascadeChance(aggressiveness float64, mimisPeers int) float64 {
-	if mimisPeers < 0 {
-		mimisPeers = 0
+// actually prevents a cascade - later keep-at nodes progressively back off
+// from a torrent the swarm has already piled onto.
+func AntiCascadeChance(aggressiveness float64, keepAtPeers int) float64 {
+	if keepAtPeers < 0 {
+		keepAtPeers = 0
 	}
-	return math.Pow(aggressiveness, float64(mimisPeers))
+	return math.Pow(aggressiveness, float64(keepAtPeers))
 }
 
 // MeetsSeedMargin reports whether candidateSeeders is at least minSeedMargin
 // lower than every torrent in displaced. It's cheap (no swarm probing
 // involved) and deliberately checkable before EvaluateSwap so callers can
-// skip an expensive mimis-peer probe for candidates that would fail this
+// skip an expensive keep-at-peer probe for candidates that would fail this
 // check anyway. An empty displaced list always passes: there's nothing to
-// beat when mimis is just filling free space, not swapping.
+// beat when keep-at is just filling free space, not swapping.
 func MeetsSeedMargin(candidateSeeders int, displaced []Held, minSeedMargin int) bool {
 	if len(displaced) == 0 {
 		return true
@@ -107,16 +106,9 @@ type SwapDecision struct {
 }
 
 // EvaluateSwap decides whether to start downloading candidate, optionally
-// displacing the torrents in displaced to make room.
-//
-// PLAN.md defines n as "the chance that mimis swaps to the new torrent,"
-// which only prevents a global cascade if the roll succeeds *more* often
-// when n is *larger*. Its literal wording ("if mimis rolls higher than n,
-// swap") does the opposite: n shrinks as more mimis nodes join a swarm, so
-// rolling above a shrinking threshold gets easier over time, encouraging
-// exactly the pile-on the mechanism exists to prevent. mimis implements the
-// definition ("n = chance mimis swaps") rather than the inverted
-// comparison: it swaps when roll < n.
+// displacing the torrents in displaced to make room. It swaps when roll <
+// n: see DESIGN.md for why that comparison direction, not the reverse, is
+// what actually discourages a cascade.
 //
 // roll must be a fresh uniform [0, 1) draw per call; it's a parameter
 // rather than generated internally so this stays deterministic to test.
@@ -129,12 +121,12 @@ func EvaluateSwap(candidate Candidate, displaced []Held, minSeedMargin int, aggr
 		return SwapDecision{ShouldSwap: false, Reason: "candidate does not beat displaced torrents by the required margin"}
 	}
 
-	chance := AntiCascadeChance(aggressiveness, candidate.MimisPeers)
+	chance := AntiCascadeChance(aggressiveness, candidate.KeepAtPeers)
 	shouldSwap := roll < chance
 
 	reason := "anti-cascade roll succeeded"
 	if !shouldSwap {
-		reason = "anti-cascade roll failed; backing off while other mimis nodes are already on this torrent"
+		reason = "anti-cascade roll failed; backing off while other keep-at nodes are already on this torrent"
 	}
 
 	return SwapDecision{ShouldSwap: shouldSwap, Chance: chance, Roll: roll, Reason: reason}

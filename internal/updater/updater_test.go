@@ -19,7 +19,7 @@ func buildFakeReleaseAsset(t *testing.T, binaryContent []byte) []byte {
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
 
-	if err := tw.WriteHeader(&tar.Header{Name: "mimis", Mode: 0o755, Size: int64(len(binaryContent))}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Name: "keep-at", Mode: 0o755, Size: int64(len(binaryContent))}); err != nil {
 		t.Fatalf("writing tar header: %v", err)
 	}
 	if _, err := tw.Write(binaryContent); err != nil {
@@ -35,9 +35,9 @@ func buildFakeReleaseAsset(t *testing.T, binaryContent []byte) []byte {
 }
 
 func TestApplyDownloadsAndReplacesBinary(t *testing.T) {
-	newContent := []byte("new mimis binary contents")
+	newContent := []byte("new keep-at binary contents")
 	assetBytes := buildFakeReleaseAsset(t, newContent)
-	assetName := fmt.Sprintf("mimisbaeti_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+	assetName := fmt.Sprintf("keep-at_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -52,7 +52,7 @@ func TestApplyDownloadsAndReplacesBinary(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	execPath := filepath.Join(dir, "mimis")
+	execPath := filepath.Join(dir, "keep-at")
 	if err := os.WriteFile(execPath, []byte("old binary contents"), 0o755); err != nil {
 		t.Fatalf("seeding old binary: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestApplyErrorsWhenAssetMissing(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	execPath := filepath.Join(dir, "mimis")
+	execPath := filepath.Join(dir, "keep-at")
 	if err := os.WriteFile(execPath, []byte("old"), 0o755); err != nil {
 		t.Fatalf("seeding old binary: %v", err)
 	}

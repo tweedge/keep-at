@@ -9,24 +9,24 @@ func TestAntiCascadeChance(t *testing.T) {
 	cases := []struct {
 		name           string
 		aggressiveness float64
-		mimisPeers     int
+		keepAtPeers    int
 		want           float64
 	}{
-		{"no other mimis nodes", 0.6, 0, 1.0},
+		{"no other keep-at nodes", 0.6, 0, 1.0},
 		{"one other node", 0.6, 1, 0.6},
 		{"two other nodes", 0.6, 2, 0.36},
 		{"negative peers clamped to zero", 0.6, -5, 1.0},
 	}
 	for _, c := range cases {
-		got := AntiCascadeChance(c.aggressiveness, c.mimisPeers)
+		got := AntiCascadeChance(c.aggressiveness, c.keepAtPeers)
 		if math.Abs(got-c.want) > 1e-9 {
-			t.Errorf("%s: AntiCascadeChance(%v, %d) = %v, want %v", c.name, c.aggressiveness, c.mimisPeers, got, c.want)
+			t.Errorf("%s: AntiCascadeChance(%v, %d) = %v, want %v", c.name, c.aggressiveness, c.keepAtPeers, got, c.want)
 		}
 	}
 }
 
 func TestAntiCascadeChanceDecreasesAsNodesJoin(t *testing.T) {
-	// This is the whole point of the mechanism: each additional mimis node
+	// This is the whole point of the mechanism: each additional keep-at node
 	// already on a torrent should make it strictly less likely (or at least
 	// no more likely) that yet another node piles on.
 	aggressiveness := 0.6
@@ -34,7 +34,7 @@ func TestAntiCascadeChanceDecreasesAsNodesJoin(t *testing.T) {
 	for n := 1; n <= 20; n++ {
 		cur := AntiCascadeChance(aggressiveness, n)
 		if cur >= prev {
-			t.Fatalf("chance did not decrease at mimisPeers=%d: prev=%v cur=%v", n, prev, cur)
+			t.Fatalf("chance did not decrease at keepAtPeers=%d: prev=%v cur=%v", n, prev, cur)
 		}
 		prev = cur
 	}
@@ -79,30 +79,30 @@ func TestEvaluateSwapEnforcesSeedMargin(t *testing.T) {
 }
 
 func TestEvaluateSwapAllowsSwapWhenMarginMetAndRollSucceeds(t *testing.T) {
-	candidate := Candidate{Seeders: 1, MimisPeers: 0} // chance = 1.0 with 0 peers
-	displaced := []Held{{Seeders: 10}, {Seeders: 8}}  // min displaced = 8, margin 3 -> need <= 5
+	candidate := Candidate{Seeders: 1, KeepAtPeers: 0} // chance = 1.0 with 0 peers
+	displaced := []Held{{Seeders: 10}, {Seeders: 8}}   // min displaced = 8, margin 3 -> need <= 5
 
 	decision := EvaluateSwap(candidate, displaced, 3, 0.6, 0.999)
 	if !decision.ShouldSwap {
 		t.Fatalf("expected swap to proceed, got %+v", decision)
 	}
 	if decision.Chance != 1.0 {
-		t.Fatalf("expected chance 1.0 with zero mimis peers, got %v", decision.Chance)
+		t.Fatalf("expected chance 1.0 with zero keep-at peers, got %v", decision.Chance)
 	}
 }
 
-func TestEvaluateSwapBacksOffWhenManyMimisPeersPresent(t *testing.T) {
-	candidate := Candidate{Seeders: 1, MimisPeers: 10}
+func TestEvaluateSwapBacksOffWhenManyKeepAtPeersPresent(t *testing.T) {
+	candidate := Candidate{Seeders: 1, KeepAtPeers: 10}
 	// chance = 0.6^10 ~= 0.006; a roll of 0.5 should fail to swap.
 	decision := EvaluateSwap(candidate, nil, 3, 0.6, 0.5)
 	if decision.ShouldSwap {
-		t.Fatalf("expected swap to be rejected with many mimis peers already present, got %+v", decision)
+		t.Fatalf("expected swap to be rejected with many keep-at peers already present, got %+v", decision)
 	}
 }
 
 func TestEvaluateSwapWithNoDisplacementSkipsMarginCheck(t *testing.T) {
 	// Used for filling free space, not just swapping - no torrents to beat.
-	candidate := Candidate{Seeders: 100, MimisPeers: 0}
+	candidate := Candidate{Seeders: 100, KeepAtPeers: 0}
 	decision := EvaluateSwap(candidate, nil, 3, 0.6, 0.5)
 	if !decision.ShouldSwap {
 		t.Fatalf("expected swap to proceed when nothing is displaced, got %+v", decision)

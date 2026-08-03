@@ -1,4 +1,4 @@
-// Package engine ties every other package together into mimis' actual
+// Package engine ties every other package together into keep-at's actual
 // runtime behavior: periodically scanning the Academic Torrents catalog,
 // deciding what to seed, and running the underlying BitTorrent client.
 package engine
@@ -12,18 +12,18 @@ import (
 	"github.com/anacrolix/torrent"
 	"golang.org/x/time/rate"
 
-	"github.com/tweedge/mimisbaeti/internal/atcatalog"
-	"github.com/tweedge/mimisbaeti/internal/attorrent"
-	"github.com/tweedge/mimisbaeti/internal/buildinfo"
-	"github.com/tweedge/mimisbaeti/internal/config"
-	"github.com/tweedge/mimisbaeti/internal/filter"
-	"github.com/tweedge/mimisbaeti/internal/piecestore"
-	"github.com/tweedge/mimisbaeti/internal/state"
+	"github.com/tweedge/keep-at/internal/atcatalog"
+	"github.com/tweedge/keep-at/internal/attorrent"
+	"github.com/tweedge/keep-at/internal/buildinfo"
+	"github.com/tweedge/keep-at/internal/config"
+	"github.com/tweedge/keep-at/internal/filter"
+	"github.com/tweedge/keep-at/internal/piecestore"
+	"github.com/tweedge/keep-at/internal/state"
 )
 
 // Engine owns the BitTorrent client, per-location storage backends, and
-// mimis' persisted view of what it holds. One Engine corresponds to one
-// running mimis process.
+// keep-at's persisted view of what it holds. One Engine corresponds to one
+// running keep-at process.
 type Engine struct {
 	cfg    config.Config
 	logger *slog.Logger
@@ -58,7 +58,7 @@ type Options struct {
 }
 
 // New builds an Engine from cfg. It opens (creating if necessary) a piece
-// store per configured storage location, the mimis state file, and the
+// store per configured storage location, the keep-at state file, and the
 // underlying anacrolix/torrent client. It does not start scanning; call Run
 // for that.
 func New(cfg config.Config, opts Options) (*Engine, error) {
@@ -162,6 +162,19 @@ func (e *Engine) newTorrentClient(cfg config.Config) (*torrent.Client, error) {
 	}
 
 	return torrent.NewClient(tcfg)
+}
+
+// networkStatsPath is where the current scan's network-wide stats are
+// persisted, so a separate `keep-at network-status` invocation can read
+// them without talking to this process directly.
+func (e *Engine) networkStatsPath() string {
+	return e.cfg.DataDir + "/network-stats.json"
+}
+
+// NetworkStatsPath returns the same path DataDir(cfg) would use, for
+// callers (the CLI) that only have a Config, not a running Engine.
+func NetworkStatsPath(cfg config.Config) string {
+	return cfg.DataDir + "/network-stats.json"
 }
 
 // Close shuts down the BitTorrent client. It does not delete any data.

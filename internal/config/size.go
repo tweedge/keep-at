@@ -8,7 +8,7 @@ import (
 
 // ByteSize is a storage quantity, parsed from strings like "500G" or "2T".
 // Suffixes are binary (1 KiB = 1024 bytes) since that's what disks and
-// filesystems actually report; mimis just uses the plan's letters (M, G, T,
+// filesystems actually report; keep-at just uses the plan's letters (M, G, T,
 // P) rather than the pedantically correct MiB/GiB/TiB/PiB ones.
 type ByteSize int64
 

@@ -1,6 +1,6 @@
-// Package attorrent handles everything mimis needs per-torrent from
+// Package attorrent handles everything keep-at needs per-torrent from
 // Academic Torrents: fetching the .torrent file itself (which carries the
-// piece hashes mimis needs to actually download, plus a creation date used
+// piece hashes keep-at needs to actually download, plus a creation date used
 // as an age proxy) and scraping trackers for seeder/leecher counts without
 // joining the swarm.
 package attorrent
@@ -16,7 +16,7 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 )
 
-// Metadata is everything mimis extracts from a .torrent file for selection
+// Metadata is everything keep-at extracts from a .torrent file for selection
 // and downloading purposes.
 type Metadata struct {
 	MetaInfo  *metainfo.MetaInfo

@@ -1,4 +1,4 @@
-module github.com/tweedge/mimisbaeti
+module github.com/tweedge/keep-at
 
 go 1.26.5
 

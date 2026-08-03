@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Cross-compiles mimis for every architecture PLAN.md asks for and packages
-# each into mimisbaeti_<os>_<arch>.tar.gz, the naming convention
-# internal/updater expects when checking GitHub releases for self-update.
+# Cross-compiles keep-at for every common architecture and packages each
+# into keep-at_<os>_<arch>.tar.gz, the naming convention internal/updater
+# expects when checking GitHub releases for self-update.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -13,11 +13,11 @@ mkdir -p "$OUT_DIR"
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 COMMIT="${COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 
-LDFLAGS="-X github.com/tweedge/mimisbaeti/internal/buildinfo.Version=${VERSION} -X github.com/tweedge/mimisbaeti/internal/buildinfo.Commit=${COMMIT}"
+LDFLAGS="-X github.com/tweedge/keep-at/internal/buildinfo.Version=${VERSION} -X github.com/tweedge/keep-at/internal/buildinfo.Commit=${COMMIT}"
 
 # linux covers the Raspberry Pi / home server / Debian VM / Docker targets
-# this project cares about most; darwin and windows are included too since
-# PLAN.md asks for "all common architectures" without restricting to Linux.
+# this project cares about most; darwin and windows are included too for
+# broader portability.
 #
 # 32-bit ARM only ships one build at GOARM=6: Go's runtime.GOARCH reports
 # "arm" regardless of GOARM version, so self-update (internal/updater)
@@ -37,17 +37,17 @@ TARGETS=(
 
 for target in "${TARGETS[@]}"; do
   read -r os arch goarm <<<"$target"
-  name="mimisbaeti_${os}_${arch}"
+  name="keep-at_${os}_${arch}"
 
   echo "building ${name}..."
   build_dir="$(mktemp -d)"
-  binary_name="mimis"
+  binary_name="keep-at"
   if [ "$os" = "windows" ]; then
-    binary_name="mimis.exe"
+    binary_name="keep-at.exe"
   fi
 
   GOOS="$os" GOARCH="$arch" GOARM="$goarm" \
-    go build -trimpath -ldflags "$LDFLAGS" -o "${build_dir}/${binary_name}" ./cmd/mimis
+    go build -trimpath -ldflags "$LDFLAGS" -o "${build_dir}/${binary_name}" ./cmd/keep-at
 
   tar -C "$build_dir" -czf "${OUT_DIR}/${name}.tar.gz" "$binary_name"
   rm -rf "$build_dir"
