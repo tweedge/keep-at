@@ -120,6 +120,10 @@ The ETA is a straight-line extrapolation - elapsed time divided by candidates pr
 
 Because ranking a candidate (see "Deciding what to seed") depends on comparing it against every other candidate found that scan, `ScanOnce` evaluates the *entire* pending candidate list before it starts adding or swapping anything. On the real catalog (a few thousand candidates, rate-limited against Academic Torrents), a first scan can take a long time before keep-at downloads anything at all, even with free space sitting idle the whole time. This is a real, currently-unaddressed tradeoff between "always pick the single most urgent candidate across the whole catalog" and "start using free space immediately" - not a bug, but a known cost of the current design worth revisiting.
 
+### Verified end to end
+
+After the fixes above, a real run against the entire live catalog (2,850 items, 10GB cap in `/tmp`) completed its first full scan in 4h19m with zero crashes and bounded memory (peaked around 5GB, not the tens of gigabytes it was on track for before the mid-scan probe reset), selected 538 torrents to hold, and stayed stable for another 2+ hours of real downloading and seeding afterward. Every fix above was found and confirmed this way - none of them reproduced in anything smaller than the real catalog at real duration.
+
 ## Storage
 
 keep-at stores each verified piece as its own gzip-compressed file, keyed by piece index under a directory named after the torrent's infohash. There's no attempt to reconstruct the original file layout on disk - keep-at prioritized conflict-free, efficient local storage, rather than being locally readable. Giving up on that constraint makes per-piece compression simple. Deleting a torrent just removes its directory and pieces.
