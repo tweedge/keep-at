@@ -30,7 +30,7 @@ func (e *Engine) scrapeSwarm(ctx context.Context, trackers []string, infoHash me
 		}
 
 		callCtx, cancel := context.WithTimeout(ctx, scrapeTimeout)
-		counts, err := attorrent.Scrape(callCtx, e.httpClient, tracker, []metainfo.Hash{infoHash})
+		counts, err := attorrent.Scrape(callCtx, e.httpClient, e.udpScraper, tracker, []metainfo.Hash{infoHash})
 		cancel()
 		if err != nil {
 			lastErr = err

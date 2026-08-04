@@ -9,8 +9,6 @@ import (
 
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
-	"github.com/anacrolix/torrent/tracker"
-	"github.com/anacrolix/torrent/types/infohash"
 )
 
 // SwarmCounts is what keep-at actually cares about from a tracker: is anyone
@@ -73,46 +71,16 @@ func ScrapeHTTP(ctx context.Context, client *http.Client, announceURL string, ha
 	return out, nil
 }
 
-// ScrapeUDP queries a single UDP tracker for every hash in one request (BEP
-// 15), delegating the wire protocol to anacrolix/torrent's tracker client.
-func ScrapeUDP(ctx context.Context, announceURL string, hashes []metainfo.Hash) (map[metainfo.Hash]SwarmCounts, error) {
-	client, err := tracker.NewClient(announceURL, tracker.NewClientOpts{})
-	if err != nil {
-		return nil, fmt.Errorf("attorrent: creating udp tracker client for %s: %w", announceURL, err)
-	}
-	defer client.Close()
-
-	ihs := make([]infohash.T, len(hashes))
-	for i, h := range hashes {
-		ihs[i] = infohash.T(h)
-	}
-
-	resp, err := client.Scrape(ctx, ihs)
-	if err != nil {
-		return nil, fmt.Errorf("attorrent: udp scrape %s: %w", announceURL, err)
-	}
-
-	out := make(map[metainfo.Hash]SwarmCounts, len(hashes))
-	for i, h := range hashes {
-		if i >= len(resp) {
-			break
-		}
-		out[h] = SwarmCounts{
-			Seeders:   int(resp[i].Seeders),
-			Leechers:  int(resp[i].Leechers),
-			Completed: int(resp[i].Completed),
-		}
-	}
-	return out, nil
-}
-
-// Scrape picks the right protocol for announceURL and scrapes it.
-func Scrape(ctx context.Context, client *http.Client, announceURL string, hashes []metainfo.Hash) (map[metainfo.Hash]SwarmCounts, error) {
+// Scrape picks the right protocol for announceURL and scrapes it. UDP
+// scrapes are delegated to udpScraper, which reuses one client (and UDP
+// socket) per tracker across calls - see UDPScraper's doc comment for why
+// that matters, not just for efficiency.
+func Scrape(ctx context.Context, httpClient *http.Client, udpScraper *UDPScraper, announceURL string, hashes []metainfo.Hash) (map[metainfo.Hash]SwarmCounts, error) {
 	switch {
 	case strings.HasPrefix(announceURL, "http://"), strings.HasPrefix(announceURL, "https://"):
-		return ScrapeHTTP(ctx, client, announceURL, hashes)
+		return ScrapeHTTP(ctx, httpClient, announceURL, hashes)
 	case strings.HasPrefix(announceURL, "udp://"):
-		return ScrapeUDP(ctx, announceURL, hashes)
+		return udpScraper.Scrape(ctx, announceURL, hashes)
 	default:
 		return nil, fmt.Errorf("attorrent: unsupported tracker scheme in %s", announceURL)
 	}

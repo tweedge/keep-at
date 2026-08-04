@@ -43,6 +43,28 @@ const progressSaveInterval = 2 * time.Second
 // progress, without flooding the log while it does.
 const progressLogInterval = 2 * time.Minute
 
+// probeClientResetInterval bounds how many candidates' worth of probed
+// torrents accumulate in the probe client (see resetProbeClient) before
+// it gets discarded and replaced mid-scan, rather than only once at the
+// very start of the next scan.
+//
+// resetProbeClient's whole premise is that probed torrents are cheap to
+// leave sitting in memory since they hold no real data - true for a
+// typical torrent, but not for Academic Torrents specifically: some
+// datasets are large enough that just the piece-level bookkeeping for one
+// torrent (hashes and per-piece state, scaling with piece count, not with
+// how much of it keep-at has actually downloaded - which for a probe is
+// nothing) runs into tens of megabytes. Verified in a real full-catalog
+// run: memory usage grew roughly linearly with candidates processed,
+// on track to exceed available RAM well before a scan of the full ~2,850
+// item catalog would finish. Resetting every 250 candidates instead of
+// every ~2,850 bounds peak memory to roughly what that many candidates'
+// probes need, at the cost of a probe that was still in flight against
+// the client being reset occasionally erroring out - already handled the
+// same as any other probe failure (logged, treated as zero peers
+// observed for that one candidate).
+const probeClientResetInterval = 250
+
 // evaluatedCandidate is a catalog item keep-at has fetched metadata and a
 // fresh scrape (and, if anyone was around to scrape, a swarm probe) for,
 // and is ready to rank and possibly act on.
@@ -227,12 +249,19 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 		defer saveTicker.Stop()
 		logTicker := time.NewTicker(progressLogInterval)
 		defer logTicker.Stop()
+		lastProbeReset := 0
 		for {
 			select {
 			case <-stopProgress:
 				return
 			case <-saveTicker.C:
 				e.saveNetworkStats(currentSnapshot())
+				if p := int(processed.Load()); p-lastProbeReset >= probeClientResetInterval {
+					lastProbeReset = p
+					if err := e.resetProbeClient(); err != nil {
+						e.logger.Warn("failed to reset probe client mid-scan", "err", err)
+					}
+				}
 			case <-logTicker.C:
 				e.logScrapeProgress(evalStartedAt, totalCandidates, int(processed.Load()))
 			}

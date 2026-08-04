@@ -72,9 +72,15 @@ So probing now happens on a dedicated `*torrent.Client` that:
 
 * Is never used for anything else - real downloads (`AddCandidate`, resuming held torrents on startup) always go through the main client.
 * Has DHT disabled. DHT's own per-torrent announce goroutine was one of the two concrete triggers found for the v1.61.0 bug, and DHT isn't needed to answer "who else is in this swarm right now" - regular trackers are enough for that.
-* Never has individual torrents dropped from it. Probed torrents just accumulate for the rest of the current scan (harmless - they hold no real data and attempt no transfer) and the entire client is closed and replaced at the start of the next scan, which releases everything through a code path that doesn't share the add/drop race.
+* Never has individual torrents dropped from it. Probed torrents just accumulate - not attempting any real transfer - and the entire client is periodically closed and replaced instead (see below), which releases everything through a code path that doesn't share the add/drop race.
 
 DHT stays enabled on the main client: disabling it globally was tried first and measurably hurt real download connectivity (one torrent went from a 15-second download to not finishing within 90 seconds with DHT off). Isolating the churn to a disposable, DHT-free client keeps the crash risk contained without that cost.
+
+### Bounding probe memory mid-scan
+
+Letting probed torrents accumulate for an entire scan (rather than the previous approach: only at the start of the *next* scan) turned out not to be harmless after all, at real Academic Torrents scale. Some datasets are large enough that a torrent's piece-level bookkeeping - hashes and per-piece state, sized by piece *count*, not by how much of it keep-at has actually downloaded (nothing, for a probe) - runs into tens of megabytes on its own. In a real full-catalog run, process memory grew roughly linearly with candidates processed and was on track to exceed available RAM before the scan of ~2,850 items would have finished.
+
+`resetProbeClient` now also runs mid-scan, every `probeClientResetInterval` (250) candidates processed, not just once between scans. This bounds peak memory to roughly what 250 candidates' worth of probes need instead of the whole catalog's. The cost is that a probe still in flight against the client being reset can error out; that's already handled the same as any other probe failure - logged, and treated as zero peers observed for that one candidate, not fatal.
 
 ### Evaluating candidates concurrently
 
@@ -89,6 +95,16 @@ Probing waits several seconds per candidate for peer connections to establish. R
 Many `.torrent` files reference third-party trackers that are now offline, blocking automated clients, or returning garbage - and webseed URLs that don't match what this version of anacrolix/torrent expects. Both are normal, not a keep-at problem, and logging every instance of them at full-catalog scale is overwhelming: one candidate can generate a dozen `"announce failed"` or `"webseed request error"` lines across its various dead trackers and webseeds.
 
 The library's internal chatter is now suppressed by setting `ClientConfig.Logger` to a filter-level-capped logger (`analog.Default.WithFilterLevel(analog.Error)`), which drops its warnings entirely rather than passing them through. This was not the first approach tried: wrapping `ClientConfig.Slogger` with a custom `slog.Handler` that selectively dropped specific messages looked like it should work, but empirically didn't - `"announce failed"` and `"webseed request error"` never reached the wrapped handler, for reasons in the library's `Logger`-to-`Slogger` bridging that weren't worth chasing further once a reliable alternative was found. The tradeoff of the level-based approach is coarser: it silences *all* of the library's internal warnings, not just the specific noisy ones, including a same-severity warning against Academic Torrents' own tracker specifically if one ever occurs. keep-at's own logging (scan progress, its own request failures like a failed `.torrent` download or scrape) is unaffected either way, since that's separate, application-level logging that never went through the torrent client's logger.
+
+### Reusing UDP tracker connections
+
+`scrapeSwarm` scrapes third-party UDP trackers (BEP 15) for candidates whose primary tracker doesn't answer, and a full-catalog scrape does this thousands of times over several hours. The first implementation created a fresh `tracker.Client` (and the UDP socket it opens) for every single scrape call and closed it again immediately after. In a real full-catalog run, this started failing with "address already in use" on `listen udp :0` late into a multi-hour scan - a slow resource leak (sockets not being released fast enough relative to the rate new ones were being opened) that only became visible after thousands of create/close cycles, not in any test smaller than the real thing.
+
+`attorrent.UDPScraper` now caches one `tracker.Client` per distinct tracker URL and reuses it for every scrape against that tracker for the lifetime of the Engine. This is also how the protocol is meant to be used, not just a workaround: BEP 15 scrapes carry a random transaction ID, and the client dispatches responses back to the matching in-flight caller by that ID under its own lock, so concurrent scrapes against the same shared client from multiple goroutines are safe.
+
+### Disabling webseeds entirely
+
+A real full-catalog run crashed with a nil pointer dereference deep inside anacrolix/torrent's webseed request machinery (`webseed.(*Client).StartNewRequest`), triggered from a periodic background timer - a goroutine keep-at's own code never touches, so nothing in keep-at could `recover()` from it (unlike the `safely()`-wrapped per-candidate work elsewhere). keep-at doesn't rely on webseeds in the first place (see "Storage" below and the log-noise section above) - real peers are what it actually seeds to and downloads from - so `ClientConfig.DisableWebseeds` is now set on both torrent clients. That flag stops the library from ever constructing a webseed peer for any torrent, which removes the crashing code path structurally rather than just reducing how often it's hit.
 
 ### Reporting progress during a long scrape
 

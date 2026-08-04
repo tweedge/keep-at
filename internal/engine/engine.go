@@ -47,6 +47,7 @@ type Engine struct {
 	catalogFetcher *atcatalog.Fetcher
 	torrentFetcher *attorrent.Fetcher
 	httpClient     *http.Client
+	udpScraper     *attorrent.UDPScraper
 	blocklist      filter.KeywordBlocklist
 	probeTimeout   time.Duration
 }
@@ -134,6 +135,7 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 			Limiter:    limiter,
 		},
 		httpClient:   httpClient,
+		udpScraper:   attorrent.NewUDPScraper(),
 		blocklist:    filter.NewKeywordBlocklist(cfg.KeywordBlocklist),
 		probeTimeout: defaultProbeTimeout,
 	}
@@ -189,6 +191,16 @@ func (e *Engine) newTorrentClient(listenPort int, noDHT bool) (*torrent.Client, 
 	// progress, its own request failures) is unaffected - this only
 	// silences the underlying library's internal chatter.
 	tcfg.Logger = analog.Default.WithFilterLevel(analog.Error)
+
+	// keep-at seeds to and downloads from real BitTorrent peers; webseeds
+	// (HTTP/FTP fallback sources some .torrent files list) are never
+	// relied on. Disabling them isn't just tidiness: a real full-catalog
+	// scan hit a nil pointer dereference deep in anacrolix/torrent's
+	// webseed request machinery (a background timer callback, so nothing
+	// in keep-at's own code could have recovered from it), and
+	// DisableWebseeds stops the library from ever creating a webseed peer
+	// in the first place, which avoids that code path entirely.
+	tcfg.DisableWebseeds = true
 
 	// Every torrent gets its storage assigned explicitly per-location in
 	// addTorrentToClient, but the library still wants a default in case
@@ -270,7 +282,8 @@ func NetworkStatsPath(cfg config.Config) string {
 	return cfg.DataDir + "/network-stats.json"
 }
 
-// Close shuts down both BitTorrent clients. It does not delete any data.
+// Close shuts down both BitTorrent clients and the cached UDP tracker
+// connections. It does not delete any data.
 func (e *Engine) Close() error {
 	var errs []error
 	if e.torrentClient != nil {
@@ -280,6 +293,11 @@ func (e *Engine) Close() error {
 	}
 	if probeClient := e.currentProbeClient(); probeClient != nil {
 		for _, err := range probeClient.Close() {
+			errs = append(errs, err)
+		}
+	}
+	if e.udpScraper != nil {
+		if err := e.udpScraper.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
