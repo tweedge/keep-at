@@ -198,7 +198,11 @@ func writeStarterConfig(path string) error {
 		"# once you want more than one storage location, or don't want to repeat\n" +
 		"# flags every time.\n" +
 		"#\n" +
-		"# At minimum, set a real limit (e.g. 500G, 2T) below.\n\n"
+		"# At minimum, set a real limit (e.g. 500G, 2T) below.\n" +
+		"#\n" +
+		"# To get credit for the torrents you seed, set api_key to your Academic\n" +
+		"# Torrents API key (https://academictorrents.com/my.php) - it's only sent\n" +
+		"# to AT's own trackers and never logged.\n\n"
 	return writeYAML(path, header, starter)
 }
 

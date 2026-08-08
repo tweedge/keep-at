@@ -45,8 +45,6 @@ keep-at run --storage-limit 500G
 
 That's the only variable you need to set to start. `keep-at run --help` lists every other flag (port, aggressiveness, scan interval, rate limit, and so on), all with reasonable defaults.
 
-Inside a container, `start` automatically runs in the foreground instead of daemonizing - daemonizing would just exit the entrypoint and kill the container.
-
 ### Service Usage
 
 keep-at is designed to be used as a long-running service on an always-on server, VM, or similar. Where `keep-at run` starts it in the foreground (good for seeing what's going on), `service install` is what you want for something that stays up. As a systemd service (Linux only for now; the binary itself is built for every platform above, but service install/uninstall is Linux-first):
@@ -75,7 +73,7 @@ And to update to the latest release:
 keep-at self-update
 ```
 
-### A config file, if you want one
+### Advanced Configuration Settings
 
 A config file is only worth reaching for once you want more than one storage location, or don't want to repeat flags every time (`service install` writes one for you automatically - see above). Point `--config` at a path that doesn't exist yet and keep-at will write a starter one there and tell you to edit it:
 
@@ -102,15 +100,29 @@ scan:
 aggressiveness: 0.6
 keyword_blocklist: []
 preserve_deleted_torrents: false
+# Optional: your Academic Torrents API key - see below
+api_key: "uid=12345;pass=abcdef..."
 ```
 
 Every field here, plus its CLI flag equivalent and what it actually does, is documented in [docs/CONFIG.md](docs/CONFIG.md).
 
-### Running behind a VPN
+### Academic Torrents API Keys
 
-Optional, and it comes with real tradeoffs (mainly around port forwarding and speed) that are worth understanding before turning one on - see [docs/VPN.md](docs/VPN.md) for a general guide covering both Docker (via [gluetun](https://github.com/passteque/gluetun)) and service-level (WireGuard) setups.
+*Optional.* keep-at works exactly the same with or without an API key - if you don't set one, you seed anonymously and nothing about what keep-at holds or how it behaves changes. The only difference is attribution.
 
-## How it works
+Academic Torrents shows a "Hosted by" box on every torrent's details page listing the users who are hosting that data, and it associates a hoster with their account via a passkey embedded in the announce URL. If you'd like the torrents you seed to be credited to your account rather than shown anonymously, pass your API key (from https://academictorrents.com/my.php, formatted like `uid=12345;pass=abcdef...`):
+
+```
+keep-at run --api-key 'uid=12345;pass=abcdef...' --storage-limit 500G
+```
+
+keep-at announces to AT's tracker with that passkey so the attribution happens automatically. The key is only ever sent to Academic Torrents' own trackers (`academictorrents.com` and `ipv6.academictorrents.com`); third-party trackers never see it, and keep-at never logs it or writes it into cached torrent files. You can also set it in a config file as `api_key` (see below).
+
+### VPN Compatibility
+
+*Optional.* Running behind a VPN comes with real tradeoffs (mainly around port forwarding and speed) that are worth understanding before turning one on - see [docs/VPN.md](docs/VPN.md) for a general guide covering both Docker (via [gluetun](https://github.com/passteque/gluetun)) and service-level (WireGuard) setups.
+
+## How It Works
 
 keep-at ranks candidates by seed count, checks for other keep-at nodes already piling onto the same torrent before committing to one, and can combine several smaller held torrents to make room for one bigger candidate. The full rationale for all of that - plus the parts that are deliberately simplified or not implemented yet - is in [docs/DESIGN.md](docs/DESIGN.md).
 

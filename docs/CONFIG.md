@@ -97,6 +97,32 @@ From the CLI, pass a comma-separated list: `--keyword-blocklist confidential,dra
 
 keep-at's memory use scales with how many torrents it holds, not with their total size - the underlying BitTorrent library gives every held torrent its own independent pool of peer-connection buffers. So `max_ram` translates into a hard cap on the **number of torrents** keep-at will ever hold at once (logged at startup as `max_torrents`). This is what lets a tiny 1 GB Raspberry Pi on a big disk still seed usefully: it just holds fewer, and (when RAM is the binding constraint rather than disk) larger torrents, getting more bytes seeded per scarce RAM slot. Lowering this also lowers keep-at's connection settings automatically-derived footprint.
 
+## Academic Torrents account attribution
+
+### `api_key` / `--api-key`
+
+*Default: unset (anonymous).* This setting is **completely optional** - if you don't set it, keep-at seeds anonymously and behaves exactly the same in every way. The only thing an API key changes is attribution. Set it to your Academic Torrents API key, from https://academictorrents.com/my.php (it looks like `uid=12345;pass=abcdef...`), and keep-at attributes the torrents it seeds to your account, so the details page of each torrent shows your name and image as one of the users currently hosting the data - that's the "Hosted by" box described in AT's [mirroring docs](https://academictorrents.com/docs/mirroring.html).
+
+At startup, keep-at resolves the key through AT's own `userannounce` endpoint (the same mechanism AT's smartnode tooling uses) into the per-user announce URL carrying your account's passkey, then uses that URL for every announce to AT's trackers. Third-party trackers listed in `.torrent` files are never touched.
+
+Security notes:
+
+- The key is **only ever sent to the two Academic Torrents tracker hosts** (`academictorrents.com` and `ipv6.academictorrents.com`, https only). Any other tracker - or an `http://` or lookalike `*.academictorrents.com` host - never receives it.
+- The key and the resolved passkey URL are **never logged, never written to cached `.torrent` files or state, and never surfaced anywhere** except the announce to AT's tracker.
+- If the key is invalid or the endpoint is unreachable, keep-at logs a warning (with the secret portion redacted) and keeps running unattributed - it never crashes or refuses to start.
+
+Setting it:
+
+```
+keep-at run --api-key 'uid=12345;pass=abcdef...' --storage-limit 500G
+```
+
+or in a config file:
+
+```yaml
+api_key: uid=12345;pass=abcdef...
+```
+
 ## Network
 
 ### `port` / `--port`
