@@ -182,7 +182,7 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 	// declared above.
 	systemTotal, sysErr := SystemTotalRAM()
 	if sysErr != nil {
-		return nil, fmt.Errorf("engine: measuring system RAM: %w", sysErr)
+		e.logger.Warn("could not measure system RAM; the RAM-driven torrent cap is disabled", "err", sysErr)
 	}
 	perTorrent := PerTorrentConnRAM(establishedConnsPerTorrent, maxAllocPeerRequestData) + PerTorrentRAMBase
 	budget, hardCap, maxTorrents := ramBudget(systemTotal, int64(cfg.MaxRAM), int64(cfg.MaxRAMConfig), perTorrent)
@@ -191,14 +191,18 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 	// The operator's explicit --max-ram (or config max_ram) must never ask
 	// for more than the hard 80%-of-system cap. ramBudget already clamps the
 	// effective budget, but we reject out of hand so a misconfiguration
-	// fails loud rather than silently running against the cap.
-	if cfg.MaxRAM > 0 && hardCap > 0 && int64(cfg.MaxRAM) > hardCap {
-		return nil, fmt.Errorf("engine: max_ram %s exceeds the 80%%-of-system hard cap of %s (system total %s)",
-			cfg.MaxRAM.String(), config.ByteSize(hardCap).String(), config.ByteSize(systemTotal).String())
-	}
-	if cfg.MaxRAMConfig > 0 && hardCap > 0 && int64(cfg.MaxRAMConfig) > hardCap {
-		return nil, fmt.Errorf("engine: config max_ram %s exceeds the 80%%-of-system hard cap of %s (system total %s)",
-			cfg.MaxRAMConfig.String(), config.ByteSize(hardCap).String(), config.ByteSize(systemTotal).String())
+	// fails loud rather than silently running against the cap. When system
+	// RAM can't be measured (systemTotal == 0), keep-at applies no cap and
+	// there's nothing to reject against.
+	if sysErr == nil && systemTotal > 0 {
+		if cfg.MaxRAM > 0 && int64(cfg.MaxRAM) > hardCap {
+			return nil, fmt.Errorf("engine: max_ram %s exceeds the 80%%-of-system hard cap of %s (system total %s)",
+				cfg.MaxRAM.String(), config.ByteSize(hardCap).String(), config.ByteSize(systemTotal).String())
+		}
+		if cfg.MaxRAMConfig > 0 && int64(cfg.MaxRAMConfig) > hardCap {
+			return nil, fmt.Errorf("engine: config max_ram %s exceeds the 80%%-of-system hard cap of %s (system total %s)",
+				cfg.MaxRAMConfig.String(), config.ByteSize(hardCap).String(), config.ByteSize(systemTotal).String())
+		}
 	}
 
 	e.logger.Info("RAM budget",

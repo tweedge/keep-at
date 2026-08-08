@@ -1,10 +1,6 @@
 package engine
 
-import (
-	"fmt"
-
-	"golang.org/x/sys/unix"
-)
+import "math"
 
 // SystemRAMFractionHardCap is the most of the host's physical memory keep-at
 // will ever allow itself to plan around, regardless of what --max-ram says.
@@ -36,33 +32,38 @@ func PerTorrentConnRAM(establishedConnsPerTorrent int, maxAllocPeerRequestDataPe
 	return int64(establishedConnsPerTorrent) * int64(maxAllocPeerRequestDataPerConn)
 }
 
-// SystemTotalRAM returns the host's total physical memory in bytes. It uses
-// the portable unix.Sysinfo interface, which covers the Linux, macOS, and
-// (via the Go build) Windows targets keep-at ships for. A non-fatal error
-// returns 0 so callers can fall back to a configured default rather than
-// refusing to start.
-func SystemTotalRAM() (int64, error) {
-	var info unix.Sysinfo_t
-	if err := unix.Sysinfo(&info); err != nil {
-		return 0, fmt.Errorf("engine: reading system RAM: %w", err)
-	}
-	// Unit is MemUnit bytes (usually 1 on modern kernels), not 1024.
-	total := int64(info.Totalram) * int64(info.Unit)
-	return total, nil
-}
-
 // ramBudget computes how much RAM keep-at will let itself plan around, the
 // hard 80%-of-system cap, and how many torrents that funds at the given
 // per-torrent footprint.
 //
-// userMaxRAM is the operator's --max-ram setting, or 0 to mean "use the full
-// hard cap" (keep-at's simple default: spend up to 80% of system RAM). configMax
-// is the configured maximum (also honoured when --max-ram is unset, so a config
-// file can pin it). The returned budget is min(userMaxRAM-or-configMax, hard
-// cap, full system RAM).
+// systemTotal is the host's physical RAM (see SystemTotalRAM); a value of 0
+// means it couldn't be measured on this platform, in which case keep-at
+// applies NO RAM-driven torrent cap (it just won't bound by RAM) rather than
+// capping to zero. userMaxRAM is the operator's --max-ram setting, or 0 to
+// mean "use the full hard cap" (keep-at's simple default: spend up to 80% of
+// system RAM). configMax is the configured maximum (also honoured when
+// --max-ram is unset, so a config file can pin it). The returned budget is
+// min(userMaxRAM-or-configMax, hard cap, full system RAM).
 func ramBudget(systemTotal int64, userMaxRAM int64, configMax int64, perTorrent int64) (budget int64, hardCap int64, maxTorrents int) {
+	// No measurable RAM: don't cap by RAM at all. A hard cap of 0 would
+	// otherwise make maxTorrents 0 and stop keep-at from holding anything,
+	// which is far worse than an uncapped (but still connection-bounded)
+	// hold. Callers should log that the RAM budget is disabled.
+	if systemTotal <= 0 {
+		if perTorrent <= 0 {
+			maxTorrents = 0
+		} else if userMaxRAM > 0 {
+			maxTorrents = int(userMaxRAM / perTorrent)
+		} else if configMax > 0 {
+			maxTorrents = int(configMax / perTorrent)
+		} else {
+			maxTorrents = math.MaxInt
+		}
+		return userMaxRAMOrConfig(userMaxRAM, configMax), 0, maxTorrents
+	}
+
 	hardCap = int64(float64(systemTotal) * SystemRAMFractionHardCap)
-	if systemTotal > 0 && hardCap > systemTotal {
+	if hardCap > systemTotal {
 		hardCap = systemTotal
 	}
 
@@ -76,7 +77,7 @@ func ramBudget(systemTotal int64, userMaxRAM int64, configMax int64, perTorrent 
 		budget = configMax
 	}
 
-	if hardCap > 0 && budget > hardCap {
+	if budget > hardCap {
 		budget = hardCap
 	}
 	if budget < 0 {
@@ -89,4 +90,15 @@ func ramBudget(systemTotal int64, userMaxRAM int64, configMax int64, perTorrent 
 		maxTorrents = int(budget / perTorrent)
 	}
 	return budget, hardCap, maxTorrents
+}
+
+func userMaxRAMOrConfig(userMaxRAM, configMax int64) int64 {
+	switch {
+	case userMaxRAM > 0:
+		return userMaxRAM
+	case configMax > 0:
+		return configMax
+	default:
+		return 0
+	}
 }
