@@ -48,11 +48,33 @@ func TestRankCandidatesOrdersBySeedersThenSize(t *testing.T) {
 		{Title: "highseed", Seeders: 50, SizeBytes: 1},
 	}
 
-	ranked := RankCandidates(candidates)
+	ranked := RankCandidates(candidates, false)
 	if len(ranked) != 3 {
 		t.Fatalf("expected unavailable candidate excluded, got %d results: %+v", len(ranked), ranked)
 	}
 	wantOrder := []string{"small-lowseed", "big-lowseed", "highseed"}
+	for i, want := range wantOrder {
+		if ranked[i].Title != want {
+			t.Errorf("position %d: got %q, want %q", i, ranked[i].Title, want)
+		}
+	}
+}
+
+func TestRankCandidatesRamBoundPrefersLarger(t *testing.T) {
+	candidates := []Candidate{
+		{Title: "big-lowseed", Seeders: 1, SizeBytes: 1000},
+		{Title: "small-lowseed", Seeders: 1, SizeBytes: 10},
+		{Title: "unavailable", Seeders: 0, SizeBytes: 1},
+		{Title: "highseed", Seeders: 50, SizeBytes: 1},
+	}
+
+	ranked := RankCandidates(candidates, true)
+	if len(ranked) != 3 {
+		t.Fatalf("expected unavailable candidate excluded, got %d results: %+v", len(ranked), ranked)
+	}
+	// RAM-bound: among equal seeders, the larger torrent wins the scarce
+	// per-torrent RAM slot.
+	wantOrder := []string{"big-lowseed", "small-lowseed", "highseed"}
 	for i, want := range wantOrder {
 		if ranked[i].Title != want {
 			t.Errorf("position %d: got %q, want %q", i, ranked[i].Title, want)

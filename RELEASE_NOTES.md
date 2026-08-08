@@ -1,3 +1,20 @@
+keep-at now bounds its own RAM use and scales how many (and which) torrents it holds to fit the machine it's running on - so a tiny 1 GB Raspberry Pi on a big disk seeds just as sensibly as a server with 32 GB.
+
+## New: RAM-aware holding
+
+- Added a `--max-ram` flag (and `max_ram` config key) for the most memory keep-at will plan around. It defaults to **80% of system RAM**, and an explicit value is never allowed to exceed that hard cap (keep-at refuses to start rather than overcommit the host).
+- RAM scales with the **number** of torrents keep-at holds, not their total size: the underlying BitTorrent library gives every held torrent its own independent pool of peer-connection buffers. So `max_ram` translates into a hard cap on the torrent count, logged at startup as `max_torrents`. A free-space fill that would exceed the cap is skipped; only swaps (net-zero or negative count) proceed.
+- When RAM is the binding constraint rather than disk, the decision function flips to **prefer larger torrents**: more bytes get seeded per scarce RAM slot, and eviction sheds the smallest held torrents first so big ones survive. This is exactly the "prioritize larger torrents to fill space when RAM runs out before disk" behavior - a 1 GB Pi on a 20 TB disk holds fewer but bigger torrents and stays effective.
+
+## Changed: lower default connection footprint
+
+keep-at is a seed-first, always-on daemon that assumes many keep-at nodes share the Academic Torrents seeding load, so no single node needs to be a speed monster. The default per-torrent peer fanout and buffer sizes are now much smaller (12 established connections per torrent instead of 50, 256 KiB per-connection buffer instead of 1 MiB). This cuts the dominant RAM cost by roughly 4x and is what makes the RAM budget meaningful on small boxes.
+
+## Planning notes
+
+- The per-torrent footprint estimate (`EstablishedConnsPerTorrent × MaxAllocPeerRequestDataPerConn + a fixed base`) is a deliberate conservative upper bound used only for planning the torrent-count cap, not a precise live allocation accounting.
+- `max_ram` is honored from both `--max-ram` and a config file's `max_ram`; the 80%-of-system hard cap applies to both.
+
 Real full-catalog testing surfaced crashes and scaling problems that a small hand-picked test never hit. This release fixes all of them and adds visibility into how long a scrape is actually taking.
 
 ## Fixes

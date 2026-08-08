@@ -126,7 +126,7 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	e.logger.Info("scrape complete, updating what keep-at holds",
 		"available", len(candidates), "processed", processedCount, "total", totalCandidates, "elapsed", humanDuration(time.Since(scrapeStartedAt)))
 
-	ranked := rankEvaluated(candidates)
+	ranked := rankEvaluated(candidates, len(held) >= e.maxTorrents)
 	actErr := e.actOnRanked(ctx, ranked)
 
 	e.saveNetworkStats(netstats.Snapshot{
@@ -387,8 +387,10 @@ func (e *Engine) logScrapeProgress(evalStartedAt time.Time, totalCandidates, pro
 }
 
 // rankEvaluated converts evaluated candidates into selector.Candidate and
-// orders them by seeding urgency.
-func rankEvaluated(candidates []evaluatedCandidate) []evaluatedCandidate {
+// orders them by seeding urgency. ramBound tells the selector to prefer
+// larger torrents for the size tie-break when keep-at is already at its
+// RAM-driven torrent cap (see selector.RankCandidates).
+func rankEvaluated(candidates []evaluatedCandidate, ramBound bool) []evaluatedCandidate {
 	sel := make([]selector.Candidate, len(candidates))
 	byHash := make(map[string]evaluatedCandidate, len(candidates))
 	for i, c := range candidates {
@@ -402,7 +404,7 @@ func rankEvaluated(candidates []evaluatedCandidate) []evaluatedCandidate {
 		byHash[c.metadata.InfoHash.HexString()] = c
 	}
 
-	ranked := selector.RankCandidates(sel)
+	ranked := selector.RankCandidates(sel, ramBound)
 	out := make([]evaluatedCandidate, len(ranked))
 	for i, r := range ranked {
 		out[i] = byHash[r.InfoHash.HexString()]
@@ -411,8 +413,12 @@ func rankEvaluated(candidates []evaluatedCandidate) []evaluatedCandidate {
 }
 
 // actOnRanked walks candidates in priority order, filling free space first
-// and falling back to displacing lower-priority held torrents.
+// and falling back to displacing lower-priority held torrents. The RAM-driven
+// torrent-count cap (e.maxTorrents) is enforced inside tryAdd/trySwap: once
+// keep-at is holding the maximum number of torrents its RAM budget allows, it
+// stops adding new ones and only swaps (which keeps or lowers the count).
 func (e *Engine) actOnRanked(ctx context.Context, ranked []evaluatedCandidate) error {
+	heldCount := len(e.state.All())
 	for _, c := range ranked {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -427,13 +433,21 @@ func (e *Engine) actOnRanked(ctx context.Context, ranked []evaluatedCandidate) e
 				freeByPath[loc.Path] = e.freeBytes(loc)
 			}
 
-			if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
-				if e.tryAdd(c, sizeBytes, location, nil) {
-					return
+			// A plain free-space fill increases the torrent count, so it's
+			// only allowed while under the RAM-driven cap. It first tries to
+			// find a location with room; tryAdd rejects it past the cap.
+			if heldCount < e.maxTorrents {
+				if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
+					if e.tryAdd(c, sizeBytes, location, nil, &heldCount) {
+						return
+					}
 				}
+			} else {
+				e.logger.Debug("skipping free-space fill: at RAM-driven torrent cap",
+					"title", c.title, "held", heldCount, "max_torrents", e.maxTorrents)
 			}
 
-			e.trySwap(c, sizeBytes)
+			e.trySwap(c, sizeBytes, &heldCount)
 		})
 	}
 	return nil
@@ -442,7 +456,19 @@ func (e *Engine) actOnRanked(ctx context.Context, ranked []evaluatedCandidate) e
 // tryAdd runs the anti-cascade decision using the swarm probe already
 // gathered in evaluateCandidates, and if it passes, starts downloading the
 // candidate into location. displaced is nil for a plain free-space fill.
-func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, displaced []selector.Held) bool {
+//
+// heldCount points at the running count of held torrents in actOnRanked so a
+// successful add can bump it (and a swap, which passes a non-nil displaced,
+// keeps the count constant without bumping). A plain fill past the RAM-driven
+// torrent cap is rejected outright: RAM scales per-torrent, so the count cap
+// is the real memory bound.
+func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, displaced []selector.Held, heldCount *int) bool {
+	if heldCount != nil && displaced == nil && *heldCount >= e.maxTorrents {
+		e.logger.Debug("rejected candidate: would exceed RAM-driven torrent cap",
+			"title", c.title, "held", *heldCount, "max_torrents", e.maxTorrents)
+		return false
+	}
+
 	candidate := selector.Candidate{
 		InfoHash:    c.metadata.InfoHash,
 		Title:       c.title,
@@ -464,6 +490,9 @@ func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, 
 		e.logger.Error("failed to add candidate", "title", c.title, "err", err)
 		return false
 	}
+	if heldCount != nil && displaced == nil {
+		*heldCount++
+	}
 	return true
 }
 
@@ -473,7 +502,21 @@ func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, 
 // clear the seed margin against this candidate, and their combined size
 // covers it, keep-at will remove all of them rather than only handling the
 // single-torrent case.
-func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64) {
+// trySwap looks for held torrents, within a single storage location, that
+// this candidate can justifiably displace - one is enough if it's big
+// enough on its own, but if several smaller torrents each individually clear
+// the seed margin against this candidate, and their combined size covers it,
+// keep-at will remove all of them rather than only handling the single-torrent
+// case.
+//
+// heldCount points at the running held count in actOnRanked; a swap keeps the
+// count constant (one in, >=1 out), so it's passed but never incremented. When
+// keep-at is already at its RAM-driven torrent cap (ramBound), the eviction
+// preference flips toward smaller held torrents so the scarce per-torrent RAM
+// slots go to the largest torrents that fit - which is exactly the
+// "prioritize larger torrents when RAM is the binding constraint" behavior.
+func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64, heldCount *int) {
+	ramBound := heldCount != nil && *heldCount >= e.maxTorrents
 	held := e.state.All()
 
 	byLocation := make(map[string][]state.Torrent)
@@ -482,7 +525,7 @@ func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64) {
 	}
 
 	for location, inLocation := range byLocation {
-		displaced := selectDisplaceable(inLocation, c.swarm.Seeders, sizeBytes, e.cfg.Scan.MinSeedMargin)
+		displaced := selectDisplaceable(inLocation, c.swarm.Seeders, sizeBytes, e.cfg.Scan.MinSeedMargin, ramBound)
 		if displaced == nil {
 			continue
 		}
@@ -492,7 +535,7 @@ func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64) {
 			selHeld[i] = selector.Held{InfoHash: h.InfoHash, Title: h.Title, SizeBytes: h.SizeBytes, Seeders: h.LastKnownSeeders}
 		}
 
-		if e.tryAdd(c, sizeBytes, location, selHeld) {
+		if e.tryAdd(c, sizeBytes, location, selHeld, heldCount) {
 			for _, h := range displaced {
 				if err := e.RemoveTorrent(h.InfoHash, h.StorageLocation); err != nil {
 					e.logger.Error("failed to remove displaced torrent", "title", h.Title, "err", err)
@@ -512,7 +555,14 @@ func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64) {
 // because it's bundled with others that do), and their combined size must
 // cover what the candidate needs. Returns nil if this location can't
 // accommodate the swap even using every torrent that qualifies.
-func selectDisplaceable(inLocation []state.Torrent, candidateSeeders int, sizeNeeded int64, minSeedMargin int) []state.Torrent {
+//
+// ramBound indicates keep-at is already at its RAM-driven torrent cap. In
+// that regime the binding constraint is the per-torrent RAM slot, not disk,
+// so eviction flips from "most-seeded first" (least in need of keep-at) to
+// "smallest first" - the scarce RAM slots go to the largest torrents that
+// fit, the opposite of the disk-bound preference where we'd rather keep
+// small torrents and shed big ones.
+func selectDisplaceable(inLocation []state.Torrent, candidateSeeders int, sizeNeeded int64, minSeedMargin int, ramBound bool) []state.Torrent {
 	var qualifying []state.Torrent
 	for _, h := range inLocation {
 		if h.LastKnownSeeders-minSeedMargin >= candidateSeeders {
@@ -523,9 +573,17 @@ func selectDisplaceable(inLocation []state.Torrent, candidateSeeders int, sizeNe
 		return nil
 	}
 
-	// Displace the least valuable (most-seeded, i.e. least in need of
-	// keep-at specifically) torrents first.
-	sort.SliceStable(qualifying, func(i, j int) bool { return qualifying[i].LastKnownSeeders > qualifying[j].LastKnownSeeders })
+	if ramBound {
+		// Free RAM slots with the least disk disruption: evict the smallest
+		// qualifying torrents first so large held torrents (best bytes per
+		// RAM slot) survive, and the candidate - which ranking has already
+		// biased toward larger when RAM-bound - takes the freed slot.
+		sort.SliceStable(qualifying, func(i, j int) bool { return qualifying[i].SizeBytes < qualifying[j].SizeBytes })
+	} else {
+		// Disk-bound: shed the least valuable (most-seeded, i.e. least in
+		// need of keep-at specifically) torrents first.
+		sort.SliceStable(qualifying, func(i, j int) bool { return qualifying[i].LastKnownSeeders > qualifying[j].LastKnownSeeders })
+	}
 
 	var chosen []state.Torrent
 	var freed int64

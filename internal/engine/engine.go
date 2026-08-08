@@ -23,6 +23,24 @@ import (
 	"github.com/tweedge/keep-at/internal/state"
 )
 
+// Connection settings for the underlying anacrolix/torrent client. These are
+// kept deliberately modest: keep-at is a seed-first, always-on daemon meant to
+// run on everything from a 1 GB Raspberry Pi to a big server, and Academic
+// Torrents is seeded by many keep-at nodes in aggregate - so no single node
+// needs to be a speed monster or lean on a huge per-torrent peer fanout.
+//
+// Critically, anacrolix/torrent's peer-connection buffer pool is per-torrent
+// (each held torrent keeps up to EstablishedConnsPerTorrent independent peer
+// connections, each buffering up to MaxAllocPeerRequestDataPerConn), so these
+// values directly set how much RAM each held torrent costs - which is exactly
+// what the RAM budget (see ram.go) uses to decide how many torrents fit.
+const (
+	establishedConnsPerTorrent   = 12
+	halfOpenConnsPerTorrent      = 6
+	maxAllocPeerRequestData      = 256 << 10 // 256 KiB
+	totalHalfOpenConns           = 40
+)
+
 // Engine owns the BitTorrent client, per-location storage backends, and
 // keep-at's persisted view of what it holds. One Engine corresponds to one
 // running keep-at process.
@@ -43,6 +61,11 @@ type Engine struct {
 	stores     map[string]*piecestore.Client // keyed by storage location path
 	probeStore *piecestore.Client            // scratch storage for swarm-probing candidates, see probe.go
 	state      *state.State
+
+	// maxTorrents is the hard cap on how many torrents keep-at will hold at
+	// once, derived from the RAM budget (see ram.go). RAM scales per-torrent
+	// in anacrolix/torrent, so capping the count is what bounds memory use.
+	maxTorrents int
 
 	catalogFetcher *atcatalog.Fetcher
 	torrentFetcher *attorrent.Fetcher
@@ -143,6 +166,39 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		e.probeTimeout = opts.ProbeTimeout
 	}
 
+	// Work out keep-at's RAM budget before spinning up the torrent client,
+	// so the torrent-count cap (the thing that actually bounds memory, since
+	// anacrolix/torrent's footprint scales per-torrent) is wired in from the
+	// start. The per-torrent footprint uses the exact connection settings
+	// declared above.
+	systemTotal, sysErr := SystemTotalRAM()
+	if sysErr != nil {
+		return nil, fmt.Errorf("engine: measuring system RAM: %w", sysErr)
+	}
+	perTorrent := PerTorrentConnRAM(establishedConnsPerTorrent, maxAllocPeerRequestData) + PerTorrentRAMBase
+	budget, hardCap, maxTorrents := ramBudget(systemTotal, int64(cfg.MaxRAM), int64(cfg.MaxRAMConfig), perTorrent)
+	e.maxTorrents = maxTorrents
+
+	// The operator's explicit --max-ram (or config max_ram) must never ask
+	// for more than the hard 80%-of-system cap. ramBudget already clamps the
+	// effective budget, but we reject out of hand so a misconfiguration
+	// fails loud rather than silently running against the cap.
+	if cfg.MaxRAM > 0 && hardCap > 0 && int64(cfg.MaxRAM) > hardCap {
+		return nil, fmt.Errorf("engine: max_ram %s exceeds the 80%%-of-system hard cap of %s (system total %s)",
+			cfg.MaxRAM.String(), config.ByteSize(hardCap).String(), config.ByteSize(systemTotal).String())
+	}
+	if cfg.MaxRAMConfig > 0 && hardCap > 0 && int64(cfg.MaxRAMConfig) > hardCap {
+		return nil, fmt.Errorf("engine: config max_ram %s exceeds the 80%%-of-system hard cap of %s (system total %s)",
+			cfg.MaxRAMConfig.String(), config.ByteSize(hardCap).String(), config.ByteSize(systemTotal).String())
+	}
+
+	e.logger.Info("RAM budget",
+		"system_total", humanBytes(systemTotal),
+		"hard_cap_80pct", humanBytes(hardCap),
+		"budget", humanBytes(budget),
+		"per_torrent_footprint", humanBytes(perTorrent),
+		"max_torrents", maxTorrents)
+
 	torrentClient, err := e.newTorrentClient(cfg.Port, false)
 	if err != nil {
 		return nil, err
@@ -171,6 +227,24 @@ func (e *Engine) newTorrentClient(listenPort int, noDHT bool) (*torrent.Client, 
 	tcfg.ExtendedHandshakeClientVersion = buildinfo.ExtendedHandshakeVersion()
 	tcfg.Bep20 = buildinfo.PeerIDPrefix
 	tcfg.NoDHT = noDHT
+
+	// Memory tuning. The library defaults are sized for a handful of
+	// torrents (EstablishedConnsPerTorrent=50, MaxAllocPeerRequestDataPerConn=1MiB),
+	// so a seeding daemon holding hundreds of torrents buffers up to
+	// roughly heldTorrents * 50 * 1MiB of upload data on warm peer
+	// connections alone - easily multiple GB and the dominant RAM cost.
+	// keep-at is a seed-first daemon, so it never needs a huge per-torrent
+	// peer fanout; a smaller cap keeps peer connection memory bounded and
+	// spreads it predictably across held torrents instead of scaling with
+	// the whole catalog. These are applied to the probe client too, where
+	// they don't hurt swarm-probing accuracy but prevent the second client
+	// from doubling the connection footprint. The values are the named
+	// constants declared above so the RAM budget (ram.go) can compute the
+	// per-torrent footprint from exactly the same numbers.
+	tcfg.EstablishedConnsPerTorrent = establishedConnsPerTorrent
+	tcfg.HalfOpenConnsPerTorrent = halfOpenConnsPerTorrent
+	tcfg.MaxAllocPeerRequestDataPerConn = maxAllocPeerRequestData
+	tcfg.TotalHalfOpenConns = totalHalfOpenConns
 
 	// The torrent library re-announces to every tracker in a torrent's
 	// spec on its own schedule, independent of scrapeSwarm/attorrent's

@@ -3,7 +3,15 @@ package engine
 import (
 	"fmt"
 	"time"
+
+	"github.com/tweedge/keep-at/internal/config"
 )
+
+// humanBytes renders a byte count the way an operator wants to read it in a
+// log line, using the same binary units as storage limits (M/G/T/P).
+func humanBytes(b int64) string {
+	return config.ByteSize(b).String()
+}
 
 // humanDuration renders a duration the way an operator wants to read it in
 // a log line - "2h15m", "5m30s", "45s" - rather than Go's default

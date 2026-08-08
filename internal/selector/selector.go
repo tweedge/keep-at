@@ -46,7 +46,14 @@ type Held struct {
 // with smaller torrents preferred as a tie-break (they're cheaper to try
 // first while keep-at works down the list). Candidates that aren't Available
 // are excluded entirely, since they'd stall a download indefinitely.
-func RankCandidates(candidates []Candidate) []Candidate {
+//
+// ramBound, when true, means keep-at is already at its RAM-driven torrent
+// cap, so the binding constraint is the per-torrent RAM slot rather than
+// disk. The size tie-break then flips to prefer LARGER torrents, because each
+// RAM slot seeds a fixed overhead regardless of size - a big torrent fills a
+// slot far more efficiently than a small one, which is exactly what a
+// RAM-constrained, disk-rich host (e.g. a 1 GB Pi on a 20 TB disk) wants.
+func RankCandidates(candidates []Candidate, ramBound bool) []Candidate {
 	ranked := make([]Candidate, 0, len(candidates))
 	for _, c := range candidates {
 		if c.Available() {
@@ -56,6 +63,9 @@ func RankCandidates(candidates []Candidate) []Candidate {
 	sort.SliceStable(ranked, func(i, j int) bool {
 		if ranked[i].Seeders != ranked[j].Seeders {
 			return ranked[i].Seeders < ranked[j].Seeders
+		}
+		if ramBound {
+			return ranked[i].SizeBytes > ranked[j].SizeBytes
 		}
 		return ranked[i].SizeBytes < ranked[j].SizeBytes
 	})

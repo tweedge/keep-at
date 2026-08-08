@@ -29,6 +29,7 @@ type configFlagSet struct {
 	rateLimit               *float64
 	keywordBlocklist        *string
 	preserveDeletedTorrents *bool
+	maxRAM                  *string
 }
 
 func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
@@ -46,6 +47,7 @@ func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
 		rateLimit:               fs.Float64("rate-limit", def.Scan.RateLimitPerSecond, "max requests per second to Academic Torrents' own infrastructure"),
 		keywordBlocklist:        fs.String("keyword-blocklist", "", "comma-separated keywords to block, matched against title and description"),
 		preserveDeletedTorrents: fs.Bool("preserve-deleted-torrents", def.PreserveDeletedTorrents, "keep seeding a torrent even if Academic Torrents removes it"),
+		maxRAM:                  fs.String("max-ram", "", "max RAM to plan around, e.g. 1G (default: 80% of system RAM); never exceeds an 80%-of-system hard cap"),
 	}
 }
 
@@ -86,6 +88,11 @@ func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
 		}
 		cfg = loaded
 		configFileLoaded = true
+		// The file's max_ram is the configured maximum; surface it on the
+		// separate field so the engine can tell a config-file value apart
+		// from a CLI --max-ram override (both flow into cfg.MaxRAM, but the
+		// cap check looks at whichever was set).
+		cfg.MaxRAMConfig = cfg.MaxRAM
 	}
 
 	for name := range visited {
@@ -108,6 +115,12 @@ func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
 			cfg.KeywordBlocklist = splitKeywords(*cf.keywordBlocklist)
 		case "preserve-deleted-torrents":
 			cfg.PreserveDeletedTorrents = *cf.preserveDeletedTorrents
+		case "max-ram":
+			limit, err := config.ParseByteSize(*cf.maxRAM)
+			if err != nil {
+				return config.Config{}, fmt.Errorf("--max-ram: %w", err)
+			}
+			cfg.MaxRAM = limit
 		}
 	}
 

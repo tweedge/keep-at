@@ -56,6 +56,21 @@ type Config struct {
 	Aggressiveness          float64       `yaml:"aggressiveness"`
 	KeywordBlocklist        []string      `yaml:"keyword_blocklist"`
 	PreserveDeletedTorrents bool          `yaml:"preserve_deleted_torrents"`
+
+	// MaxRAM caps how much of the host's memory keep-at will plan its
+	// torrent holding around. It's expressed as a ByteSize for a config
+	// file; the CLI exposes it as --max-ram. Zero (the default) means "use
+	// the full hard cap of 80% of system RAM" - keep-at is designed to run
+	// unattended and simply, so by default it spends up to that share and
+	// figures out the rest itself. A explicit value is subject to the same
+	// hard cap and is never allowed to exceed 80% of system RAM.
+	MaxRAM ByteSize `yaml:"max_ram"`
+
+	// MaxRAMConfig mirrors MaxRAM but is only set from a config file (it
+	// carries the on-disk value), so the CLI's --max-ram and a config file
+	// can be distinguished by resolve. It is not unmarshalled from YAML
+	// directly; see Load.
+	MaxRAMConfig ByteSize `yaml:"-"`
 }
 
 // StorageLocation is one folder keep-at is allowed to fill, up to Limit.

@@ -89,6 +89,14 @@ From the CLI, pass a comma-separated list: `--keyword-blocklist confidential,dra
 
 *Default: `false`.* If Academic Torrents removes a torrent keep-at is seeding, keep-at removes its local copy too by default, on the theory that a takedown probably happened for a reason. Set this to `true` to keep seeding removed torrents anyway.
 
+## Memory
+
+### `max_ram` / `--max-ram`
+
+*Default: 80% of system RAM.* The most memory keep-at will plan its holding around. keep-at runs unattended and is meant to share a host (a Pi's OS, the arr stack, other services), so by default it spends up to 80% of the machine's physical RAM and figures out the rest itself. You can set a smaller explicit cap (e.g. `--max-ram 1G`), but never a larger one: keep-at refuses to use more than 80% of system RAM, and asks beyond that are rejected at startup.
+
+keep-at's memory use scales with how many torrents it holds, not with their total size - the underlying BitTorrent library gives every held torrent its own independent pool of peer-connection buffers. So `max_ram` translates into a hard cap on the **number of torrents** keep-at will ever hold at once (logged at startup as `max_torrents`). This is what lets a tiny 1 GB Raspberry Pi on a big disk still seed usefully: it just holds fewer, and (when RAM is the binding constraint rather than disk) larger torrents, getting more bytes seeded per scarce RAM slot. Lowering this also lowers keep-at's connection settings automatically-derived footprint.
+
 ## Network
 
 ### `port` / `--port`
