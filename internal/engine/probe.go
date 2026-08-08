@@ -43,6 +43,10 @@ func (e *Engine) probeSwarm(ctx context.Context, mi *metainfo.MetaInfo, timeout 
 	spec.Storage = e.probeStore
 	spec.DisallowDataDownload = true
 	spec.DisallowDataUpload = true
+	// Probing announces to AT's tracker too, so use the per-user announce
+	// URL here as well when a key is configured (see torrents.go's
+	// addTorrentSpec). Third-party trackers are never touched.
+	spec.Trackers = keyedTrackers(spec.Trackers, e.userAnnounceURL, e.userAnnounceIPv6URL)
 
 	t, _, err := e.currentProbeClient().AddTorrentSpec(spec)
 	if err != nil {

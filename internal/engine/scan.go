@@ -119,7 +119,7 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 
 	totalCandidates := countPendingCandidates(catalog, heldHashes, e.blocklist)
 	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt, TotalCandidates: totalCandidates})
-	e.logger.Info("starting scrape: fetching torrent metadata and tracker data for every pending catalog candidate to work out what needs seeding most - this determines priority before anything is downloaded, so it can take a while on a large catalog, and keep-at won't start changing what it holds until it finishes",
+	e.logger.Info("starting scrape: fetching torrent metadata and tracker data for every pending catalog candidate to work out what needs seeding most - this can take a while on a large catalog, and downloads start gradually as the highest-priority candidates are found rather than waiting for the whole scrape to finish",
 		"total", totalCandidates)
 
 	tracker := netstats.NewTracker()

@@ -78,6 +78,11 @@ func TestSmokeRealAcademicTorrents(t *testing.T) {
 	cfg.Port = 47560
 	cfg.Storage.Locations = []config.StorageLocation{{Path: storageDir, Limit: config.ByteSize(1 << 30)}} // 1GB cap
 	cfg.Scan.ModerationDelay = config.Duration(0)                                                         // fixtures are years old; no need to wait in the test
+	// Optional: exercise API-key attribution end to end when the operator
+	// passes their key via env, without hardcoding it into the test.
+	if k := os.Getenv("KEEPAT_API_KEY"); k != "" {
+		cfg.APIKey = k
+	}
 
 	e, err := New(cfg, Options{
 		CatalogURL:   catalogServer.URL + "/database.xml",

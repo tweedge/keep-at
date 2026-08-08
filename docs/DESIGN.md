@@ -110,7 +110,7 @@ A real full-catalog run crashed with a nil pointer dereference deep inside anacr
 
 A full-catalog scrape can run for a long time (see above), and a log that goes quiet for that long looks the same whether keep-at is working or stuck. Three log lines mark the phase:
 
-* `"starting scrape"`, once, right before evaluation begins - stating explicitly that it can take a while, and that keep-at won't add, swap, or remove anything until it's done (see below).
+* `"starting scrape"`, once, right before evaluation begins - stating explicitly that it can take a while, and that downloads start gradually as the highest-priority candidates are found rather than waiting for the whole scrape to finish (see "Scans act incrementally" below).
 * `"scrape in progress"`, every `progressLogInterval` (2 minutes) while it runs, with percent complete and an ETA.
 * `"scrape complete, updating what keep-at holds"`, once, when it finishes, right before acting on the results.
 

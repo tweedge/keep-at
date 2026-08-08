@@ -30,6 +30,7 @@ type configFlagSet struct {
 	keywordBlocklist        *string
 	preserveDeletedTorrents *bool
 	maxRAM                  *string
+	apiKey                  *string
 }
 
 func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
@@ -48,6 +49,7 @@ func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
 		keywordBlocklist:        fs.String("keyword-blocklist", "", "comma-separated keywords to block, matched against title and description"),
 		preserveDeletedTorrents: fs.Bool("preserve-deleted-torrents", def.PreserveDeletedTorrents, "keep seeding a torrent even if Academic Torrents removes it"),
 		maxRAM:                  fs.String("max-ram", "", "max RAM to plan around, e.g. 1G (default: 80% of system RAM); never exceeds an 80%-of-system hard cap"),
+		apiKey:                  fs.String("api-key", "", "Academic Torrents API key (uid=...;pass=...) to associate seeded torrents with your account; only sent to academictorrents.com trackers"),
 	}
 }
 
@@ -121,6 +123,8 @@ func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
 				return config.Config{}, fmt.Errorf("--max-ram: %w", err)
 			}
 			cfg.MaxRAM = limit
+		case "api-key":
+			cfg.APIKey = *cf.apiKey
 		}
 	}
 

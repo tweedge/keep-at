@@ -71,6 +71,17 @@ type Config struct {
 	// can be distinguished by resolve. It is not unmarshalled from YAML
 	// directly; see Load.
 	MaxRAMConfig ByteSize `yaml:"-"`
+
+	// APIKey is the operator's Academic Torrents API key (from
+	// https://academictorrents.com/my.php, formatted like
+	// "uid=12345;pass=abcdef..."). When set, keep-at resolves it to the
+	// per-user tracker announce URL at startup and uses that URL for every
+	// announce to Academic Torrents' own trackers, which makes AT show the
+	// operator's account (name and image) as hosting the torrents keep-at
+	// seeds. The key is only ever sent to the two Academic Torrents tracker
+	// hosts; it is never logged, never written into cached .torrent files or
+	// state, and never passed to any third-party tracker.
+	APIKey string `yaml:"api_key"`
 }
 
 // StorageLocation is one folder keep-at is allowed to fill, up to Limit.

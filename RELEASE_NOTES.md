@@ -1,3 +1,17 @@
+## v0.3.4 - API key attribution
+
+keep-at can now attribute the torrents it seeds to your Academic Torrents account, so the details page shows your name and image as hosting the data. Add your API key (from https://academictorrents.com/my.php) via `--api-key` or `api_key` in the config file.
+
+At startup, keep-at resolves the key through AT's own `userannounce` endpoint (the same mechanism AT's smartnode tooling uses) into the per-user announce URL carrying your account's passkey, then uses that URL for every announce to AT's trackers.
+
+- The key is **only ever sent to the two Academic Torrents tracker hosts** (`academictorrents.com` and `ipv6.academictorrents.com`, https only). Third-party trackers in `.torrent` files never see it.
+- The key and the resolved passkey URL are **never logged, never written to cached .torrent files or state, and never surfaced anywhere** except the announce to AT's tracker.
+- If the key is invalid or the endpoint is unreachable, keep-at logs a warning (with the secret portion redacted) and keeps running unattributed - it never crashes or refuses to start.
+
+Verified live against Academic Torrents: with a key configured, keep-at seeded real torrents and the account attribution was confirmed on the site.
+
+---
+
 ## v0.3.3 - bugfix
 
 Fixed the 0.3.2 release build: the new RAM-aware `SystemTotalRAM` used a Linux-only syscall, which broke cross-compiling the macOS and Windows binaries that the release workflow ships. It now uses the right per-platform API (Linux `sysinfo`, macOS `hw.memsize`, Windows `GlobalMemoryStatusEx`), so `scripts/build-release.sh` succeeds for every target. On a platform where RAM can't be measured, keep-at logs that the RAM-driven torrent cap is disabled rather than refusing to hold anything.

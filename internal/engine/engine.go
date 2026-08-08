@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -62,6 +63,15 @@ type Engine struct {
 	probeStore *piecestore.Client            // scratch storage for swarm-probing candidates, see probe.go
 	state      *state.State
 	swarmCache *swarmCache                   // persisted per-torrent scrape counts, reused across scans
+
+	// userAnnounceURL (and its ipv6 variant) is the per-user Academic
+	// Torrents announce URL resolved from cfg.APIKey at startup. When set,
+	// addTorrentSpec/probeSwarm swap AT tracker URLs for it, so AT attributes
+	// kept torrents to the operator's account. Empty when no API key is
+	// configured or resolution failed. The URL contains the account's
+	// passkey and must never be logged or written to disk.
+	userAnnounceURL     string
+	userAnnounceIPv6URL string
 
 	// maxTorrents is the hard cap on how many torrents keep-at will hold at
 	// once, derived from the RAM budget (see ram.go). RAM scales per-torrent
@@ -147,6 +157,27 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 
 	limiter := rate.NewLimiter(rate.Limit(cfg.Scan.RateLimitPerSecond), 1)
 
+	// Resolve the operator's API key (if set) to the per-user announce URL
+	// up front. This is one request to Academic Torrents' own endpoint, sent
+	// with the key as cookies; the resulting URL carries the account's
+	// passkey and is what makes AT show this operator as hosting whatever
+	// keep-at seeds. Failure is non-fatal: keep-at still runs, just without
+	// account attribution (the key itself is only ever used for this
+	// resolution and the keyed announces below).
+	userAnnounceURL, userAnnounceIPv6URL := "", ""
+	if cfg.APIKey != "" {
+		resolveCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ua, ua6, err := resolveUserAnnounce(resolveCtx, httpClient, cfg.APIKey)
+		cancel()
+		if err != nil {
+			logger.Warn("could not resolve Academic Torrents API key to a user announce URL; seeded torrents won't be attributed to your account",
+				"api_key", sanitizeAPIKey(cfg.APIKey), "err", err)
+		} else {
+			userAnnounceURL, userAnnounceIPv6URL = ua, ua6
+			logger.Info("Academic Torrents API key resolved; seeded torrents will be attributed to your account")
+		}
+	}
+
 	e := &Engine{
 		cfg:        cfg,
 		logger:     logger,
@@ -154,6 +185,8 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		probeStore: probeStore,
 		state:      st,
 		swarmCache: swarmCache,
+		userAnnounceURL:     userAnnounceURL,
+		userAnnounceIPv6URL: userAnnounceIPv6URL,
 		catalogFetcher: &atcatalog.Fetcher{
 			CachePath:  cfg.DataDir + "/database.xml",
 			HTTPClient: httpClient,

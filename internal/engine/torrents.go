@@ -57,6 +57,10 @@ func (e *Engine) addTorrentSpec(mi *metainfo.MetaInfo, store *piecestore.Client)
 		return nil, fmt.Errorf("engine: building torrent spec: %w", err)
 	}
 	spec.Storage = store
+	// If an AT API key is configured, swap AT tracker URLs for the
+	// operator's per-user announce URL so Academic Torrents attributes this
+	// torrent to their account. Third-party trackers are never touched.
+	spec.Trackers = keyedTrackers(spec.Trackers, e.userAnnounceURL, e.userAnnounceIPv6URL)
 
 	t, _, err := e.torrentClient.AddTorrentSpec(spec)
 	if err != nil {
