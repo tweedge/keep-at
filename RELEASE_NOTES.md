@@ -1,3 +1,13 @@
+## v0.4.0 - proper client identity in the swarm
+
+Until now, keep-at identified itself correctly to other peers (the BEP 10 extended handshake "v" string was already `keep-at/<version>`), but the HTTP User-Agent it sent on tracker announces was left at the torrent library's default - so Academic Torrents' tracker recorded keep-at peers as `anacrolix-torrent`, and its Technical page showed that instead of keep-at. This release fixes the whole identity story, and distinguishes keep-at's two roles so a node that's merely probing a swarm never gets mistaken for one that's actually seeding.
+
+- **Tracker announces now identify as keep-at.** The main (seeding) client sends `keep-at/<version> (seeder)` as its HTTP User-Agent on tracker announces, which is what AT's tracker records and displays on each torrent's Technical page. keep-at seeders now show up as keep-at, not anacrolix-torrent.
+- **Two roles, visibly different.** The probe (scraper) client - used only to briefly join swarms and count other keep-at nodes during a scan - sends `keep-at/<version> (scraper)` in both its User-Agent and extended-handshake "v" string, so AT's logs and other keep-at nodes can tell a prober from a seeder. keep-at's own HTTP tracker scrape requests carry the scraper identity too.
+- **Anti-cascade and network-status count only seeders.** `keep-at network-status` and the anti-cascade peer count now ignore any peer whose client string marks it as a scraper (older keep-at versions advertising the bare `keep-at/<version>` string still count as seeders). A node that's only probing a swarm no longer inflates how many keep-at nodes appear to be seeding a given torrent.
+
+---
+
 ## v0.3.5 - dependency security fixes
 
 This release upgrades the indirect dependencies behind all 20 GitHub Dependabot advisories (7 critical, 3 high, 10 moderate) that were open on the default branch. keep-at's own code was not at fault - the advisories were in transitive dependencies - but the versions have been bumped to patched releases:

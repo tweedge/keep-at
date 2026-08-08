@@ -59,7 +59,7 @@ func TestScrapeHTTPParsesBencodeResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	counts, err := ScrapeHTTP(context.Background(), server.Client(), server.URL+"/announce.php", []metainfo.Hash{hash})
+	counts, err := ScrapeHTTP(context.Background(), server.Client(), "", server.URL+"/announce.php", []metainfo.Hash{hash})
 	if err != nil {
 		t.Fatalf("ScrapeHTTP: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestScrapeHTTPLiveAgainstAcademicTorrents(t *testing.T) {
 		t.Fatalf("FromHexString: %v", err)
 	}
 
-	counts, err := ScrapeHTTP(context.Background(), http.DefaultClient, "https://academictorrents.com/announce.php", []metainfo.Hash{hash})
+	counts, err := ScrapeHTTP(context.Background(), http.DefaultClient, "", "https://academictorrents.com/announce.php", []metainfo.Hash{hash})
 	if err != nil {
 		t.Fatalf("ScrapeHTTP: %v", err)
 	}

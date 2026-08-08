@@ -24,8 +24,9 @@ type SwarmCounts struct {
 // using the BEP 48 scrape convention (announce URL with "announce" replaced
 // by "scrape" in its final path segment). Batching every hash keep-at cares
 // about into one request is what keeps a full catalog scan from turning
-// into thousands of individual tracker hits.
-func ScrapeHTTP(ctx context.Context, client *http.Client, announceURL string, hashes []metainfo.Hash) (map[metainfo.Hash]SwarmCounts, error) {
+// into thousands of individual tracker hits. userAgent, if non-empty, is
+// sent on the request so trackers can identify keep-at scrape traffic.
+func ScrapeHTTP(ctx context.Context, client *http.Client, userAgent, announceURL string, hashes []metainfo.Hash) (map[metainfo.Hash]SwarmCounts, error) {
 	scrapeURL, ok := deriveHTTPScrapeURL(announceURL)
 	if !ok {
 		return nil, fmt.Errorf("attorrent: tracker %s does not follow the announce/scrape URL convention", announceURL)
@@ -39,6 +40,9 @@ func ScrapeHTTP(ctx context.Context, client *http.Client, announceURL string, ha
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, scrapeURL+"?"+query.Encode(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("attorrent: building scrape request: %w", err)
+	}
+	if userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
 	}
 
 	resp, err := client.Do(req)
@@ -75,10 +79,10 @@ func ScrapeHTTP(ctx context.Context, client *http.Client, announceURL string, ha
 // scrapes are delegated to udpScraper, which reuses one client (and UDP
 // socket) per tracker across calls - see UDPScraper's doc comment for why
 // that matters, not just for efficiency.
-func Scrape(ctx context.Context, httpClient *http.Client, udpScraper *UDPScraper, announceURL string, hashes []metainfo.Hash) (map[metainfo.Hash]SwarmCounts, error) {
+func Scrape(ctx context.Context, httpClient *http.Client, udpScraper *UDPScraper, userAgent, announceURL string, hashes []metainfo.Hash) (map[metainfo.Hash]SwarmCounts, error) {
 	switch {
 	case strings.HasPrefix(announceURL, "http://"), strings.HasPrefix(announceURL, "https://"):
-		return ScrapeHTTP(ctx, httpClient, announceURL, hashes)
+		return ScrapeHTTP(ctx, httpClient, userAgent, announceURL, hashes)
 	case strings.HasPrefix(announceURL, "udp://"):
 		return udpScraper.Scrape(ctx, announceURL, hashes)
 	default:

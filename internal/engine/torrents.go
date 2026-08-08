@@ -125,17 +125,17 @@ type peerObservation struct {
 }
 
 // keepAtPeers returns one observation per currently-connected peer on t
-// that self-identifies as keep-at in the BitTorrent extended handshake.
-// It's a lower bound: it only sees peers we're actually connected to, not
-// the whole swarm, and a hostile peer could claim to be keep-at when it
-// isn't. See buildinfo for why that's an accepted tradeoff.
+// that self-identifies as a keep-at node actually seeding (not one merely
+// probing the swarm). It's a lower bound: it only sees peers we're actually
+// connected to, not the whole swarm, and a hostile peer could claim to be
+// keep-at when it isn't. See buildinfo for why that's an accepted tradeoff.
 func keepAtPeers(t *torrent.Torrent) []peerObservation {
 	var out []peerObservation
 	totalPieces := uint64(t.NumPieces())
 
 	for _, pc := range t.PeerConns() {
 		name, _ := pc.PeerClientName.Load().(string)
-		if len(name) < len(buildinfo.ClientName) || name[:len(buildinfo.ClientName)] != buildinfo.ClientName {
+		if !buildinfo.IsKeepAtSeeder(name) {
 			continue
 		}
 

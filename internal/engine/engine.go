@@ -245,7 +245,7 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		"per_torrent_footprint", humanBytes(perTorrent),
 		"max_torrents", maxTorrents)
 
-	torrentClient, err := e.newTorrentClient(cfg.Port, false)
+	torrentClient, err := e.newTorrentClient(cfg.Port, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -265,12 +265,23 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 	return e, nil
 }
 
-func (e *Engine) newTorrentClient(listenPort int, noDHT bool) (*torrent.Client, error) {
+func (e *Engine) newTorrentClient(listenPort int, noDHT bool, scraper bool) (*torrent.Client, error) {
 	tcfg := torrent.NewDefaultClientConfig()
 	tcfg.ListenPort = listenPort
 	tcfg.Seed = true
 	tcfg.DataDir = e.cfg.DataDir
-	tcfg.ExtendedHandshakeClientVersion = buildinfo.ExtendedHandshakeVersion()
+	// The extended handshake "v" string is what other keep-at nodes read
+	// (see keepAtPeers) and the HTTP User-Agent is what AT's tracker records
+	// on announces and shows on its Technical pages. Both carry keep-at plus
+	// the version, and a role suffix so the probe (scraper) client is
+	// distinguishable from the main (seeder) client - see buildinfo.
+	if scraper {
+		tcfg.ExtendedHandshakeClientVersion = buildinfo.ScraperExtendedHandshakeVersion()
+		tcfg.HTTPUserAgent = buildinfo.ScraperUserAgent()
+	} else {
+		tcfg.ExtendedHandshakeClientVersion = buildinfo.ExtendedHandshakeVersion()
+		tcfg.HTTPUserAgent = buildinfo.SeederUserAgent()
+	}
 	tcfg.Bep20 = buildinfo.PeerIDPrefix
 	tcfg.NoDHT = noDHT
 
@@ -367,7 +378,7 @@ func (e *Engine) resetProbeClient() error {
 	defer e.probeClientMu.Unlock()
 
 	old := e.probeTorrentClient
-	newClient, err := e.newTorrentClient(0, true)
+	newClient, err := e.newTorrentClient(0, true, true)
 	if err != nil {
 		return err
 	}

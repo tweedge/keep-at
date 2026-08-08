@@ -14,3 +14,6 @@ VOICE_FINDER_LOG.md
 
 # Local runtime state if keep-at is ever run from the repo root during dev
 /keep-at.yaml
+
+# Kilo local session/state directory
+/.kilo/
