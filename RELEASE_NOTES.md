@@ -1,3 +1,9 @@
+## v0.3.3 - bugfix
+
+Fixed the 0.3.2 release build: the new RAM-aware `SystemTotalRAM` used a Linux-only syscall, which broke cross-compiling the macOS and Windows binaries that the release workflow ships. It now uses the right per-platform API (Linux `sysinfo`, macOS `hw.memsize`, Windows `GlobalMemoryStatusEx`), so `scripts/build-release.sh` succeeds for every target. On a platform where RAM can't be measured, keep-at logs that the RAM-driven torrent cap is disabled rather than refusing to hold anything.
+
+---
+
 keep-at now bounds its own RAM use and scales how many (and which) torrents it holds to fit the machine it's running on - so a tiny 1 GB Raspberry Pi on a big disk seeds just as sensibly as a server with 32 GB. This release also makes scans dramatically faster and start seeding sooner.
 
 ## New: faster scans, seeding starts immediately
