@@ -1,3 +1,19 @@
+## v0.3.5 - dependency security fixes
+
+This release upgrades the indirect dependencies behind all 20 GitHub Dependabot advisories (7 critical, 3 high, 10 moderate) that were open on the default branch. keep-at's own code was not at fault - the advisories were in transitive dependencies - but the versions have been bumped to patched releases:
+
+- `golang.org/x/crypto` v0.44.0 -> v0.53.0 (fixed the SSH/FIDO key-constraint, `@revoked` bypass, channel deadlock, and pathological-input panics)
+- `golang.org/x/net` v0.47.0 -> v0.56.0 (HTML parser and DNS SVCB/HTTPS panic DoS)
+- `golang.org/x/text` v0.31.0 -> v0.39.0, `golang.org/x/sys` v0.45.0 -> v0.46.0, `golang.org/x/sync` v0.20.0 -> v0.21.0 (cascaded upgrades)
+- `go.opentelemetry.io/otel` v1.38.0 -> v1.42.0 (baggage-header allocation DoS amplification)
+- `github.com/pion/dtls/v3` v3.0.3 -> v3.1.5 and `github.com/pion/stun/v3` v3.0.0 -> v3.1.5 (panic DoS on crafted messages; DTLS nonce/key-leak)
+
+`github.com/anacrolix/torrent` remains **pinned at v1.60.0** - v1.61.0 has a crash bug keep-at must not take (see DESIGN.md) - so these are upgrades of its transitive dependencies only, not the library itself.
+
+Verified with `govulncheck`: zero vulnerabilities reachable from keep-at's code. The one remaining advisory (the unmaintained `golang.org/x/crypto/openpgp` package) has no upstream fix and is not called by any of keep-at's code paths. All 7 release targets build, and the full test suite passes.
+
+---
+
 ## v0.3.4 - API key attribution
 
 keep-at can now attribute the torrents it seeds to your Academic Torrents account, so the details page shows your name and image as hosting the data. Add your API key (from https://academictorrents.com/my.php) via `--api-key` or `api_key` in the config file.
