@@ -31,6 +31,9 @@ type configFlagSet struct {
 	preserveDeletedTorrents *bool
 	maxRAM                  *string
 	apiKey                  *string
+	uploadRateLimit         *string
+	downloadRateLimit       *string
+	statsInterval           *time.Duration
 }
 
 func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
@@ -50,6 +53,9 @@ func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
 		preserveDeletedTorrents: fs.Bool("preserve-deleted-torrents", def.PreserveDeletedTorrents, "keep seeding a torrent even if Academic Torrents removes it"),
 		maxRAM:                  fs.String("max-ram", "", "max RAM to plan around, e.g. 1G (default: 80% of system RAM); never exceeds an 80%-of-system hard cap"),
 		apiKey:                  fs.String("api-key", "", "Academic Torrents API key (uid=...;pass=...) to associate seeded torrents with your account; only sent to academictorrents.com trackers"),
+		uploadRateLimit:         fs.String("upload-rate-limit", "", "max upload speed across all torrents, e.g. 50M = 50 MiB/s (default: unlimited)"),
+		downloadRateLimit:       fs.String("download-rate-limit", "", "max download speed across all torrents, e.g. 20M = 20 MiB/s (default: unlimited)"),
+		statsInterval:           fs.Duration("stats-interval", def.StatsInterval.AsDuration(), "how often to log a summary of what keep-at is doing; 0 disables periodic summaries"),
 	}
 }
 
@@ -125,6 +131,20 @@ func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
 			cfg.MaxRAM = limit
 		case "api-key":
 			cfg.APIKey = *cf.apiKey
+		case "upload-rate-limit":
+			limit, err := config.ParseByteSize(*cf.uploadRateLimit)
+			if err != nil {
+				return config.Config{}, fmt.Errorf("--upload-rate-limit: %w", err)
+			}
+			cfg.UploadRateLimit = limit
+		case "download-rate-limit":
+			limit, err := config.ParseByteSize(*cf.downloadRateLimit)
+			if err != nil {
+				return config.Config{}, fmt.Errorf("--download-rate-limit: %w", err)
+			}
+			cfg.DownloadRateLimit = limit
+		case "stats-interval":
+			cfg.StatsInterval = config.Duration(*cf.statsInterval)
 		}
 	}
 

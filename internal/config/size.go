@@ -31,7 +31,9 @@ var byteSizeSuffixes = []struct {
 }
 
 // ParseByteSize parses a fixed integer followed by M, G, T, or P (case
-// insensitive) into a byte count, e.g. "500G" -> 500 * 1024^3.
+// insensitive) into a byte count, e.g. "500G" -> 500 * 1024^3. A bare
+// integer with no suffix is taken as a plain byte count, which is how "0"
+// (meaning unlimited for rate limits) and small exact values are expressed.
 func ParseByteSize(s string) (ByteSize, error) {
 	trimmed := strings.TrimSpace(s)
 	if trimmed == "" {
@@ -53,11 +55,23 @@ func ParseByteSize(s string) (ByteSize, error) {
 		}
 	}
 
-	return 0, fmt.Errorf("byte size %q: must end in M, G, T, or P", s)
+	// No suffix: treat the whole thing as a plain byte count (e.g. "0" or
+	// "4096"). A numeric suffix-less value with a trailing letter that isn't
+	// M/G/T/P still errors out below, since ParseInt will reject it.
+	value, err := strconv.ParseInt(upper, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("byte size %q: must end in M, G, T, or P (or be a plain byte count)", s)
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("byte size %q: must not be negative", s)
+	}
+	return ByteSize(value), nil
 }
 
 func (b ByteSize) String() string {
 	switch {
+	case b == 0:
+		return "0"
 	case b >= byteSizePeta && b%byteSizePeta == 0:
 		return fmt.Sprintf("%dP", b/byteSizePeta)
 	case b >= byteSizeTera && b%byteSizeTera == 0:

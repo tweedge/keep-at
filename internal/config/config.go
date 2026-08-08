@@ -47,6 +47,13 @@ var (
 
 const DefaultRateLimitPerSec = 0.5
 
+// DefaultStatsInterval is how often keep-at logs and persists a summary of
+// what it's doing, so operators (and `keep-at status`) can see held torrents,
+// disk utilization, and transfer totals without digging through logs. 30
+// minutes is frequent enough to be useful but not so chatty it buries real
+// messages.
+const DefaultStatsInterval = Duration(30 * time.Minute)
+
 // Config is the full keep-at configuration.
 type Config struct {
 	Port                    int           `yaml:"port"`
@@ -82,6 +89,20 @@ type Config struct {
 	// hosts; it is never logged, never written into cached .torrent files or
 	// state, and never passed to any third-party tracker.
 	APIKey string `yaml:"api_key"`
+
+	// UploadRateLimit and DownloadRateLimit cap how fast keep-at transfers
+	// data, in bytes per second. Zero (the default) means unlimited. A
+	// limit is applied across all torrents at once (a single shared rate
+	// limiter on the torrent client), not per torrent.
+	UploadRateLimit   ByteSize `yaml:"upload_rate_limit"`
+	DownloadRateLimit ByteSize `yaml:"download_rate_limit"`
+
+	// StatsInterval controls how often keep-at logs a brief summary of what
+	// it's doing - torrents held/seeding, disk utilization, bytes
+	// transferred since boot, and so on - and writes that summary to disk
+	// so `keep-at status` can display it. Zero disables the periodic log
+	// (one summary is still written at startup).
+	StatsInterval Duration `yaml:"stats_interval"`
 }
 
 // StorageLocation is one folder keep-at is allowed to fill, up to Limit.
@@ -120,6 +141,7 @@ func Default() Config {
 			MinSeedMargin:      DefaultMinSeedMargin,
 			ModerationDelay:    DefaultModerationDelay,
 		},
+		StatsInterval: DefaultStatsInterval,
 	}
 }
 
@@ -184,6 +206,15 @@ func (c Config) Validate() error {
 	}
 	if c.Scan.RateLimitPerSecond <= 0 {
 		return fmt.Errorf("scan.rate_limit_per_second must be positive")
+	}
+	if c.UploadRateLimit < 0 {
+		return fmt.Errorf("upload_rate_limit must not be negative")
+	}
+	if c.DownloadRateLimit < 0 {
+		return fmt.Errorf("download_rate_limit must not be negative")
+	}
+	if c.StatsInterval < 0 {
+		return fmt.Errorf("stats_interval must not be negative")
 	}
 	return nil
 }

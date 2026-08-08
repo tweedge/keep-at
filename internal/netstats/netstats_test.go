@@ -110,3 +110,56 @@ func TestHumanBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestRuntimeStatsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/runtime-stats.json"
+
+	if _, err := LoadRuntime(path); err != nil {
+		t.Fatalf("LoadRuntime on missing file: %v", err)
+	}
+
+	want := RuntimeStats{
+		CollectedAt:      time.Now().UTC(),
+		UptimeSeconds:    3600,
+		HeldTorrents:     12,
+		SeedingTorrents:  10,
+		DownloadingTorrents: 2,
+		DiskUsedBytes:    50 << 30,
+		DiskLimitBytes:   100 << 30,
+		BytesUploaded:    5 << 30,
+		BytesDownloaded:  1 << 30,
+		ActivePeers:      24,
+	}
+	if err := SaveRuntime(path, want); err != nil {
+		t.Fatalf("SaveRuntime: %v", err)
+	}
+
+	got, err := LoadRuntime(path)
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	if got.HeldTorrents != want.HeldTorrents || got.SeedingTorrents != want.SeedingTorrents ||
+		got.DiskUsedBytes != want.DiskUsedBytes || got.Uptime() != time.Hour {
+		t.Errorf("round trip mismatch: got %+v want %+v", got, want)
+	}
+}
+
+func TestRuntimeStatsDiskUsedPct(t *testing.T) {
+	cases := []struct {
+		name     string
+		used     int64
+		limit    int64
+		wantPct  float64
+	}{
+		{"half full", 50 << 30, 100 << 30, 50},
+		{"over limit", 120 << 30, 100 << 30, 100},
+		{"no limit", 10 << 30, 0, 0},
+	}
+	for _, c := range cases {
+		s := RuntimeStats{DiskUsedBytes: c.used, DiskLimitBytes: c.limit}
+		if got := s.DiskUsedPct(); got != c.wantPct {
+			t.Errorf("%s: DiskUsedPct() = %v, want %v", c.name, got, c.wantPct)
+		}
+	}
+}

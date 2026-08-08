@@ -80,6 +80,91 @@ func Save(path string, s Snapshot) error {
 	return nil
 }
 
+// RuntimeStats is a point-in-time summary of keep-at's own operation -
+// how many torrents it's holding and seeding, disk utilization against its
+// configured limits, and bytes transferred since boot - persisted to disk
+// so `keep-at status` can display it from a separate process without
+// needing to talk to the running daemon directly. It complements Snapshot,
+// which describes the wider keep-at network observed during a scan.
+type RuntimeStats struct {
+	CollectedAt time.Time `json:"collected_at"`
+	// UptimeSeconds is how long keep-at has been running, for the "since
+	// boot" framing of the transfer counters.
+	UptimeSeconds int64 `json:"uptime_seconds"`
+
+	HeldTorrents      int `json:"held_torrents"`
+	SeedingTorrents   int `json:"seeding_torrents"`
+	DownloadingTorrents int `json:"downloading_torrents"`
+
+	// DiskUsedBytes and DiskLimitBytes are sums across every configured
+	// storage location (used is tracked against each location's limit, not
+	// raw filesystem usage). A zero limit means "not applicable".
+	DiskUsedBytes  int64 `json:"disk_used_bytes"`
+	DiskLimitBytes int64 `json:"disk_limit_bytes"`
+
+	// BytesUploaded and BytesDownloaded are data payload bytes transferred
+	// over peer connections since keep-at started, excluding protocol
+	// overhead.
+	BytesUploaded   int64 `json:"bytes_uploaded"`
+	BytesDownloaded int64 `json:"bytes_downloaded"`
+
+	// ActivePeers is the number of peer connections keep-at has open right
+	// now across all held torrents.
+	ActivePeers int `json:"active_peers"`
+}
+
+// Uptime returns how long keep-at has been running.
+func (s RuntimeStats) Uptime() time.Duration {
+	return time.Duration(s.UptimeSeconds) * time.Second
+}
+
+// DiskUsedPct returns the percentage of keep-at's configured storage
+// limits currently in use, or 0 when no limit is set.
+func (s RuntimeStats) DiskUsedPct() float64 {
+	if s.DiskLimitBytes <= 0 {
+		return 0
+	}
+	pct := float64(s.DiskUsedBytes) / float64(s.DiskLimitBytes) * 100
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+// LoadRuntime reads a persisted runtime stats snapshot. A missing file
+// returns a zero RuntimeStats and no error - that just means keep-at
+// hasn't written one yet.
+func LoadRuntime(path string) (RuntimeStats, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return RuntimeStats{}, nil
+	}
+	if err != nil {
+		return RuntimeStats{}, fmt.Errorf("netstats: reading %s: %w", path, err)
+	}
+	var s RuntimeStats
+	if err := json.Unmarshal(data, &s); err != nil {
+		return RuntimeStats{}, fmt.Errorf("netstats: parsing %s: %w", path, err)
+	}
+	return s, nil
+}
+
+// SaveRuntime atomically persists a runtime stats snapshot.
+func SaveRuntime(path string, s RuntimeStats) error {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return fmt.Errorf("netstats: marshalling runtime stats: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("netstats: writing %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("netstats: finalizing %s: %w", path, err)
+	}
+	return nil
+}
+
 // Tracker accumulates network-wide observations during a single scan.
 //
 // "How many keep-at nodes are there" and "how much data are they seeding

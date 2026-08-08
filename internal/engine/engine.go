@@ -78,6 +78,10 @@ type Engine struct {
 	// in anacrolix/torrent, so capping the count is what bounds memory use.
 	maxTorrents int
 
+	// startedAt is when this Engine was constructed, the reference point
+	// for the "since boot" transfer and uptime figures in RuntimeStats.
+	startedAt time.Time
+
 	catalogFetcher *atcatalog.Fetcher
 	torrentFetcher *attorrent.Fetcher
 	httpClient     *http.Client
@@ -185,6 +189,7 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		probeStore: probeStore,
 		state:      st,
 		swarmCache: swarmCache,
+		startedAt:  time.Now(),
 		userAnnounceURL:     userAnnounceURL,
 		userAnnounceIPv6URL: userAnnounceIPv6URL,
 		catalogFetcher: &atcatalog.Fetcher{
@@ -284,6 +289,18 @@ func (e *Engine) newTorrentClient(listenPort int, noDHT bool, scraper bool) (*to
 	}
 	tcfg.Bep20 = buildinfo.PeerIDPrefix
 	tcfg.NoDHT = noDHT
+
+	// Optional upload/download throttling. Zero means unlimited, which is
+	// what the library defaults to, so a limiter is only wired in when the
+	// operator actually set one. The burst is left at zero and filled in by
+	// the library (see ClientConfig.setRateLimiterBursts) so it stays
+	// consistent with keep-at's other connection settings.
+	if bytesPerSec := int64(e.cfg.UploadRateLimit); bytesPerSec > 0 {
+		tcfg.UploadRateLimiter = rate.NewLimiter(rate.Limit(bytesPerSec), 0)
+	}
+	if bytesPerSec := int64(e.cfg.DownloadRateLimit); bytesPerSec > 0 {
+		tcfg.DownloadRateLimiter = rate.NewLimiter(rate.Limit(bytesPerSec), 0)
+	}
 
 	// Memory tuning. The library defaults are sized for a handful of
 	// torrents (EstablishedConnsPerTorrent=50, MaxAllocPeerRequestDataPerConn=1MiB),

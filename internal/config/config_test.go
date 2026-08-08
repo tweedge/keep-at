@@ -16,6 +16,8 @@ func TestParseByteSize(t *testing.T) {
 		{"1T", byteSizeTera},
 		{"1P", byteSizePeta},
 		{"  10g ", 10 * byteSizeGiga},
+		{"0", 0},
+		{"4096", 4096},
 	}
 	for _, c := range cases {
 		got, err := ParseByteSize(c.in)
@@ -30,7 +32,7 @@ func TestParseByteSize(t *testing.T) {
 }
 
 func TestParseByteSizeRejectsInvalid(t *testing.T) {
-	invalid := []string{"", "500", "500X", "-5G", "abc"}
+	invalid := []string{"", "500X", "-5G", "abc", "10Q"}
 	for _, in := range invalid {
 		if _, err := ParseByteSize(in); err == nil {
 			t.Errorf("ParseByteSize(%q): expected an error, got none", in)
@@ -77,6 +79,38 @@ func TestValidateRejectsBadAggressiveness(t *testing.T) {
 		if err := cfg.Validate(); err == nil {
 			t.Errorf("aggressiveness=%v: expected Validate to reject", bad)
 		}
+	}
+}
+
+func TestValidateRejectsNegativeRateLimits(t *testing.T) {
+	cfg := Default()
+	cfg.Storage.Locations = []StorageLocation{{Path: "/data", Limit: byteSizeGiga}}
+
+	cfg.UploadRateLimit = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("negative upload_rate_limit: expected Validate to reject")
+	}
+
+	cfg = Default()
+	cfg.Storage.Locations = []StorageLocation{{Path: "/data", Limit: byteSizeGiga}}
+	cfg.DownloadRateLimit = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("negative download_rate_limit: expected Validate to reject")
+	}
+}
+
+func TestValidateRejectsNegativeStatsInterval(t *testing.T) {
+	cfg := Default()
+	cfg.Storage.Locations = []StorageLocation{{Path: "/data", Limit: byteSizeGiga}}
+	cfg.StatsInterval = Duration(-1)
+	if err := cfg.Validate(); err == nil {
+		t.Error("negative stats_interval: expected Validate to reject")
+	}
+}
+
+func TestDefaultStatsInterval(t *testing.T) {
+	if got := Default().StatsInterval.AsDuration(); got != DefaultStatsInterval.AsDuration() {
+		t.Errorf("Default().StatsInterval = %v, want %v", got, DefaultStatsInterval)
 	}
 }
 

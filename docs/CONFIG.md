@@ -129,6 +129,45 @@ api_key: uid=12345;pass=abcdef...
 
 *Default: `37550`* (picked randomly during development, checked against common well-known ports). The BitTorrent listen port. If you're running keep-at behind a VPN or router with port forwarding, this is the port to forward - see [VPN.md](VPN.md).
 
+## Throttling
+
+### `upload_rate_limit` / `--upload-rate-limit` and `download_rate_limit` / `--download-rate-limit`
+
+*Default: `0` (unlimited).* Caps how fast keep-at transfers data, in bytes per second, e.g. `50M` = 50 MiB/s. A limit applies **across all torrents at once** - one shared limiter on the torrent client, not a per-torrent budget - so `upload_rate_limit: 10M` means keep-at will never upload faster than 10 MiB/s total. Values use the same size syntax as storage limits (`M`/`G`/`T`/`P`), or a plain byte count; `0` means unlimited. Set both in a config file, or one via flags:
+
+```
+keep-at run --upload-rate-limit 50M --download-rate-limit 20M
+```
+
+```yaml
+upload_rate_limit: 50M
+download_rate_limit: 20M
+```
+
+## Runtime statistics
+
+### `stats_interval` / `--stats-interval`
+
+*Default: `30m`.* How often keep-at logs a brief summary of what it's doing - torrents held/seeding/downloading, disk utilization, bytes uploaded and downloaded since boot, active peers, and uptime - and writes that same summary to disk (in `data_dir/runtime-stats.json`) so `keep-at status` can display it. A summary is always written once at startup; `stats_interval: 0` disables the periodic ones. The log line looks like:
+
+```
+runtime stats kind=periodic held=12 seeding=10 downloading=2 disk_used=50.0G disk_limit=100.0G disk_used_pct=50 uploaded=5.0G downloaded=1.0G peers=24 uptime=2h0m0s
+```
+
+and `keep-at status` prints the same picture:
+
+```
+keep-at is running (pid 12345)
+runtime stats (as of 2026-08-08 20:55:00 UTC, uptime 2h0m0s):
+  torrents: 12 held, 10 seeding, 2 downloading
+  disk: 50.0 GB used of 100.0 GB configured (50.0%)
+  uploaded since boot: 5.0 GB
+  downloaded since boot: 1.0 GB
+  active peers: 24
+```
+
+Disk utilization is measured against keep-at's **configured storage limits** (the `storage.locations`/`--storage-limit` totals), not raw filesystem usage - 100% means keep-at has reached the limit it was given. "Since boot" means since this keep-at process started.
+
 ## Flags that aren't config fields
 
 A few flags control CLI behavior rather than keep-at's own settings, and don't have a YAML equivalent:

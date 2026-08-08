@@ -1,3 +1,41 @@
+## v0.4.1 - runtime stats and bandwidth throttling
+
+keep-at now tells you what it's actually doing, and lets you cap how much bandwidth it uses.
+
+### Runtime statistics
+
+keep-at logs a brief summary of its own operation once at startup (right after held torrents have resumed) and then every `stats_interval` (default 30 minutes), even mid-scan. Each summary reports:
+
+- torrents held, seeding, and still downloading
+- disk used vs configured storage limits (as a percentage of those limits)
+- bytes uploaded and downloaded since boot
+- active peers and uptime
+
+The same summary is written to `data_dir/runtime-stats.json`, and **`keep-at status`** now prints it underneath the usual running/not-running line - so checking on a box is one command:
+
+```
+keep-at is running (pid 12345)
+runtime stats (as of 2026-08-08 20:55:00 UTC, uptime 2h0m0s):
+  torrents: 12 held, 10 seeding, 2 downloading
+  disk: 50.0 GB used of 100.0 GB configured (50.0%)
+  uploaded since boot: 5.0 GB
+  downloaded since boot: 1.0 GB
+  active peers: 24
+```
+
+`stats_interval: 0` disables the periodic summaries (the startup one is always written). Disk percentage is measured against the storage limits keep-at was given, not raw filesystem usage, so 100% means keep-at has filled the space it was allowed.
+
+### Bandwidth throttling
+
+Two new settings cap transfer speed across all torrents at once, in bytes per second:
+
+- `upload_rate_limit` / `--upload-rate-limit`
+- `download_rate_limit` / `--download-rate-limit`
+
+Both default to `0` (unlimited) and use the same size syntax as storage limits (`50M` = 50 MiB/s), with a plain byte count also accepted. The limit is a single shared rate limiter on the torrent client, so `upload_rate_limit: 10M` means keep-at will never upload faster than 10 MiB/s total, no matter how many torrents it's seeding.
+
+---
+
 ## v0.4.0 - proper client identity in the swarm
 
 Until now, keep-at identified itself correctly to other peers (the BEP 10 extended handshake "v" string was already `keep-at/<version>`), but the HTTP User-Agent it sent on tracker announces was left at the torrent library's default - so Academic Torrents' tracker recorded keep-at peers as `anacrolix-torrent`, and its Technical page showed that instead of keep-at. This release fixes the whole identity story, and distinguishes keep-at's two roles so a node that's merely probing a swarm never gets mistaken for one that's actually seeding.

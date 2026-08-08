@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+
+	"github.com/tweedge/keep-at/internal/netstats"
 )
 
 func cmdStatus(args []string) error {
@@ -29,5 +31,36 @@ func cmdStatus(args []string) error {
 	} else {
 		fmt.Println("keep-at is not running")
 	}
+
+	// The runtime summary is written by the running daemon; if none is
+	// present (keep-at hasn't started, or hasn't gotten far enough to write
+	// one), just skip the block rather than implying a problem.
+	runtimeStats, err := netstats.LoadRuntime(dir + "/runtime-stats.json")
+	if err != nil {
+		return err
+	}
+	if runtimeStats.CollectedAt.IsZero() {
+		return nil
+	}
+
+	seeding := runtimeStats.SeedingTorrents
+	downloading := runtimeStats.HeldTorrents - seeding
+	if downloading < 0 {
+		downloading = 0
+	}
+
+	fmt.Printf("runtime stats (as of %s, uptime %s):\n",
+		runtimeStats.CollectedAt.Format("2006-01-02 15:04:05 MST"),
+		runtimeStats.Uptime().Round(1e9).String())
+	fmt.Printf("  torrents: %d held, %d seeding, %d downloading\n", runtimeStats.HeldTorrents, seeding, downloading)
+	if runtimeStats.DiskLimitBytes > 0 {
+		fmt.Printf("  disk: %s used of %s configured (%.1f%%)\n",
+			netstats.HumanBytes(runtimeStats.DiskUsedBytes),
+			netstats.HumanBytes(runtimeStats.DiskLimitBytes),
+			runtimeStats.DiskUsedPct())
+	}
+	fmt.Printf("  uploaded since boot: %s\n", netstats.HumanBytes(runtimeStats.BytesUploaded))
+	fmt.Printf("  downloaded since boot: %s\n", netstats.HumanBytes(runtimeStats.BytesDownloaded))
+	fmt.Printf("  active peers: %d\n", runtimeStats.ActivePeers)
 	return nil
 }
