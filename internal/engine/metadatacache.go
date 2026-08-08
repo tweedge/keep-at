@@ -22,14 +22,21 @@ func (e *Engine) cachedTorrentPath(infoHash metainfo.Hash) string {
 }
 
 // fetchMetadata returns a torrent's metadata, preferring keep-at's local cache
-// over a fresh request to Academic Torrents.
-func (e *Engine) fetchMetadata(ctx context.Context, infoHash metainfo.Hash) (*attorrent.Metadata, error) {
+// over a fresh request to Academic Torrents. stats, if non-nil, is updated to
+// record whether this was served from cache or fetched over the network.
+func (e *Engine) fetchMetadata(ctx context.Context, infoHash metainfo.Hash, stats *scanStats) (*attorrent.Metadata, error) {
 	path := e.cachedTorrentPath(infoHash)
 	if data, err := os.ReadFile(path); err == nil {
 		if md, parseErr := attorrent.ParseTorrentBytes(data); parseErr == nil {
+			if stats != nil {
+				stats.metadataCached.Add(1)
+			}
 			return md, nil
 		}
 		// Corrupt cache entry; fall through and refetch.
+	}
+	if stats != nil {
+		stats.metadataFetched.Add(1)
 	}
 
 	md, err := e.torrentFetcher.FetchTorrent(ctx, infoHash)

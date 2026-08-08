@@ -77,6 +77,36 @@ type evaluatedCandidate struct {
 	swarm    attorrent.SwarmCounts
 }
 
+// scanStats accumulates what a single scan actually did, so the completion
+// log can say how much of the work hit Academic Torrents versus keep-at's
+// caches, how many candidates were skipped (and why), and how big the
+// catalog is. All fields are atomic because evaluation runs concurrently.
+type scanStats struct {
+	// LibraryBytes is the summed size of every catalog item, so the log can
+	// report how big the Academic Torrents library is.
+	libraryBytes int64
+
+	// Metadata fetches: one .torrent GET per uncached candidate, vs served
+	// from keep-at's on-disk torrent cache.
+	metadataFetched atomic.Int64
+	metadataCached  atomic.Int64
+
+	// Tracker scrapes: one batched multi-hash scrape request per tracker per
+	// flush, vs counts reused from keep-at's swarm cache.
+	scrapeRequests atomic.Int64
+	scrapeCached   atomic.Int64
+
+	// Candidates skipped entirely, by reason.
+	skippedHeld      atomic.Int64
+	skippedBlocked   atomic.Int64
+	skippedAge       atomic.Int64
+	skippedFetchErr  atomic.Int64
+	skippedScrapeErr atomic.Int64
+
+	// Candidates that made it through evaluation (eligible to be added).
+	eligible atomic.Int64
+}
+
 // ScanOnce runs one full pass: refresh the catalog, drop anything Academic
 // Torrents has taken down, refresh seed counts for what keep-at already
 // holds, and then look for new torrents to fill free space or displace
@@ -122,9 +152,14 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	e.logger.Info("starting scrape: fetching torrent metadata and tracker data for every pending catalog candidate to work out what needs seeding most - this can take a while on a large catalog, and downloads start gradually as the highest-priority candidates are found rather than waiting for the whole scrape to finish",
 		"total", totalCandidates)
 
+	stats := &scanStats{}
+	for _, item := range catalog.Items {
+		stats.libraryBytes += item.SizeBytes
+	}
+
 	tracker := netstats.NewTracker()
 	scrapeStartedAt := time.Now()
-	candChan := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates)
+	candChan := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates, stats)
 
 	// Incremental acting: evaluate candidates stream in, and we act on the
 	// highest-priority ones as soon as they're known, rather than waiting
@@ -151,7 +186,22 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	}
 
 	e.logger.Info("scrape complete, updating what keep-at holds",
-		"available", len(evaluated), "processed", processed, "total", totalCandidates, "elapsed", humanDuration(time.Since(scrapeStartedAt)))
+		"available", len(evaluated),
+		"processed", processed,
+		"total", totalCandidates,
+		"elapsed", humanDuration(time.Since(scrapeStartedAt)),
+		"library_size", humanBytes(stats.libraryBytes),
+		"metadata_fetched", stats.metadataFetched.Load(),
+		"metadata_cached", stats.metadataCached.Load(),
+		"scrape_requests", stats.scrapeRequests.Load(),
+		"scrape_cached", stats.scrapeCached.Load(),
+		"skipped_held", stats.skippedHeld.Load(),
+		"skipped_blocked", stats.skippedBlocked.Load(),
+		"skipped_age", stats.skippedAge.Load(),
+		"skipped_fetch_err", stats.skippedFetchErr.Load(),
+		"skipped_scrape_err", stats.skippedScrapeErr.Load(),
+		"eligible", stats.eligible.Load(),
+	)
 
 	e.saveNetworkStats(netstats.Snapshot{
 		ScanStartedAt:       scanStartedAt,
@@ -238,12 +288,12 @@ func (e *Engine) refreshHeldSeederCounts(ctx context.Context, held []state.Torre
 		}
 		h := h
 		safely(e.logger, "refreshing seeder count for "+h.Title, func() {
-			md, err := e.fetchMetadata(ctx, h.InfoHash)
+			md, err := e.fetchMetadata(ctx, h.InfoHash, nil)
 			if err != nil {
 				e.logger.Warn("could not refresh metadata for held torrent", "title", h.Title, "err", err)
 				return
 			}
-			swarm, err := e.scrapeSwarm(ctx, md.Trackers, h.InfoHash)
+			swarm, err := e.scrapeSwarm(ctx, md.Trackers, h.InfoHash, nil)
 			if err != nil {
 				e.logger.Warn("could not scrape held torrent", "title", h.Title, "err", err)
 				return
@@ -264,11 +314,16 @@ func (e *Engine) refreshHeldSeederCounts(ctx context.Context, held []state.Torre
 // (waits several seconds per candidate) and only needed at decision time, so
 // ScanOnce probes on demand for just the candidates it's about to act on.
 //
+// Tracker scrapes are batched across candidates (see scrapeBatcher) so the
+// scrape phase issues one rate-limited request per ~64 candidates rather than
+// one per candidate; that's the dominant structural speedup for a full-catalog
+// scan. Only Academic Torrents' own trackers are scraped.
+//
 // Candidates are evaluated concurrently (see evaluateConcurrency) and emitted
 // as they complete, so ScanOnce can start acting on the highest-priority ones
 // before the whole catalog is evaluated. The channel is closed when the walk
 // and all in-flight evaluations finish.
-func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, scanStartedAt time.Time, totalCandidates int) <-chan evaluatedCandidate {
+func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, scanStartedAt time.Time, totalCandidates int, stats *scanStats) <-chan evaluatedCandidate {
 	now := time.Now().UTC()
 	minAge := e.cfg.Scan.ModerationDelay.AsDuration()
 
@@ -303,6 +358,8 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 		}
 
 		evalStartedAt := time.Now()
+		batcher := newScrapeBatcher(e, ctx, stats)
+		defer batcher.close()
 
 		stopProgress := make(chan struct{})
 		progressStopped := make(chan struct{})
@@ -337,9 +394,11 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 				break catalogLoop
 			}
 			if heldHashes[item.InfoHash.HexString()] {
+				stats.skippedHeld.Add(1)
 				continue
 			}
 			if blocked, kw := e.blocklist.Blocks(item.Title, item.Description); blocked {
+				stats.skippedBlocked.Add(1)
 				e.logger.Debug("skipping blocked candidate", "title", item.Title, "keyword", kw)
 				continue
 			}
@@ -358,10 +417,11 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 				defer processed.Add(1)
 
 				safely(e.logger, "evaluating "+item.Title, func() {
-					c, ok := e.evaluateOneCandidate(ctx, item, now, minAge)
+					c, ok := e.evaluateOneCandidate(ctx, item, now, minAge, batcher, stats)
 					if !ok {
 						return
 					}
+					stats.eligible.Add(1)
 					results <- c
 				})
 			}()
@@ -378,19 +438,22 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 	return results
 }
 
-func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, now time.Time, minAge time.Duration) (evaluatedCandidate, bool) {
-	md, err := e.fetchMetadata(ctx, item.InfoHash)
+func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, now time.Time, minAge time.Duration, batcher *scrapeBatcher, stats *scanStats) (evaluatedCandidate, bool) {
+	md, err := e.fetchMetadata(ctx, item.InfoHash, stats)
 	if err != nil {
+		stats.skippedFetchErr.Add(1)
 		e.logger.Warn("skipping candidate: could not fetch torrent metadata", "title", item.Title, "err", err)
 		return evaluatedCandidate{}, false
 	}
 
 	if !filter.AgeEligible(md.CreatedAt, minAge, now) {
+		stats.skippedAge.Add(1)
 		return evaluatedCandidate{}, false
 	}
 
-	swarm, err := e.scrapeSwarm(ctx, md.Trackers, item.InfoHash)
+	swarm, err := e.scrapeOneCandidate(ctx, item, md, batcher, stats)
 	if err != nil {
+		stats.skippedScrapeErr.Add(1)
 		e.logger.Warn("skipping candidate: could not scrape trackers", "title", item.Title, "err", err)
 		return evaluatedCandidate{}, false
 	}
@@ -399,6 +462,42 @@ func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, 
 	// only needed at decision time, so tryAdd does it on demand for just the
 	// candidates keep-at is about to act on.
 	return evaluatedCandidate{title: item.Title, metadata: md, swarm: swarm}, true
+}
+
+// scrapeOneCandidate gets swarm counts for one candidate. Counts come from
+// keep-at's swarm cache when fresh, otherwise from the batched scrape
+// pipeline (only Academic Torrents' own trackers), falling back to the
+// per-candidate scrapeSwarm when a torrent lists no AT tracker at all.
+func (e *Engine) scrapeOneCandidate(ctx context.Context, item atcatalog.Item, md *attorrent.Metadata, batcher *scrapeBatcher, stats *scanStats) (attorrent.SwarmCounts, error) {
+	if cached, ok := e.swarmCache.get(item.InfoHash); ok {
+		stats.scrapeCached.Add(1)
+		return cached, nil
+	}
+
+	atTracker := ""
+	for _, trackerURL := range md.Trackers {
+		if isAcademicTorrentsHost(trackerURL) {
+			atTracker = trackerURL
+			break
+		}
+	}
+
+	// No AT tracker in the list (rare for AT-hosted torrents): fall back to
+	// the original per-candidate scrape path, which tries every tracker.
+	if atTracker == "" {
+		return e.scrapeSwarm(ctx, md.Trackers, item.InfoHash, stats)
+	}
+
+	result := batcher.submit(ctx, item.InfoHash, atTracker)
+	if result == nil {
+		return attorrent.SwarmCounts{}, ctx.Err()
+	}
+	select {
+	case r := <-result:
+		return r.counts, r.err
+	case <-ctx.Done():
+		return attorrent.SwarmCounts{}, ctx.Err()
+	}
 }
 
 func (e *Engine) saveNetworkStats(snapshot netstats.Snapshot) {

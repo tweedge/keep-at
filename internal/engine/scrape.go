@@ -21,12 +21,15 @@ const scrapeTimeout = 15 * time.Second
 // tracker first in the .torrent files it serves, so in the overwhelming
 // common case this means exactly one lightweight scrape request per
 // torrent, not a fan-out to every tracker in the file.
-func (e *Engine) scrapeSwarm(ctx context.Context, trackers []string, infoHash metainfo.Hash) (attorrent.SwarmCounts, error) {
+func (e *Engine) scrapeSwarm(ctx context.Context, trackers []string, infoHash metainfo.Hash, stats *scanStats) (attorrent.SwarmCounts, error) {
 	// Reuse a cached count from a previous scan when it's still fresh. This
 	// is what keeps repeat scans cheap: the vast majority of the catalog
 	// hasn't changed since last week, so we skip the rate-limited request to
 	// Academic Torrents' tracker entirely.
 	if cached, ok := e.swarmCache.get(infoHash); ok {
+		if stats != nil {
+			stats.scrapeCached.Add(1)
+		}
 		return cached, nil
 	}
 
@@ -36,6 +39,9 @@ func (e *Engine) scrapeSwarm(ctx context.Context, trackers []string, infoHash me
 			if err := e.torrentFetcher.Limiter.Wait(ctx); err != nil {
 				return attorrent.SwarmCounts{}, err
 			}
+		}
+		if stats != nil {
+			stats.scrapeRequests.Add(1)
 		}
 
 		callCtx, cancel := context.WithTimeout(ctx, scrapeTimeout)

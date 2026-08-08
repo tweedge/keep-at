@@ -1,3 +1,27 @@
+## v0.5.0 - batched tracker scrapes and detailed scan statistics
+
+Full-catalog scrapes were dominated by one rate-limited HTTP request per candidate: every candidate's tracker was scraped individually (and AT torrents list two AT trackers, so it was often two). keep-at now **batches tracker scrapes** - a single BEP 48 multi-hash scrape request covers up to 64 candidates per tracker, with one rate-limiter wait per batch instead of per candidate. The scrape phase drops from thousands of rate-limited requests to a few dozen, which is the dominant structural speedup for a large catalog. Scrapes only ever target Academic Torrents' own trackers now (AT is authoritative for AT torrents); dead third-party trackers, which previously cost a 15-second timeout each, are skipped during the scan.
+
+When a scrape completes, keep-at also logs a detailed breakdown of what the scan actually did:
+
+```
+scrape complete, updating what keep-at holds available=2 processed=2 total=2 elapsed=14s
+  library_size=1M metadata_fetched=2 metadata_cached=0
+  scrape_requests=2 scrape_cached=0
+  skipped_held=0 skipped_blocked=0 skipped_age=0 skipped_fetch_err=0 skipped_scrape_err=0
+  eligible=2
+```
+
+- `library_size` - total bytes of the whole catalog
+- `metadata_fetched` / `metadata_cached` - `.torrent` files pulled from AT vs served from keep-at's on-disk torrent cache
+- `scrape_requests` / `scrape_cached` - tracker scrapes issued vs reused from the swarm cache
+- `skipped_*` - candidates skipped, by reason (already held, keyword-blocked, too new, metadata fetch failed, tracker scrape failed)
+- `eligible` - candidates that made it through evaluation and can be added
+
+So operators can see at a glance how much work actually hit Academic Torrents versus keep-at's caches, how big the library is, and why individual candidates were skipped.
+
+---
+
 ## v0.4.1 - runtime stats and bandwidth throttling
 
 keep-at now tells you what it's actually doing, and lets you cap how much bandwidth it uses.
