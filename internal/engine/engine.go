@@ -61,6 +61,7 @@ type Engine struct {
 	stores     map[string]*piecestore.Client // keyed by storage location path
 	probeStore *piecestore.Client            // scratch storage for swarm-probing candidates, see probe.go
 	state      *state.State
+	swarmCache *swarmCache                   // persisted per-torrent scrape counts, reused across scans
 
 	// maxTorrents is the hard cap on how many torrents keep-at will hold at
 	// once, derived from the RAM budget (see ram.go). RAM scales per-torrent
@@ -120,6 +121,13 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("engine: loading state: %w", err)
 	}
 
+	swarmCache := newSwarmCache(cfg.DataDir+"/scrape-cache.json", cfg.Scan.Interval.AsDuration())
+	if err := swarmCache.load(); err != nil {
+		// A corrupt cache is non-fatal: keep-at just re-scrapes everything
+		// this scan. Log and continue with an empty cache.
+		logger.Warn("could not load swarm cache, starting fresh", "err", err)
+	}
+
 	probeStore, err := piecestore.New(cfg.DataDir + "/probe-scratch")
 	if err != nil {
 		return nil, fmt.Errorf("engine: opening probe scratch storage: %w", err)
@@ -145,6 +153,7 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		stores:     stores,
 		probeStore: probeStore,
 		state:      st,
+		swarmCache: swarmCache,
 		catalogFetcher: &atcatalog.Fetcher{
 			CachePath:  cfg.DataDir + "/database.xml",
 			HTTPClient: httpClient,

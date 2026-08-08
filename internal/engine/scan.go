@@ -66,13 +66,15 @@ const progressLogInterval = 2 * time.Minute
 const probeClientResetInterval = 250
 
 // evaluatedCandidate is a catalog item keep-at has fetched metadata and a
-// fresh scrape (and, if anyone was around to scrape, a swarm probe) for,
-// and is ready to rank and possibly act on.
+// fresh scrape for, and is ready to rank and possibly act on. The swarm
+// probe (which counts other keep-at nodes for the anti-cascade check) is
+// deliberately NOT done here - it waits several seconds per candidate and is
+// only needed at the moment of decision, so tryAdd probes on demand for just
+// the candidates keep-at is actually about to act on.
 type evaluatedCandidate struct {
-	title       string
-	metadata    *attorrent.Metadata
-	swarm       attorrent.SwarmCounts
-	keepAtPeers int // from probing the swarm once during evaluateCandidates; reused by tryAdd
+	title    string
+	metadata *attorrent.Metadata
+	swarm    attorrent.SwarmCounts
 }
 
 // ScanOnce runs one full pass: refresh the catalog, drop anything Academic
@@ -122,24 +124,76 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 
 	tracker := netstats.NewTracker()
 	scrapeStartedAt := time.Now()
-	candidates, processedCount := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates)
-	e.logger.Info("scrape complete, updating what keep-at holds",
-		"available", len(candidates), "processed", processedCount, "total", totalCandidates, "elapsed", humanDuration(time.Since(scrapeStartedAt)))
+	candChan := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates)
 
-	ranked := rankEvaluated(candidates, len(held) >= e.maxTorrents)
-	actErr := e.actOnRanked(ctx, ranked)
+	// Incremental acting: evaluate candidates stream in, and we act on the
+	// highest-priority ones as soon as they're known, rather than waiting
+	// for the whole catalog. This is what stops free disk from sitting idle
+	// for hours on a first scan - the top candidates start seeding within
+	// minutes. We only ever act on a candidate while it's still in the
+	// running top window (see actOnWindowed), so we never seed something
+	// that isn't genuinely among the best keep-at could hold.
+	var evaluated []evaluatedCandidate
+	acted := make(map[string]bool)
+	heldCount := len(held)
+	processed := 0
+	ramBound := heldCount >= e.maxTorrents
+
+	for c := range candChan {
+		processed++
+		evaluated = append(evaluated, c)
+		// Act on whatever is currently in the top window and not yet acted
+		// on. As more candidates arrive, the top window shifts and we act on
+		// the new arrivals that earn a slot; candidates that fall out of the
+		// window simply never get acted on (they weren't worth it).
+		ramBound = heldCount >= e.maxTorrents
+		e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker)
+	}
+
+	e.logger.Info("scrape complete, updating what keep-at holds",
+		"available", len(evaluated), "processed", processed, "total", totalCandidates, "elapsed", humanDuration(time.Since(scrapeStartedAt)))
 
 	e.saveNetworkStats(netstats.Snapshot{
 		ScanStartedAt:       scanStartedAt,
 		ScanCompletedAt:     time.Now().UTC(),
 		TotalCandidates:     totalCandidates,
-		ProcessedCandidates: processedCount,
+		ProcessedCandidates: processed,
 		NodeCount:           tracker.NodeCount(),
 		SeedingBytes:        tracker.SeedingBytes(),
 		LeechingBytes:       tracker.LeechingBytes(),
 	})
 
-	return actErr
+	return nil
+}
+
+// actOnWindowed ranks the already-evaluated candidates and acts on the ones
+// in the current top window that haven't been acted on yet. The window is the
+// smaller of e.maxTorrents (the most torrents keep-at can hold) and the
+// number evaluated so far, which guarantees we only ever seed candidates
+// that are genuinely among the best - and that the best ones start seeding
+// as soon as they're evaluated, without waiting for the full catalog.
+func (e *Engine) actOnWindowed(ctx context.Context, evaluated []evaluatedCandidate, acted map[string]bool, heldCount *int, ramBound bool, tracker *netstats.Tracker) {
+	ranked := rankEvaluated(evaluated, ramBound)
+	// Only act on the top of the running ranking. The window is the smaller
+	// of how many torrents keep-at can hold and how many candidates we've
+	// evaluated so far - this guarantees we only ever seed candidates that
+	// are genuinely among the best, and that the best ones start seeding as
+	// soon as they're evaluated, without waiting for the full catalog.
+	window := e.maxTorrents
+	if len(ranked) < window {
+		window = len(ranked)
+	}
+	for i := 0; i < window; i++ {
+		c := ranked[i]
+		key := c.metadata.InfoHash.HexString()
+		if acted[key] {
+			continue
+		}
+		acted[key] = true
+		safely(e.logger, "acting on "+c.title, func() {
+			e.actOnCandidate(ctx, c, heldCount, tracker)
+		})
+	}
 }
 
 // countPendingCandidates counts catalog items ScanOnce will actually walk
@@ -202,119 +256,129 @@ func (e *Engine) refreshHeldSeederCounts(ctx context.Context, held []state.Torre
 	}
 }
 
-// evaluateCandidates walks the catalog and returns everything keep-at
-// doesn't already hold, isn't keyword-blocked, and has aged past the
-// moderation delay - each with a fresh metadata fetch (cached where
-// possible) and tracker scrape. Every candidate anyone at all is seeding
-// or leeching also gets a quick swarm probe, which feeds both the
-// anti-cascade decision later and the network-wide stats in tracker.
+// evaluateCandidates walks the catalog and streams, over the returned
+// channel, everything keep-at doesn't already hold, isn't keyword-blocked,
+// and has aged past the moderation delay - each with a fresh metadata fetch
+// (cached where possible) and tracker scrape. The swarm probe that feeds the
+// anti-cascade decision is deliberately NOT done here; it's expensive
+// (waits several seconds per candidate) and only needed at decision time, so
+// ScanOnce probes on demand for just the candidates it's about to act on.
 //
-// Candidates are evaluated concurrently (see evaluateConcurrency); order
-// doesn't matter here since rankEvaluated sorts the result afterward.
-func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, scanStartedAt time.Time, totalCandidates int) ([]evaluatedCandidate, int) {
+// Candidates are evaluated concurrently (see evaluateConcurrency) and emitted
+// as they complete, so ScanOnce can start acting on the highest-priority ones
+// before the whole catalog is evaluated. The channel is closed when the walk
+// and all in-flight evaluations finish.
+func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, scanStartedAt time.Time, totalCandidates int) <-chan evaluatedCandidate {
 	now := time.Now().UTC()
 	minAge := e.cfg.Scan.ModerationDelay.AsDuration()
 
 	var (
-		mu        sync.Mutex
-		out       []evaluatedCandidate
 		processed atomic.Int64
 		wg        sync.WaitGroup
 	)
 	sem := make(chan struct{}, evaluateConcurrency)
+	results := make(chan evaluatedCandidate)
 
-	// currentSnapshot builds a fresh, self-contained snapshot from
-	// thread-safe sources only (an atomic counter and tracker's own
-	// mutex-guarded getters) - nothing here is a shared struct mutated by
-	// multiple goroutines, which is what let the periodic save below and
-	// the final save race safely.
-	currentSnapshot := func() netstats.Snapshot {
-		return netstats.Snapshot{
-			ScanStartedAt:       scanStartedAt,
-			TotalCandidates:     totalCandidates,
-			ProcessedCandidates: int(processed.Load()),
-			NodeCount:           tracker.NodeCount(),
-			SeedingBytes:        tracker.SeedingBytes(),
-			LeechingBytes:       tracker.LeechingBytes(),
-		}
-	}
-
-	evalStartedAt := time.Now()
-
-	stopProgress := make(chan struct{})
-	progressStopped := make(chan struct{})
+	// Production runs in its own goroutine so the channel can be returned
+	// immediately: the caller (ScanOnce) starts draining results while
+	// evaluation is still in flight, which is what makes acting incremental.
+	// If we blocked on wg.Wait() here before returning, the caller could
+	// never drain the channel (it hasn't received it yet) and evaluation
+	// would deadlock waiting for the caller to consume.
 	go func() {
-		defer close(progressStopped)
-		saveTicker := time.NewTicker(progressSaveInterval)
-		defer saveTicker.Stop()
-		logTicker := time.NewTicker(progressLogInterval)
-		defer logTicker.Stop()
-		lastProbeReset := 0
-		for {
-			select {
-			case <-stopProgress:
-				return
-			case <-saveTicker.C:
-				e.saveNetworkStats(currentSnapshot())
-				if p := int(processed.Load()); p-lastProbeReset >= probeClientResetInterval {
-					lastProbeReset = p
-					if err := e.resetProbeClient(); err != nil {
-						e.logger.Warn("failed to reset probe client mid-scan", "err", err)
-					}
-				}
-			case <-logTicker.C:
-				e.logScrapeProgress(evalStartedAt, totalCandidates, int(processed.Load()))
+		// currentSnapshot builds a fresh, self-contained snapshot from
+		// thread-safe sources only (an atomic counter and tracker's own
+		// mutex-guarded getters) - nothing here is a shared struct mutated by
+		// multiple goroutines, which is what let the periodic save below and
+		// the final save race safely.
+		currentSnapshot := func() netstats.Snapshot {
+			return netstats.Snapshot{
+				ScanStartedAt:       scanStartedAt,
+				TotalCandidates:     totalCandidates,
+				ProcessedCandidates: int(processed.Load()),
+				NodeCount:           tracker.NodeCount(),
+				SeedingBytes:        tracker.SeedingBytes(),
+				LeechingBytes:       tracker.LeechingBytes(),
 			}
 		}
+
+		evalStartedAt := time.Now()
+
+		stopProgress := make(chan struct{})
+		progressStopped := make(chan struct{})
+		go func() {
+			defer close(progressStopped)
+			saveTicker := time.NewTicker(progressSaveInterval)
+			defer saveTicker.Stop()
+			logTicker := time.NewTicker(progressLogInterval)
+			defer logTicker.Stop()
+			lastProbeReset := 0
+			for {
+				select {
+				case <-stopProgress:
+					return
+				case <-saveTicker.C:
+					e.saveNetworkStats(currentSnapshot())
+					if p := int(processed.Load()); p-lastProbeReset >= probeClientResetInterval {
+						lastProbeReset = p
+						if err := e.resetProbeClient(); err != nil {
+							e.logger.Warn("failed to reset probe client mid-scan", "err", err)
+						}
+					}
+				case <-logTicker.C:
+					e.logScrapeProgress(evalStartedAt, totalCandidates, int(processed.Load()))
+				}
+			}
+		}()
+
+	catalogLoop:
+		for _, item := range catalog.Items {
+			if ctx.Err() != nil {
+				break catalogLoop
+			}
+			if heldHashes[item.InfoHash.HexString()] {
+				continue
+			}
+			if blocked, kw := e.blocklist.Blocks(item.Title, item.Description); blocked {
+				e.logger.Debug("skipping blocked candidate", "title", item.Title, "keyword", kw)
+				continue
+			}
+
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				break catalogLoop
+			}
+
+			item := item
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				defer processed.Add(1)
+
+				safely(e.logger, "evaluating "+item.Title, func() {
+					c, ok := e.evaluateOneCandidate(ctx, item, now, minAge)
+					if !ok {
+						return
+					}
+					results <- c
+				})
+			}()
+		}
+
+		wg.Wait()
+		close(stopProgress)
+		<-progressStopped
+
+		e.saveNetworkStats(currentSnapshot())
+		close(results)
 	}()
 
-catalogLoop:
-	for _, item := range catalog.Items {
-		if ctx.Err() != nil {
-			break catalogLoop
-		}
-		if heldHashes[item.InfoHash.HexString()] {
-			continue
-		}
-		if blocked, kw := e.blocklist.Blocks(item.Title, item.Description); blocked {
-			e.logger.Debug("skipping blocked candidate", "title", item.Title, "keyword", kw)
-			continue
-		}
-
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			break catalogLoop
-		}
-
-		item := item
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			defer processed.Add(1)
-
-			safely(e.logger, "evaluating "+item.Title, func() {
-				c, ok := e.evaluateOneCandidate(ctx, item, now, minAge, tracker)
-				if !ok {
-					return
-				}
-				mu.Lock()
-				out = append(out, c)
-				mu.Unlock()
-			})
-		}()
-	}
-
-	wg.Wait()
-	close(stopProgress)
-	<-progressStopped
-
-	e.saveNetworkStats(currentSnapshot())
-	return out, int(processed.Load())
+	return results
 }
 
-func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, now time.Time, minAge time.Duration, tracker *netstats.Tracker) (evaluatedCandidate, bool) {
+func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, now time.Time, minAge time.Duration) (evaluatedCandidate, bool) {
 	md, err := e.fetchMetadata(ctx, item.InfoHash)
 	if err != nil {
 		e.logger.Warn("skipping candidate: could not fetch torrent metadata", "title", item.Title, "err", err)
@@ -331,20 +395,10 @@ func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, 
 		return evaluatedCandidate{}, false
 	}
 
-	keepAtPeerCount := 0
-	if swarm.Seeders+swarm.Leechers > 0 {
-		observed, err := e.probeSwarm(ctx, md.MetaInfo, e.probeTimeout)
-		if err != nil {
-			e.logger.Warn("could not probe swarm", "title", item.Title, "err", err)
-		}
-		sizeBytes := md.Info.TotalLength()
-		for _, obs := range observed {
-			tracker.Observe(obs.nodeKey, sizeBytes, obs.complete)
-		}
-		keepAtPeerCount = len(observed)
-	}
-
-	return evaluatedCandidate{title: item.Title, metadata: md, swarm: swarm, keepAtPeers: keepAtPeerCount}, true
+	// No swarm probe here: probing waits several seconds per candidate and is
+	// only needed at decision time, so tryAdd does it on demand for just the
+	// candidates keep-at is about to act on.
+	return evaluatedCandidate{title: item.Title, metadata: md, swarm: swarm}, true
 }
 
 func (e *Engine) saveNetworkStats(snapshot netstats.Snapshot) {
@@ -412,57 +466,69 @@ func rankEvaluated(candidates []evaluatedCandidate, ramBound bool) []evaluatedCa
 	return out
 }
 
-// actOnRanked walks candidates in priority order, filling free space first
-// and falling back to displacing lower-priority held torrents. The RAM-driven
-// torrent-count cap (e.maxTorrents) is enforced inside tryAdd/trySwap: once
+// actOnCandidate decides whether to seed candidate c, given the current held
+// torrent count, and either fills free space or swaps out lower-priority held
+// torrents. It's the per-candidate action step, called once per candidate in
+// priority order (see ScanOnce's incremental loop). heldCount is the running
+// count of held torrents so a successful add can bump it; a swap keeps the
+// count constant and never bumps it. tracker records the keep-at peers found
+// while probing this candidate's swarm, for network-status reporting.
+//
+// The RAM-driven torrent-count cap (e.maxTorrents) is enforced here: once
 // keep-at is holding the maximum number of torrents its RAM budget allows, it
 // stops adding new ones and only swaps (which keeps or lowers the count).
-func (e *Engine) actOnRanked(ctx context.Context, ranked []evaluatedCandidate) error {
-	heldCount := len(e.state.All())
-	for _, c := range ranked {
-		if ctx.Err() != nil {
-			return ctx.Err()
+func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldCount *int, tracker *netstats.Tracker) {
+	sizeBytes := c.metadata.Info.TotalLength()
+
+	// Probe this candidate's swarm on demand - only now, at decision time,
+	// not during catalog evaluation. This is the anti-cascade signal
+	// (how many other keep-at nodes are already here) and the network-status
+	// peer data; it waits up to e.probeTimeout but only for torrents we're
+	// actually about to act on, so it's a tiny fraction of the old cost.
+	keepAtPeers := 0
+	if c.swarm.Seeders+c.swarm.Leechers > 0 {
+		observed, err := e.probeSwarm(ctx, c.metadata.MetaInfo, e.probeTimeout)
+		if err != nil {
+			e.logger.Warn("could not probe swarm", "title", c.title, "err", err)
 		}
-
-		c := c
-		safely(e.logger, "acting on "+c.title, func() {
-			sizeBytes := c.metadata.Info.TotalLength()
-
-			freeByPath := make(map[string]int64, len(e.cfg.Storage.Locations))
-			for _, loc := range e.cfg.Storage.Locations {
-				freeByPath[loc.Path] = e.freeBytes(loc)
-			}
-
-			// A plain free-space fill increases the torrent count, so it's
-			// only allowed while under the RAM-driven cap. It first tries to
-			// find a location with room; tryAdd rejects it past the cap.
-			if heldCount < e.maxTorrents {
-				if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
-					if e.tryAdd(c, sizeBytes, location, nil, &heldCount) {
-						return
-					}
-				}
-			} else {
-				e.logger.Debug("skipping free-space fill: at RAM-driven torrent cap",
-					"title", c.title, "held", heldCount, "max_torrents", e.maxTorrents)
-			}
-
-			e.trySwap(c, sizeBytes, &heldCount)
-		})
+		for _, obs := range observed {
+			tracker.Observe(obs.nodeKey, sizeBytes, obs.complete)
+		}
+		keepAtPeers = len(observed)
 	}
-	return nil
+
+	freeByPath := make(map[string]int64, len(e.cfg.Storage.Locations))
+	for _, loc := range e.cfg.Storage.Locations {
+		freeByPath[loc.Path] = e.freeBytes(loc)
+	}
+
+	// A plain free-space fill increases the torrent count, so it's only
+	// allowed while under the RAM-driven cap. tryAdd also rejects it past
+	// the cap as a backstop.
+	if heldCount == nil || *heldCount < e.maxTorrents {
+		if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
+			if e.tryAdd(c, sizeBytes, location, nil, heldCount, keepAtPeers) {
+				return
+			}
+		}
+	} else {
+		e.logger.Debug("skipping free-space fill: at RAM-driven torrent cap",
+			"title", c.title, "held", *heldCount, "max_torrents", e.maxTorrents)
+	}
+
+	e.trySwap(c, sizeBytes, heldCount, keepAtPeers)
 }
 
-// tryAdd runs the anti-cascade decision using the swarm probe already
-// gathered in evaluateCandidates, and if it passes, starts downloading the
-// candidate into location. displaced is nil for a plain free-space fill.
+// tryAdd runs the anti-cascade decision and, if it passes, starts downloading
+// the candidate into location. displaced is nil for a plain free-space fill.
+// keepAtPeers is the count of other keep-at nodes observed in this candidate's
+// swarm (gathered by the caller via probeSwarm), feeding the anti-cascade roll.
 //
-// heldCount points at the running count of held torrents in actOnRanked so a
-// successful add can bump it (and a swap, which passes a non-nil displaced,
-// keeps the count constant without bumping). A plain fill past the RAM-driven
-// torrent cap is rejected outright: RAM scales per-torrent, so the count cap
-// is the real memory bound.
-func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, displaced []selector.Held, heldCount *int) bool {
+// heldCount points at the running count of held torrents so a successful add
+// can bump it (a swap passes a non-nil displaced and keeps the count
+// constant). A plain fill past the RAM-driven torrent cap is rejected
+// outright: RAM scales per-torrent, so the count cap is the real memory bound.
+func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, displaced []selector.Held, heldCount *int, keepAtPeers int) bool {
 	if heldCount != nil && displaced == nil && *heldCount >= e.maxTorrents {
 		e.logger.Debug("rejected candidate: would exceed RAM-driven torrent cap",
 			"title", c.title, "held", *heldCount, "max_torrents", e.maxTorrents)
@@ -475,12 +541,12 @@ func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, 
 		SizeBytes:   sizeBytes,
 		Seeders:     c.swarm.Seeders,
 		Leechers:    c.swarm.Leechers,
-		KeepAtPeers: c.keepAtPeers,
+		KeepAtPeers: keepAtPeers,
 	}
 
 	decision := selector.EvaluateSwap(candidate, displaced, e.cfg.Scan.MinSeedMargin, e.cfg.Aggressiveness, rand.Float64())
 	e.logger.Info("evaluated candidate", "title", c.title, "seeders", c.swarm.Seeders,
-		"keep_at_peers", c.keepAtPeers, "should_swap", decision.ShouldSwap, "reason", decision.Reason)
+		"keep_at_peers", keepAtPeers, "should_swap", decision.ShouldSwap, "reason", decision.Reason)
 
 	if !decision.ShouldSwap {
 		return false
@@ -498,24 +564,19 @@ func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, 
 
 // trySwap looks for held torrents, within a single storage location, that
 // this candidate can justifiably displace - one is enough if it's big
-// enough on its own, but if several smaller torrents each individually
-// clear the seed margin against this candidate, and their combined size
-// covers it, keep-at will remove all of them rather than only handling the
-// single-torrent case.
-// trySwap looks for held torrents, within a single storage location, that
-// this candidate can justifiably displace - one is enough if it's big
 // enough on its own, but if several smaller torrents each individually clear
 // the seed margin against this candidate, and their combined size covers it,
 // keep-at will remove all of them rather than only handling the single-torrent
 // case.
 //
-// heldCount points at the running held count in actOnRanked; a swap keeps the
-// count constant (one in, >=1 out), so it's passed but never incremented. When
-// keep-at is already at its RAM-driven torrent cap (ramBound), the eviction
-// preference flips toward smaller held torrents so the scarce per-torrent RAM
-// slots go to the largest torrents that fit - which is exactly the
-// "prioritize larger torrents when RAM is the binding constraint" behavior.
-func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64, heldCount *int) {
+// heldCount points at the running held count; a swap keeps the count constant
+// (one in, >=1 out), so it's passed but never incremented. When keep-at is
+// already at its RAM-driven torrent cap (ramBound), the eviction preference
+// flips toward smaller held torrents so the scarce per-torrent RAM slots go to
+// the largest torrents that fit - which is exactly the "prioritize larger
+// torrents when RAM is the binding constraint" behavior. keepAtPeers is the
+// on-demand swarm-probe count from the caller, fed into the swap decision.
+func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64, heldCount *int, keepAtPeers int) {
 	ramBound := heldCount != nil && *heldCount >= e.maxTorrents
 	held := e.state.All()
 
@@ -535,7 +596,7 @@ func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64, heldCount *int) 
 			selHeld[i] = selector.Held{InfoHash: h.InfoHash, Title: h.Title, SizeBytes: h.SizeBytes, Seeders: h.LastKnownSeeders}
 		}
 
-		if e.tryAdd(c, sizeBytes, location, selHeld, heldCount) {
+		if e.tryAdd(c, sizeBytes, location, selHeld, heldCount, keepAtPeers) {
 			for _, h := range displaced {
 				if err := e.RemoveTorrent(h.InfoHash, h.StorageLocation); err != nil {
 					e.logger.Error("failed to remove displaced torrent", "title", h.Title, "err", err)

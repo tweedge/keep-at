@@ -116,9 +116,17 @@ A full-catalog scrape can run for a long time (see above), and a log that goes q
 
 The ETA is a straight-line extrapolation - elapsed time divided by candidates processed so far, multiplied by candidates remaining - not a measured prediction. It assumes the rest of the catalog behaves like what's already been seen, which mostly holds since Academic Torrents rate limiting dominates the per-candidate cost fairly evenly, but it's a rough guide, not a countdown to trust precisely.
 
-### A scan doesn't act until it finishes evaluating
+### Scans act incrementally, and re-scans are cheap
 
-Because ranking a candidate (see "Deciding what to seed") depends on comparing it against every other candidate found that scan, `ScanOnce` evaluates the *entire* pending candidate list before it starts adding or swapping anything. On the real catalog (a few thousand candidates, rate-limited against Academic Torrents), a first scan can take a long time before keep-at downloads anything at all, even with free space sitting idle the whole time. This is a real, currently-unaddressed tradeoff between "always pick the single most urgent candidate across the whole catalog" and "start using free space immediately" - not a bug, but a known cost of the current design worth revisiting.
+keep-at used to evaluate the entire pending candidate list before acting on anything, leaving free disk idle for hours on a first full-catalog scan. That changed: candidates now stream out of evaluation as they complete, and `ScanOnce` acts on the highest-priority ones immediately - the top of the running ranking gets seeded as soon as it is known, not after the whole catalog is walked. Three changes made this both correct and fast:
+
+- **Scrape results are cached across scans.** `scrapeSwarm` remembers each torrent's seeder/leecher counts in `scrape-cache.json` (TTL = the scan interval). A weekly re-scan reuses last week's counts instead of re-querying Academic Torrents' tracker for every catalog item, so repeat scans cost almost nothing beyond the per-candidate swarm probe.
+
+- **Swarm probing moved to decision time.** The anti-cascade probe (which waits several seconds per candidate to count other keep-at nodes) used to run for every available candidate during evaluation. It now runs only for the candidates keep-at is actually about to act on, so probe time drops from "every available candidate" to "everything we decide to seed."
+
+- **Acting is windowed by the torrent cap.** Each batch, keep-at ranks everything evaluated so far and acts only on the top `min(maxTorrents, evaluated)` candidates. Because `maxTorrents` is the most torrents keep-at can hold (see the RAM section), this guarantees it never seeds something that is not genuinely among the best it could hold, while still filling the best slots early. Lower-priority candidates evaluated later only get acted on if they earn a place in that top window.
+
+The first scan still takes a while (it must fetch and scrape the catalog once, and probes the torrents it actually chooses), but configured storage stops sitting idle: the most urgent torrents start seeding within minutes, not after the full walk.
 
 ### Verified end to end
 
@@ -137,5 +145,5 @@ Cross-torrent deduplication (storing identical pieces once even if they appear i
 * **macOS and Windows service management.** The binary runs fine on both; `keep-at service install` doesn't (systemd/Linux only).
 * **Peer-map availability.** See "Reasoning quickly about availability" above.
 * **Authenticated node identity.** The anti-cascade check and network-status both trust the BitTorrent extended handshake's claimed client name at face value.
-* **Incremental action during a scan.** See "A scan doesn't act until it finishes evaluating" above - a first full-catalog scan can leave configured storage unused for a long time before keep-at downloads anything.
+* **Incremental action during a scan.** Done - see "Scans act incrementally, and re-scans are cheap" above.
 * **Pinned anacrolix/torrent version.** v1.61.0 has a crashing bug (see "Running against the real catalog"); keep-at is on v1.60.0 until a fix lands upstream.
