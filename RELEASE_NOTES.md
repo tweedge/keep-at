@@ -1,4 +1,14 @@
-keep-at now bounds its own RAM use and scales how many (and which) torrents it holds to fit the machine it's running on - so a tiny 1 GB Raspberry Pi on a big disk seeds just as sensibly as a server with 32 GB.
+keep-at now bounds its own RAM use and scales how many (and which) torrents it holds to fit the machine it's running on - so a tiny 1 GB Raspberry Pi on a big disk seeds just as sensibly as a server with 32 GB. This release also makes scans dramatically faster and start seeding sooner.
+
+## New: faster scans, seeding starts immediately
+
+The initial full-catalog scrape used to take hours and left configured storage idle the whole time. Three changes fix that:
+
+- **Scrape results are cached across scans.** Each torrent's seeder/leecher counts are remembered on disk (TTL = the scan interval). A weekly re-scan reuses last week's counts instead of re-querying Academic Torrents' tracker for every catalog item, so repeat scans cost almost nothing beyond the torrents keep-at actually chooses to seed.
+- **Swarm probing moved to decision time.** The anti-cascade probe (which waits several seconds per candidate to count other keep-at nodes) used to run for every available candidate during evaluation. It now runs only for the candidates keep-at is about to act on, so probe time drops from "every available candidate" to "everything it decides to seed."
+- **Incremental acting.** Candidates stream out of evaluation as they complete, and keep-at seeds the highest-priority ones right away - the top of the running ranking fills as soon as it's known, instead of after the whole catalog is walked. It never seeds something that isn't genuinely among the best it could hold (the acted window is capped at the RAM-derived torrent limit), so the "seed the most urgent torrents" guarantee still holds.
+
+Net effect: the most urgent torrents start seeding within minutes of a scan starting, and repeat scans are nearly free.
 
 ## New: RAM-aware holding
 
