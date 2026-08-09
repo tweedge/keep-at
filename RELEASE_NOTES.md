@@ -1,5 +1,29 @@
 # keep-at release notes
 
+## v0.6.1 - see what this host is holding
+
+### New `keep-at hosted-torrents` command
+
+Lists every torrent this host currently holds and seeds, one block per torrent:
+
+```
+9111.ru Questions Dataset
+  link:        https://academictorrents.com/details/3fa77d9c4028fd6aa8a6dbdad67a218fc1ad7a5d
+  status:      seeding
+  space:       2.7 GB on disk (torrent is 2.7 GB)
+  last scrape: 2 seeders, 0 leechers
+```
+
+For each torrent it shows the title, a link to its Academic Torrents page, whether it's currently seeding or still downloading, the actual space it occupies on disk (compared with its full size), and its last-scrape seeder/leecher counts. Like `status` and `network-status`, it reads keep-at's persisted files, so it works whether or not the daemon is running. Status is derived from the storage layout: a torrent is seeding once its final compressed pieces are all on disk with no in-progress pieces left in staging.
+
+### One "evaluated candidate" log line per candidate
+
+A candidate that failed its free-space-fill roll used to fall through to the swap path and log `evaluated candidate` twice - two identical lines for the same torrent with the same seeders. The fill and swap attempts still each run their own selection roll, but the decision is now logged exactly once per candidate, after both attempts have been made.
+
+### Unified `--config` flag across inspection commands
+
+`status`, `network-status`, `stop`, and the new `hosted-torrents` all previously took a `--data-dir` flag in addition to `--config`. They now depend on `--config` alone, resolving the data directory from the config file - and still working with no arguments at all when keep-at is installed as a service.
+
 ## v0.6.0 - seed the torrents that need it
 
 keep-at exists to seed *minimally-seeded* torrents - not to put a copy on everything. That's now what the selection logic does, and restarting keep-at no longer re-scrapes the whole catalog needlessly.

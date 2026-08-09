@@ -9,12 +9,11 @@ import (
 func cmdStop(args []string) error {
 	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to a config file (optional)")
-	dataDir := fs.String("data-dir", "", "directory keep-at was started with (optional; defaults to the same as `keep-at run`)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	dir, err := resolveDataDir(*configPath, *dataDir)
+	dir, err := resolveDataDir(*configPath, "")
 	if err != nil {
 		return err
 	}

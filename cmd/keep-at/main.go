@@ -30,6 +30,8 @@ func main() {
 		err = cmdService(args)
 	case "network-status":
 		err = cmdNetworkStatus(args)
+	case "hosted-torrents":
+		err = cmdHostedTorrents(args)
 	case "self-update":
 		err = cmdSelfUpdate(args)
 	case "version":
@@ -59,7 +61,8 @@ Usage:
   keep-at status [--config PATH]           report whether keep-at is running
   keep-at service install [flags]          install a systemd service (Linux, root)
   keep-at service uninstall                remove the systemd service (Linux, root)
-  keep-at network-status [--data-dir PATH] report on other keep-at nodes seen while scanning
+  keep-at network-status [--config PATH]   report on other keep-at nodes seen while scanning
+  keep-at hosted-torrents [--config PATH]  list torrents this host holds and seeds
   keep-at self-update                      update to the latest release
   keep-at version                          print the version and exit
 

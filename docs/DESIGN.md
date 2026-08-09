@@ -22,8 +22,6 @@ This gate runs whether keep-at is filling free space or displacing something, so
 
 The number of other keep-at nodes in a torrent's swarm is deliberately **not** part of this gate. It's network-status data (see "Network-wide stats" below) and is logged as metadata per candidate, but it doesn't change whether keep-at selects a torrent. What matters is how healthy the torrent is overall, which only the total seeder count captures.
 
-One correction worth documenting: an earlier draft of this design described rolling *above* n to proceed. That's backwards from what n is defined to mean ("the chance keep-at swaps") and produces the opposite of the intended effect - a shrinking n would make keep-at select well-seeded torrents *more* eagerly, not less. keep-at implements the definition, not the inverted comparison: `selector.EvaluateSwap` swaps when `roll < n`.
-
 ## Multi-torrent swaps
 
 A candidate can be bigger than any single held torrent. When that happens, keep-at looks within one storage location for a *set* of held torrents to displace together, not just one:

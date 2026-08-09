@@ -612,10 +612,18 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 
 	// A plain free-space fill increases the torrent count, so it's only
 	// allowed while under the RAM-driven cap. tryAdd also rejects it past
-	// the cap as a backstop.
+	// the cap as a backstop. The decision from whichever attempt runs last
+	// (fill, then swap) is logged once, below - so each candidate produces
+	// exactly one "evaluated candidate" line.
+	decision := selector.SwapDecision{ShouldSwap: false, Reason: "candidate not evaluated"}
+	added := false
 	if heldCount == nil || *heldCount < e.maxTorrents {
 		if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
-			if e.tryAdd(c, md, sizeBytes, location, nil, heldCount, keepAtPeers) {
+			var d selector.SwapDecision
+			added, d = e.tryAdd(c, md, sizeBytes, location, nil, heldCount, keepAtPeers)
+			decision = d
+			if added {
+				e.logEvaluatedCandidate(c, decision, keepAtPeers)
 				return
 			}
 		}
@@ -624,7 +632,24 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 			"title", c.title, "held", *heldCount, "max_torrents", e.maxTorrents)
 	}
 
-	e.trySwap(c, md, sizeBytes, heldCount, keepAtPeers)
+	if swapped, d := e.trySwap(c, md, sizeBytes, heldCount, keepAtPeers); swapped {
+		decision = d
+	}
+	e.logEvaluatedCandidate(c, decision, keepAtPeers)
+}
+
+// logEvaluatedCandidate emits the single "evaluated candidate" line for a
+// candidate after its decision is final. This is deliberately one log line
+// per candidate, even though the fill and swap paths each run their own
+// selection roll: the operator wants to see what happened to the candidate,
+// not duplicate noise from the internal fill-then-swap attempt sequence.
+func (e *Engine) logEvaluatedCandidate(c evaluatedCandidate, decision selector.SwapDecision, keepAtPeers int) {
+	e.logger.Info("evaluated candidate",
+		"title", c.title,
+		"seeders", c.swarm.Seeders,
+		"keep_at_peers", keepAtPeers,
+		"should_swap", decision.ShouldSwap,
+		"reason", decision.Reason)
 }
 
 // tryAdd runs the selection decision and, if it passes, starts downloading
@@ -639,11 +664,11 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 // can bump it (a swap passes a non-nil displaced and keeps the count
 // constant). A plain fill past the RAM-driven torrent cap is rejected
 // outright: RAM scales per-torrent, so the count cap is the real memory bound.
-func (e *Engine) tryAdd(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, location string, displaced []selector.Held, heldCount *int, keepAtPeers int) bool {
+func (e *Engine) tryAdd(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, location string, displaced []selector.Held, heldCount *int, keepAtPeers int) (bool, selector.SwapDecision) {
 	if heldCount != nil && displaced == nil && *heldCount >= e.maxTorrents {
 		e.logger.Debug("rejected candidate: would exceed RAM-driven torrent cap",
 			"title", c.title, "held", *heldCount, "max_torrents", e.maxTorrents)
-		return false
+		return false, selector.SwapDecision{ShouldSwap: false, Reason: "RAM-driven torrent cap reached"}
 	}
 
 	candidate := selector.Candidate{
@@ -656,21 +681,19 @@ func (e *Engine) tryAdd(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes 
 	}
 
 	decision := selector.EvaluateSwap(candidate, displaced, e.cfg.Scan.MinSeedMargin, e.cfg.Aggressiveness, rand.Float64())
-	e.logger.Info("evaluated candidate", "title", c.title, "seeders", c.swarm.Seeders,
-		"keep_at_peers", keepAtPeers, "should_swap", decision.ShouldSwap, "reason", decision.Reason)
 
 	if !decision.ShouldSwap {
-		return false
+		return false, decision
 	}
 
 	if err := e.AddCandidate(md, location, sizeBytes, c.title); err != nil {
 		e.logger.Error("failed to add candidate", "title", c.title, "err", err)
-		return false
+		return false, decision
 	}
 	if heldCount != nil && displaced == nil {
 		*heldCount++
 	}
-	return true
+	return true, decision
 }
 
 // trySwap looks for held torrents, within a single storage location, that
@@ -687,7 +710,8 @@ func (e *Engine) tryAdd(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes 
 // the largest torrents that fit - which is exactly the "prioritize larger
 // torrents when RAM is the binding constraint" behavior. keepAtPeers is the
 // on-demand swarm-probe count from the caller, fed into the swap decision.
-func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, heldCount *int, keepAtPeers int) {
+// It returns whether a swap happened, and the swap decision that was made.
+func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, heldCount *int, keepAtPeers int) (bool, selector.SwapDecision) {
 	ramBound := heldCount != nil && *heldCount >= e.maxTorrents
 	held := e.state.All()
 
@@ -707,15 +731,16 @@ func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes
 			selHeld[i] = selector.Held{InfoHash: h.InfoHash, Title: h.Title, SizeBytes: h.SizeBytes, Seeders: h.LastKnownSeeders}
 		}
 
-		if e.tryAdd(c, md, sizeBytes, location, selHeld, heldCount, keepAtPeers) {
+		if ok, decision := e.tryAdd(c, md, sizeBytes, location, selHeld, heldCount, keepAtPeers); ok {
 			for _, h := range displaced {
 				if err := e.RemoveTorrent(h.InfoHash, h.StorageLocation); err != nil {
 					e.logger.Error("failed to remove displaced torrent", "title", h.Title, "err", err)
 				}
 			}
-			return
+			return true, decision
 		}
 	}
+	return false, selector.SwapDecision{}
 }
 
 // selectDisplaceable picks the smallest set of held torrents (within one

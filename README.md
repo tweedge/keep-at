@@ -54,16 +54,19 @@ sudo keep-at service install --storage-limit 500G
 sudo keep-at service uninstall
 ```
 
-`service install` takes the same flags as `run`, resolves them the same way, and writes the result to `/etc/keep-at/config.yaml` - installing the config alongside the service, rather than baking flags into the unit or requiring you to remember them. That's also what makes every other command below work with no arguments at all: once that file exists, `stop`, `status`, `network-status`, and even a bare `run`/`start` all check it automatically to find out where the running instance lives.
+`service install` takes the same flags as `run`, resolves them the same way, and writes the result to `/etc/keep-at/config.yaml` - installing the config alongside the service, rather than baking flags into the unit or requiring you to remember them. That's also what makes every other command below work with no arguments at all: once that file exists, `stop`, `status`, `network-status`, `hosted-torrents`, and even a bare `run`/`start` all check it automatically to find out where the running instance lives.
 
 ```
 keep-at start
 keep-at stop
 keep-at status
 keep-at network-status
+keep-at hosted-torrents
 ```
 
-`start` and `run` take the exact same flags as `service install` - `start` just forks `run` into the background for you (or runs it in the foreground directly, inside a container). None of these commands need `--config` or `--data-dir` once keep-at is installed as a service; pass them explicitly only if you're managing a non-service instance, or one installed somewhere unusual.
+`hosted-torrents` lists everything this host currently holds and seeds: title, actual space on disk, seeding/downloading status, last-scrape seeder and leecher counts, and a link to each torrent's Academic Torrents page. Like `status` and `network-status`, it reads keep-at's persisted files, so it works whether or not the daemon is running.
+
+`start` and `run` take the exact same flags as `service install` - `start` just forks `run` into the background for you (or runs it in the foreground directly, inside a container). None of these commands need `--config` once keep-at is installed as a service; pass it explicitly only if you're managing a non-service instance, or one installed somewhere unusual.
 
 To change settings later, edit `/etc/keep-at/config.yaml` directly and run `sudo systemctl restart keep-at`, or just run `service install` again with new flags.
 
