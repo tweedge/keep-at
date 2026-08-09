@@ -36,6 +36,49 @@ func TestResolveWithStorageLimitFlagOnly(t *testing.T) {
 	}
 }
 
+func TestResolveWithStorageLimitAllFlag(t *testing.T) {
+	withServiceConfigPath(t, filepath.Join(t.TempDir(), "nonexistent.yaml"))
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	cf := addConfigFlags(fs)
+	if err := fs.Parse([]string{"--storage-limit", "all"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	cfg, err := cf.resolve(fs)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(cfg.Storage.Locations) != 1 {
+		t.Fatalf("expected 1 storage location, got %+v", cfg.Storage.Locations)
+	}
+	loc := cfg.Storage.Locations[0]
+	if !loc.LimitAll {
+		t.Fatalf("expected LimitAll for `--storage-limit all`, got %+v", loc)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected `all` to validate, got: %v", err)
+	}
+}
+
+func TestResolveWithStallEvictionTimeoutFlag(t *testing.T) {
+	withServiceConfigPath(t, filepath.Join(t.TempDir(), "nonexistent.yaml"))
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	cf := addConfigFlags(fs)
+	if err := fs.Parse([]string{"--storage-limit", "500G", "--stall-eviction-timeout", "720h"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	cfg, err := cf.resolve(fs)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got := cfg.Scan.StallEvictionTimeout.AsDuration().Hours(); got != 720 {
+		t.Fatalf("StallEvictionTimeout = %v hours, want 720", got)
+	}
+}
+
 func TestResolveErrorsWithNoFlagsAndNoServiceConfig(t *testing.T) {
 	withServiceConfigPath(t, filepath.Join(t.TempDir(), "nonexistent.yaml"))
 

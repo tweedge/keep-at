@@ -27,6 +27,7 @@ type configFlagSet struct {
 	scanInterval            *time.Duration
 	moderationDelay         *time.Duration
 	rateLimit               *float64
+	stallEvictionTimeout    *time.Duration
 	keywordBlocklist        *string
 	preserveDeletedTorrents *bool
 	maxRAM                  *string
@@ -41,7 +42,7 @@ func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
 	return &configFlagSet{
 		configPath:              fs.String("config", "", "path to a config file (optional; advanced/multi-location setups only)"),
 		storage:                 fs.String("storage", config.DefaultStorageLocation(), "storage location for torrent data"),
-		storageLimit:            fs.String("storage-limit", "", "how much space to use, e.g. 500G, 2T (required unless set in --config)"),
+		storageLimit:            fs.String("storage-limit", "", "how much space to use, e.g. 500G, 2T, or 'all' to fill a dedicated data drive (required unless set in --config)"),
 		port:                    fs.Int("port", def.Port, "BitTorrent listen port"),
 		dataDir:                 fs.String("data-dir", def.DataDir, "directory for keep-at's own state, logs, and cached metadata"),
 		aggressiveness:          fs.Float64("aggressiveness", def.Aggressiveness, "anti-cascade base (0-1); lower backs off faster as more keep-at nodes join a swarm"),
@@ -49,6 +50,7 @@ func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
 		scanInterval:            fs.Duration("scan-interval", def.Scan.Interval.AsDuration(), "how often to rescan the Academic Torrents catalog"),
 		moderationDelay:         fs.Duration("moderation-delay", def.Scan.ModerationDelay.AsDuration(), "minimum torrent age before keep-at will download it"),
 		rateLimit:               fs.Float64("rate-limit", def.Scan.RateLimitPerSecond, "max requests per second to Academic Torrents' own infrastructure"),
+		stallEvictionTimeout:    fs.Duration("stall-eviction-timeout", def.Scan.StallEvictionTimeout.AsDuration(), "how long a torrent with zero seeders and no download progress can sit before it's removed to free the slot; 0 disables"),
 		keywordBlocklist:        fs.String("keyword-blocklist", "", "comma-separated keywords to block, matched against title and description"),
 		preserveDeletedTorrents: fs.Bool("preserve-deleted-torrents", def.PreserveDeletedTorrents, "keep seeding a torrent even if Academic Torrents removes it"),
 		maxRAM:                  fs.String("max-ram", "", "max RAM to plan around, e.g. 1G (default: 80% of system RAM); never exceeds an 80%-of-system hard cap"),
@@ -119,6 +121,8 @@ func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
 			cfg.Scan.ModerationDelay = config.Duration(*cf.moderationDelay)
 		case "rate-limit":
 			cfg.Scan.RateLimitPerSecond = *cf.rateLimit
+		case "stall-eviction-timeout":
+			cfg.Scan.StallEvictionTimeout = config.Duration(*cf.stallEvictionTimeout)
 		case "keyword-blocklist":
 			cfg.KeywordBlocklist = splitKeywords(*cf.keywordBlocklist)
 		case "preserve-deleted-torrents":
@@ -153,13 +157,22 @@ func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
 			return config.Config{}, fmt.Errorf("--storage/--storage-limit can't be combined with --config; multiple storage locations are a config-file-only feature, edit %s instead", *cf.configPath)
 		}
 		if *cf.storageLimit == "" {
-			return config.Config{}, fmt.Errorf("--storage-limit is required (e.g. --storage-limit 500G)")
+			return config.Config{}, fmt.Errorf("--storage-limit is required (e.g. --storage-limit 500G, or --storage-limit all to use a dedicated drive)")
 		}
-		limit, err := config.ParseByteSize(*cf.storageLimit)
-		if err != nil {
-			return config.Config{}, err
+		loc := config.StorageLocation{Path: *cf.storage}
+		if strings.EqualFold(strings.TrimSpace(*cf.storageLimit), "all") {
+			// `all` is resolved to a concrete byte limit at engine startup
+			// (see resolveAllLimits): a safe fraction of the device's total
+			// formatted capacity. Only suitable for dedicated data drives.
+			loc.LimitAll = true
+		} else {
+			limit, err := config.ParseByteSize(*cf.storageLimit)
+			if err != nil {
+				return config.Config{}, err
+			}
+			loc.Limit = limit
 		}
-		cfg.Storage.Locations = []config.StorageLocation{{Path: *cf.storage, Limit: limit}}
+		cfg.Storage.Locations = []config.StorageLocation{loc}
 	} else if !configFileLoaded && len(cfg.Storage.Locations) == 0 {
 		return config.Config{}, fmt.Errorf("no storage configured; pass --storage-limit (e.g. --storage-limit 500G), --config, or install keep-at as a service first")
 	}

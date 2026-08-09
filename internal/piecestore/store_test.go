@@ -97,6 +97,86 @@ func TestPieceLifecycle(t *testing.T) {
 	}
 }
 
+func TestCompletedPieceCountAndDiskUsageAll(t *testing.T) {
+	dir := t.TempDir()
+	client, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// A torrent with no stored data reports zero completed pieces.
+	emptyHash := metainfo.HashBytes([]byte("empty-torrent"))
+	pieces, err := client.CompletedPieceCount(emptyHash)
+	if err != nil {
+		t.Fatalf("CompletedPieceCount (empty): %v", err)
+	}
+	if pieces != 0 {
+		t.Errorf("empty torrent CompletedPieceCount = %d, want 0", pieces)
+	}
+
+	// Complete one piece of a torrent, then verify the count and the
+	// location-wide on-disk usage both reflect it.
+	info := &metainfo.Info{PieceLength: 16, Length: 16, Name: "test", Pieces: make([]byte, 20)}
+	infoHash := metainfo.HashBytes([]byte("one-piece-torrent"))
+	torrentImpl, err := client.OpenTorrent(context.Background(), info, infoHash)
+	if err != nil {
+		t.Fatalf("OpenTorrent: %v", err)
+	}
+	defer torrentImpl.Close()
+
+	piece := torrentImpl.PieceWithHash(info.Piece(0), g.None[[]byte]())
+	if _, err := piece.WriteAt([]byte("0123456789abcdef"), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	if err := piece.MarkComplete(); err != nil {
+		t.Fatalf("MarkComplete: %v", err)
+	}
+
+	pieces, err = client.CompletedPieceCount(infoHash)
+	if err != nil {
+		t.Fatalf("CompletedPieceCount (after complete): %v", err)
+	}
+	if pieces != 1 {
+		t.Errorf("CompletedPieceCount = %d, want 1", pieces)
+	}
+
+	allUsage, err := client.DiskUsageAll()
+	if err != nil {
+		t.Fatalf("DiskUsageAll: %v", err)
+	}
+	singleUsage, err := client.DiskUsage(infoHash)
+	if err != nil {
+		t.Fatalf("DiskUsage: %v", err)
+	}
+	if allUsage < singleUsage {
+		t.Errorf("DiskUsageAll = %d, expected >= single-torrent usage %d", allUsage, singleUsage)
+	}
+	if singleUsage <= 0 {
+		t.Errorf("expected positive single-torrent usage, got %d", singleUsage)
+	}
+
+	// A staging-only piece (incomplete) must not count as completed.
+	partialInfo := &metainfo.Info{PieceLength: 16, Length: 16, Name: "test2", Pieces: make([]byte, 20)}
+	partialHash := metainfo.HashBytes([]byte("partial-torrent"))
+	partialImpl, err := client.OpenTorrent(context.Background(), partialInfo, partialHash)
+	if err != nil {
+		t.Fatalf("OpenTorrent (partial): %v", err)
+	}
+	defer partialImpl.Close()
+
+	partialPiece := partialImpl.PieceWithHash(partialInfo.Piece(0), g.None[[]byte]())
+	if _, err := partialPiece.WriteAt([]byte("0123"), 0); err != nil {
+		t.Fatalf("WriteAt (partial): %v", err)
+	}
+	pieces, err = client.CompletedPieceCount(partialHash)
+	if err != nil {
+		t.Fatalf("CompletedPieceCount (partial): %v", err)
+	}
+	if pieces != 0 {
+		t.Errorf("staging-only torrent CompletedPieceCount = %d, want 0", pieces)
+	}
+}
+
 func TestMarkNotCompleteAllowsRewrite(t *testing.T) {
 	dir := t.TempDir()
 	client, err := New(dir)

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -45,6 +46,9 @@ var (
 	DefaultModerationDelay = Duration(7 * 24 * time.Hour)
 )
 
+// DefaultRateLimitPerSec is the default maximum request rate to Academic
+// Torrents' own infrastructure (tracker announces, .torrent fetches, and the
+// catalog download).
 const DefaultRateLimitPerSec = 0.5
 
 // DefaultStatsInterval is how often keep-at logs and persists a summary of
@@ -53,6 +57,35 @@ const DefaultRateLimitPerSec = 0.5
 // minutes is frequent enough to be useful but not so chatty it buries real
 // messages.
 const DefaultStatsInterval = Duration(30 * time.Minute)
+
+// DefaultStallEvictionTimeout is how long a held torrent can sit with zero
+// seeders and no download progress before keep-at gives up on it and removes
+// it to free the slot for a torrent that can actually complete. Defaults to
+// two weeks - deliberately cautious, since a torrent with no seeders today
+// might gain some tomorrow, and keep-at's whole job is to seed exactly the
+// under-seeded torrents everyone else ignores.
+var DefaultStallEvictionTimeout = Duration(14 * 24 * time.Hour)
+
+// AllLimitFraction is what fraction of a storage device's total (formatted)
+// capacity `limit: all` resolves to. Analysis:
+//
+//   - The device total (statfs Blocks * Bsize) is the post-formatting
+//     capacity, not the raw disk size.
+//   - Filesystems reserve blocks for their own health: ext4 defaults to
+//     reserving 5% for root, and journals/metadata need room too. A daemon
+//     running as root can fill past what a normal user could, so the
+//     fraction has to be well under 100%.
+//   - keep-at's space accounting counts gzip-compressed on-disk bytes, but
+//     filesystems allocate in blocks, so many small piece files cost more
+//     real space than their byte sum (block slack). That argues for a little
+//     extra headroom beyond the reserved blocks.
+//
+// 97.5% is the right balance for a dedicated drive: it uses nearly all of the
+// device while leaving 2.5% (plus whatever the filesystem reserves) for the
+// journal, metadata, block slack, and the OS's own emergency operations.
+// It's documented as dedicated-drive-only precisely because the margin is
+// thin; on a busy OS drive that same 2.5% isn't enough headroom for the OS.
+const AllLimitFraction = 0.975
 
 // Config is the full keep-at configuration.
 type Config struct {
@@ -109,6 +142,54 @@ type Config struct {
 type StorageLocation struct {
 	Path  string   `yaml:"path"`
 	Limit ByteSize `yaml:"limit"`
+
+	// LimitAll means "use as much of the device as possible": Limit is
+	// resolved at startup to AllLimitFraction of the storage device's total
+	// (formatted) capacity, measured with statfs on the location path. Set
+	// from `limit: all` in a config file or `--storage-limit all` on the CLI.
+	// Intended for dedicated data drives only - keep-at will fill the device
+	// to the resolved fraction, which is no place for an OS.
+	LimitAll bool `yaml:"-"`
+}
+
+// UnmarshalYAML lets `limit:` accept either a byte size like "500G" or the
+// literal "all". "all" leaves Limit at zero and sets LimitAll, which the
+// engine resolves to a concrete byte count at startup.
+func (l *StorageLocation) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var raw struct {
+		Path  string `yaml:"path"`
+		Limit string `yaml:"limit"`
+	}
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+	l.Path = raw.Path
+	if strings.EqualFold(strings.TrimSpace(raw.Limit), "all") {
+		l.LimitAll = true
+		l.Limit = 0
+		return nil
+	}
+	parsed, err := ParseByteSize(raw.Limit)
+	if err != nil {
+		return err
+	}
+	l.Limit = parsed
+	return nil
+}
+
+// MarshalYAML writes `limit: all` back out for a location configured that
+// way, so a config file keep-at writes (e.g. service install) round-trips.
+func (l StorageLocation) MarshalYAML() (interface{}, error) {
+	out := struct {
+		Path  string `yaml:"path"`
+		Limit string `yaml:"limit"`
+	}{Path: l.Path}
+	if l.LimitAll {
+		out.Limit = "all"
+	} else {
+		out.Limit = l.Limit.String()
+	}
+	return out, nil
 }
 
 // StorageConfig lists every location keep-at may write to. It's
@@ -125,6 +206,13 @@ type ScanConfig struct {
 	RateLimitPerSecond float64  `yaml:"rate_limit_per_second"`
 	MinSeedMargin      int      `yaml:"min_seed_margin"`
 	ModerationDelay    Duration `yaml:"moderation_delay"`
+
+	// StallEvictionTimeout is how long a held torrent can sit with zero
+	// seeders and no download progress before keep-at removes it to free the
+	// slot for a torrent that can actually complete. Zero disables stalled
+	// torrent eviction entirely. See DefaultStallEvictionTimeout for the
+	// default rationale.
+	StallEvictionTimeout Duration `yaml:"stall_eviction_timeout"`
 }
 
 // Default returns a config with every field that has a sane default filled
@@ -136,10 +224,11 @@ func Default() Config {
 		DataDir:        DefaultDataDir(),
 		Aggressiveness: DefaultAggressiveness,
 		Scan: ScanConfig{
-			Interval:           DefaultScanInterval,
-			RateLimitPerSecond: DefaultRateLimitPerSec,
-			MinSeedMargin:      DefaultMinSeedMargin,
-			ModerationDelay:    DefaultModerationDelay,
+			Interval:             DefaultScanInterval,
+			RateLimitPerSecond:   DefaultRateLimitPerSec,
+			MinSeedMargin:        DefaultMinSeedMargin,
+			ModerationDelay:      DefaultModerationDelay,
+			StallEvictionTimeout: DefaultStallEvictionTimeout,
 		},
 		StatsInterval: DefaultStatsInterval,
 	}
@@ -187,7 +276,7 @@ func (c Config) Validate() error {
 		if loc.Path == "" {
 			return fmt.Errorf("storage location has an empty path")
 		}
-		if loc.Limit <= 0 {
+		if !loc.LimitAll && loc.Limit <= 0 {
 			return fmt.Errorf("storage location %s has no positive limit set", loc.Path)
 		}
 		if seen[loc.Path] {
@@ -215,6 +304,9 @@ func (c Config) Validate() error {
 	}
 	if c.StatsInterval < 0 {
 		return fmt.Errorf("stats_interval must not be negative")
+	}
+	if c.Scan.StallEvictionTimeout < 0 {
+		return fmt.Errorf("scan.stall_eviction_timeout must not be negative")
 	}
 	return nil
 }

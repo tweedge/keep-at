@@ -28,7 +28,10 @@ func (e *Engine) collectRuntimeStats() netstats.RuntimeStats {
 
 	var diskUsed, diskLimit int64
 	for _, loc := range e.cfg.Storage.Locations {
-		diskUsed += e.state.BytesUsed(loc.Path)
+		// Disk used is actual on-disk (post-compression) bytes, so the
+		// status line matches what the disk really holds - compression gains
+		// show up as room, not as phantom usage.
+		diskUsed += e.onDiskBytes(loc.Path)
 		diskLimit += int64(loc.Limit)
 	}
 

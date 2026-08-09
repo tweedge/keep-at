@@ -28,6 +28,10 @@ func heldTorrent(name string, seeders int, size int64) state.Torrent {
 	}
 }
 
+func nominalSize(h state.Torrent) int64 {
+	return h.SizeBytes
+}
+
 func TestSelectDisplaceableSingleTorrentSuffices(t *testing.T) {
 	held := []state.Torrent{
 		heldTorrent("big-healthy", 100, 1000),
@@ -35,7 +39,7 @@ func TestSelectDisplaceableSingleTorrentSuffices(t *testing.T) {
 	}
 
 	// candidate has 1 seeder, margin 3: needs held seeders >= 4 to qualify.
-	got := selectDisplaceable(held, 1, 500, 3, false)
+	got := selectDisplaceable(held, 1, 500, 3, false, nominalSize)
 	if len(got) != 1 || got[0].Title != "big-healthy" {
 		t.Fatalf("expected to displace only big-healthy, got %+v", got)
 	}
@@ -52,7 +56,7 @@ func TestSelectDisplaceableCombinesMultipleQualifyingTorrents(t *testing.T) {
 	// candidate has 1 seeder, margin 3: needs held seeders >= 4 to qualify.
 	// None of a/b/c alone (300 bytes) covers a candidate needing 700, but
 	// two of them together (600) still don't; all three (900) do.
-	got := selectDisplaceable(held, 1, 700, 3, false)
+	got := selectDisplaceable(held, 1, 700, 3, false, nominalSize)
 	if len(got) != 3 {
 		t.Fatalf("expected all three qualifying torrents combined, got %d: %+v", len(got), got)
 	}
@@ -77,7 +81,7 @@ func TestSelectDisplaceablePrefersFewestNeeded(t *testing.T) {
 		heldTorrent("also-qualifies", 80, 1000),
 	}
 
-	got := selectDisplaceable(held, 1, 500, 3, false)
+	got := selectDisplaceable(held, 1, 500, 3, false, nominalSize)
 	if len(got) != 1 {
 		t.Fatalf("expected a single torrent to suffice, got %d: %+v", len(got), got)
 	}
@@ -90,7 +94,7 @@ func TestSelectDisplaceableReturnsNilWhenNothingQualifies(t *testing.T) {
 	held := []state.Torrent{
 		heldTorrent("too-good-to-lose", 2, 1000),
 	}
-	got := selectDisplaceable(held, 1, 500, 3, false)
+	got := selectDisplaceable(held, 1, 500, 3, false, nominalSize)
 	if got != nil {
 		t.Fatalf("expected nil, got %+v", got)
 	}
@@ -101,7 +105,7 @@ func TestSelectDisplaceableReturnsNilWhenEvenAllQualifiersArentEnough(t *testing
 		heldTorrent("small-a", 50, 10),
 		heldTorrent("small-b", 40, 10),
 	}
-	got := selectDisplaceable(held, 1, 1000, 3, false)
+	got := selectDisplaceable(held, 1, 1000, 3, false, nominalSize)
 	if got != nil {
 		t.Fatalf("expected nil when even every qualifying torrent combined isn't enough room, got %+v", got)
 	}

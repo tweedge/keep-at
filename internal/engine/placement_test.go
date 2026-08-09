@@ -9,8 +9,9 @@ import (
 func TestChooseLocationExcludesTooSmall(t *testing.T) {
 	locations := []config.StorageLocation{{Path: "/a"}, {Path: "/b"}}
 	free := map[string]int64{"/a": 10, "/b": 1000}
+	size := map[string]int64{"/a": 500, "/b": 500}
 
-	path, err := chooseLocation(locations, free, 500, 0.99)
+	path, err := chooseLocation(locations, free, size, 0.99)
 	if err != nil {
 		t.Fatalf("chooseLocation: %v", err)
 	}
@@ -22,8 +23,9 @@ func TestChooseLocationExcludesTooSmall(t *testing.T) {
 func TestChooseLocationErrorsWhenNothingFits(t *testing.T) {
 	locations := []config.StorageLocation{{Path: "/a"}}
 	free := map[string]int64{"/a": 10}
+	size := map[string]int64{"/a": 500}
 
-	if _, err := chooseLocation(locations, free, 500, 0.5); err == nil {
+	if _, err := chooseLocation(locations, free, size, 0.5); err == nil {
 		t.Fatalf("expected an error when no location has enough free space")
 	}
 }
@@ -32,8 +34,9 @@ func TestChooseLocationWeightsByFreeSpace(t *testing.T) {
 	locations := []config.StorageLocation{{Path: "/a"}, {Path: "/b"}}
 	// /a has 25% of total free space, /b has 75%.
 	free := map[string]int64{"/a": 250, "/b": 750}
+	size := map[string]int64{"/a": 1, "/b": 1}
 
-	path, err := chooseLocation(locations, free, 1, 0.1) // well within /a's share
+	path, err := chooseLocation(locations, free, size, 0.1) // well within /a's share
 	if err != nil {
 		t.Fatalf("chooseLocation: %v", err)
 	}
@@ -41,7 +44,7 @@ func TestChooseLocationWeightsByFreeSpace(t *testing.T) {
 		t.Fatalf("roll 0.1 of totalFree=1000 (target=100) should land in /a's [0,250) bucket, got %s", path)
 	}
 
-	path, err = chooseLocation(locations, free, 1, 0.9) // well within /b's share
+	path, err = chooseLocation(locations, free, size, 0.9) // well within /b's share
 	if err != nil {
 		t.Fatalf("chooseLocation: %v", err)
 	}

@@ -127,6 +127,16 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("engine: invalid config: %w", err)
 	}
 
+	// Resolve `limit: all` storage locations to concrete byte limits (a safe
+	// fraction of the device's total formatted capacity) before anything
+	// that consults limits runs. Returns a copy; cfg keeps the operator's
+	// "all" for anything that round-trips config back to disk.
+	resolved, err := resolveAllLimits(cfg, logger)
+	if err != nil {
+		return nil, fmt.Errorf("engine: %w", err)
+	}
+	cfg = resolved
+
 	stores := make(map[string]*piecestore.Client, len(cfg.Storage.Locations))
 	for _, loc := range cfg.Storage.Locations {
 		store, err := piecestore.New(loc.Path)

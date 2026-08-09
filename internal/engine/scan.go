@@ -159,6 +159,7 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 
 	e.removeDeletedTorrents(held, catalogHashes)
 	e.refreshHeldSeederCounts(ctx, held, catalogHashes)
+	e.evictStalledTorrents(catalogHashes)
 
 	totalCandidates := countPendingCandidates(catalog, heldHashes, e.blocklist)
 	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt, TotalCandidates: totalCandidates})
@@ -327,10 +328,75 @@ func (e *Engine) refreshHeldSeederCounts(ctx context.Context, held []state.Torre
 				return
 			}
 			h.LastKnownSeeders = swarm.Seeders
+
+			// Track download progress (completed pieces) so stalled
+			// torrents - zero seeders, no new pieces - can be evicted. A
+			// growing piece count means the torrent is alive even if the
+			// scrape is zero (e.g. the tracker is unreachable but the swarm
+			// is fine), so progress resets the stall clock.
+			if store, ok := e.stores[h.StorageLocation]; ok {
+				if pieces, err := store.CompletedPieceCount(h.InfoHash); err == nil {
+					if pieces > h.CompletedPieces {
+						h.CompletedPieces = pieces
+						h.LastProgressAt = time.Now().UTC()
+					} else if h.LastProgressAt.IsZero() {
+						// First observation: seed the clock so the torrent
+						// gets a full stall window before any eviction.
+						h.CompletedPieces = pieces
+						h.LastProgressAt = time.Now().UTC()
+					}
+				}
+			}
+
 			if err := e.state.Put(h); err != nil {
 				e.logger.Error("failed to persist refreshed seeder count", "title", h.Title, "err", err)
 			}
 		})
+	}
+}
+
+// evictStalledTorrents removes held torrents that have no live seeders and
+// have made no download progress (no new completed pieces) since their stall
+// clock started, for longer than the configured stall eviction timeout.
+// Such a torrent can't complete - with zero seeders there's no one to serve
+// the missing pieces - so it's occupying a RAM slot and disk accounting
+// forever. Removing it frees both for a torrent that can actually download.
+//
+// The stall clock (state.Torrent.LastProgressAt) starts at first observation
+// and resets whenever a torrent gains a piece, so a torrent only gets
+// evicted after a full quiet period, not on its first zero-seeder scrape.
+// Torrents still in the catalog are the only ones considered; ones that left
+// the catalog are handled by removeDeletedTorrents. A stall eviction timeout
+// of zero disables this entirely.
+func (e *Engine) evictStalledTorrents(catalogHashes map[string]bool) {
+	timeout := e.cfg.Scan.StallEvictionTimeout.AsDuration()
+	if timeout <= 0 {
+		return
+	}
+
+	now := time.Now().UTC()
+	for _, h := range e.state.All() {
+		if !catalogHashes[h.InfoHash.HexString()] {
+			continue
+		}
+		if h.LastKnownSeeders > 0 {
+			continue
+		}
+		if h.LastProgressAt.IsZero() {
+			continue // no stall clock yet; refreshHeldSeederCounts starts one
+		}
+		if now.Sub(h.LastProgressAt) < timeout {
+			continue
+		}
+
+		// No seeders and no new pieces for the whole timeout: give up.
+		e.logger.Warn("removing stalled torrent: zero seeders and no download progress for the stall timeout",
+			"title", h.Title,
+			"stalled_for", humanDuration(now.Sub(h.LastProgressAt)),
+			"timeout", humanDuration(timeout))
+		if err := e.RemoveTorrent(h.InfoHash, h.StorageLocation); err != nil {
+			e.logger.Error("failed to remove stalled torrent", "title", h.Title, "err", err)
+		}
 	}
 }
 
@@ -606,8 +672,10 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 	}
 
 	freeByPath := make(map[string]int64, len(e.cfg.Storage.Locations))
+	sizeByPath := make(map[string]int64, len(e.cfg.Storage.Locations))
 	for _, loc := range e.cfg.Storage.Locations {
 		freeByPath[loc.Path] = e.freeBytes(loc)
+		sizeByPath[loc.Path] = e.estimatedOnDiskBytes(loc.Path, sizeBytes)
 	}
 
 	// A plain free-space fill increases the torrent count, so it's only
@@ -618,7 +686,7 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 	decision := selector.SwapDecision{ShouldSwap: false, Reason: "candidate not evaluated"}
 	added := false
 	if heldCount == nil || *heldCount < e.maxTorrents {
-		if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
+		if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeByPath, rand.Float64()); err == nil {
 			var d selector.SwapDecision
 			added, d = e.tryAdd(c, md, sizeBytes, location, nil, heldCount, keepAtPeers)
 			decision = d
@@ -721,7 +789,13 @@ func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes
 	}
 
 	for location, inLocation := range byLocation {
-		displaced := selectDisplaceable(inLocation, c.swarm.Seeders, sizeBytes, e.cfg.Scan.MinSeedMargin, ramBound)
+		// Both the candidate's needed space and the freed space from
+		// displacing held torrents are measured post-compression (actual
+		// on-disk bytes / estimated on-disk footprint), so compression gains
+		// count toward fitting more torrents here just as they do for
+		// free-space fills.
+		sizeNeeded := e.estimatedOnDiskBytes(location, sizeBytes)
+		displaced := selectDisplaceable(inLocation, c.swarm.Seeders, sizeNeeded, e.cfg.Scan.MinSeedMargin, ramBound, e.heldOnDiskBytes)
 		if displaced == nil {
 			continue
 		}
@@ -743,15 +817,33 @@ func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes
 	return false, selector.SwapDecision{}
 }
 
+// heldOnDiskBytes returns a held torrent's actual on-disk (post-compression)
+// footprint, falling back to its nominal size if the store can't be queried.
+// Swap math uses this so a displaced torrent's real freed space is what
+// counts against the candidate's estimated footprint.
+func (e *Engine) heldOnDiskBytes(h state.Torrent) int64 {
+	if store, ok := e.stores[h.StorageLocation]; ok {
+		if n, err := store.DiskUsage(h.InfoHash); err == nil {
+			return n
+		}
+	}
+	return h.SizeBytes
+}
+
 // selectDisplaceable picks the smallest set of held torrents (within one
 // location) that the candidate can displace: each one individually must
 // clear the seed margin against the candidate (selector.MeetsSeedMargin
 // checks the whole set against its minimum, so requiring every member to
 // individually qualify - rather than relying on averaging - is what keeps
 // this from evicting a torrent that wouldn't qualify on its own just
-// because it's bundled with others that do), and their combined size must
-// cover what the candidate needs. Returns nil if this location can't
+// because it's bundled with others that do), and their combined freed size
+// must cover what the candidate needs. Returns nil if this location can't
 // accommodate the swap even using every torrent that qualifies.
+//
+// sizeOf resolves each held torrent's freed size (post-compression on-disk
+// bytes in production, nominal size in tests). sizeNeeded is the candidate's
+// estimated on-disk footprint; both being measured the same way is what keeps
+// compression gains from leaking out of the swap math.
 //
 // ramBound indicates keep-at is already at its RAM-driven torrent cap. In
 // that regime the binding constraint is the per-torrent RAM slot, not disk,
@@ -759,7 +851,7 @@ func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes
 // "smallest first" - the scarce RAM slots go to the largest torrents that
 // fit, the opposite of the disk-bound preference where we'd rather keep
 // small torrents and shed big ones.
-func selectDisplaceable(inLocation []state.Torrent, candidateSeeders int, sizeNeeded int64, minSeedMargin int, ramBound bool) []state.Torrent {
+func selectDisplaceable(inLocation []state.Torrent, candidateSeeders int, sizeNeeded int64, minSeedMargin int, ramBound bool, sizeOf func(state.Torrent) int64) []state.Torrent {
 	var qualifying []state.Torrent
 	for _, h := range inLocation {
 		if h.LastKnownSeeders-minSeedMargin >= candidateSeeders {
@@ -786,7 +878,7 @@ func selectDisplaceable(inLocation []state.Torrent, candidateSeeders int, sizeNe
 	var freed int64
 	for _, h := range qualifying {
 		chosen = append(chosen, h)
-		freed += h.SizeBytes
+		freed += sizeOf(h)
 		if freed >= sizeNeeded {
 			return chosen
 		}

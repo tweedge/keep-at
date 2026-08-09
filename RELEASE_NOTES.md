@@ -1,5 +1,31 @@
 # keep-at release notes
 
+## v0.7.0 - make every byte count, and don't hold a slot for a torrent that can never finish
+
+### Post-compression space accounting
+
+keep-at's space accounting now measures **actual on-disk bytes**, not nominal torrent sizes. Pieces are stored gzip-compressed, so a 100 GB torrent that lands on disk as 60 GB consumes only 60 GB of a storage location's limit - the 40 GB of compression gains count toward free space and are used to fit more torrents. Academic Torrents is full of textual and structured data that compresses well, so a location typically fits noticeably more than its nominal-size accounting would suggest.
+
+The same rule runs through every path that fits a torrent:
+
+- **Placement** estimates a candidate's on-disk footprint by applying the location's observed compression ratio (on-disk bytes / nominal bytes across held torrents) to its nominal size.
+- **Swaps** measure a displaced torrent's freed space in actual on-disk bytes, so compression gains help in eviction math too.
+- **Runtime stats** (`keep-at status`, the periodic summary) report disk used as actual on-disk bytes, so the status line matches what the disk really holds.
+
+Free-space checks are additionally capped by what the device actually reports free (statfs), so filesystem block slack and metadata can never let accounting drift past real capacity.
+
+### New `limit: all` for dedicated drives
+
+A storage location's limit can now be the literal `all` - `limit: all` in a config file, or `--storage-limit all` - which resolves at startup to **97.5% of the device's total formatted capacity**, measured with statfs on the location path. That fraction is deliberately below 100%: filesystems reserve blocks for their own health (ext4 defaults to reserving 5% for root), journals and metadata need room, and block slack on many small piece files costs real space beyond their byte sum.
+
+> **DANGER: dedicated drives only. Never use `all` on an OS drive.** With `limit: all`, keep-at will attempt to fill the device to the resolved fraction - on a system disk that can choke the OS out of space for logs, swap, and the boot process itself. A fixed byte limit is always safer if you're unsure.
+
+### Stalled downloads free themselves
+
+A held torrent that falls to zero seeders and never completes can never finish - with no seeders, nobody can serve its missing pieces - yet it previously held its RAM slot and disk accounting forever, immune to swaps (which only evict *well-seeded* torrents). keep-at now tracks download progress per held torrent (completed pieces, persisted in state) and, after `scan.stall_eviction_timeout` (default **two weeks**, configurable via `--stall-eviction-timeout` or `stall_eviction_timeout`; `0` disables), removes any torrent that has stayed at zero seeders and gained no new pieces.
+
+The stall clock starts at a torrent's first observation and resets whenever it gains a piece, so a torrent gets a full quiet window before any eviction, and slow-but-alive downloads (pieces arriving from leechers' combined data even at zero seeders) are never misclassified as stalled.
+
 ## v0.6.1 - see what this host is holding
 
 ### New `keep-at hosted-torrents` command

@@ -156,3 +156,58 @@ func TestLoadParsesAndValidatesExistingConfig(t *testing.T) {
 		t.Errorf("unexpected storage locations: %+v", cfg.Storage.Locations)
 	}
 }
+
+func TestStorageLocationAllLimitParsesAndRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keep-at.yaml")
+	contents := "port: 40000\n" +
+		"storage:\n" +
+		"  locations:\n" +
+		"    - path: /data\n" +
+		"      limit: all\n"
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Storage.Locations) != 1 {
+		t.Fatalf("expected 1 storage location, got %+v", cfg.Storage.Locations)
+	}
+	if !cfg.Storage.Locations[0].LimitAll {
+		t.Fatalf("expected LimitAll for `limit: all`, got %+v", cfg.Storage.Locations[0])
+	}
+	if cfg.Storage.Locations[0].Limit != 0 {
+		t.Errorf("expected Limit to stay 0 until resolved, got %d", cfg.Storage.Locations[0].Limit)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected `limit: all` to validate, got: %v", err)
+	}
+
+	// Round-trip: a config keep-at writes (e.g. service install) must keep
+	// `limit: all` rather than writing "0".
+	outPath := filepath.Join(dir, "roundtrip.yaml")
+	if err := Save(outPath, cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading round-tripped config: %v", err)
+	}
+	reloaded, err := Load(outPath)
+	if err != nil {
+		t.Fatalf("reloading round-tripped config: %v", err)
+	}
+	if len(reloaded.Storage.Locations) != 1 || !reloaded.Storage.Locations[0].LimitAll {
+		t.Errorf("round-trip lost `limit: all`: %s", data)
+	}
+}
+
+func TestDefaultStallEvictionTimeout(t *testing.T) {
+	if got := Default().Scan.StallEvictionTimeout.AsDuration(); got != DefaultStallEvictionTimeout.AsDuration() {
+		t.Errorf("Default().Scan.StallEvictionTimeout = %v, want %v", got, DefaultStallEvictionTimeout)
+	}
+}

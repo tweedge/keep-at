@@ -14,7 +14,7 @@ Precedence, when more than one source could set a value:
 
 ### `storage.locations` (config file only)
 
-A list of `{path, limit}` pairs. Each `limit` is a fixed integer followed by `M`, `G`, `T`, or `P` (binary units - `1G` is `1024^3` bytes, not `1000^3`). There's no default limit; keep-at always requires at least one explicit location with a positive limit before it will run.
+A list of `{path, limit}` pairs. Each `limit` is either a fixed integer followed by `M`, `G`, `T`, or `P` (binary units - `1G` is `1024^3` bytes, not `1000^3`), or the literal `all` - see below. There's no default limit; keep-at always requires at least one explicit location with a positive limit before it will run.
 
 ```yaml
 storage:
@@ -24,6 +24,10 @@ storage:
     - path: /mnt/disk2/keep-at
       limit: 2T
 ```
+
+Limits are enforced **post-compression**: keep-at compares a location's limit against the actual on-disk bytes its pieces occupy (each piece is stored gzip-compressed), not the nominal torrent sizes. A torrent that compresses well consumes less of the limit than its catalog size, and the compression gains count toward free space for the next torrent. Free-space checks are also capped by what the device actually reports free, so filesystem block slack and metadata can't push real usage past capacity.
+
+`limit: all` (or `--storage-limit all`) resolves at startup to 97.5% of the storage device's total formatted capacity, measured with statfs on the location path - the device is dedicated to keep-at and the last 2.5% (plus whatever the filesystem reserves) is left for the journal, metadata, and the OS's emergency operations. **Only use `all` on a dedicated data drive.** On an OS drive, keep-at will attempt to fill the device to that fraction and can choke the OS out of room for logs, swap, and the boot process. A fixed byte limit is the safe choice whenever the drive isn't exclusively keep-at's.
 
 keep-at fills multiple locations proportionally to free space, not sequentially, so they fill up roughly evenly over time instead of one disk taking everything until it's full. See [DESIGN.md](DESIGN.md) for the weighting logic.
 
@@ -39,7 +43,7 @@ The single storage location to use, when not using a config file. Defaults to an
 
 ### `--storage-limit` (CLI only)
 
-How much space `--storage` is allowed to use, e.g. `500G` or `2T`. Required whenever you're not using a config file - keep-at will not guess this.
+How much space `--storage` is allowed to use, e.g. `500G`, `2T`, or `all` for a dedicated drive (see `storage.locations` above for the `all` caveats). Required whenever you're not using a config file - keep-at will not guess this.
 
 ## Data directory
 
@@ -66,6 +70,10 @@ Defaults to the same OS-appropriate base directory as `--storage` (see above), u
 ### `scan.moderation_delay` / `--moderation-delay`
 
 *Default: `168h` (one week).* Minimum age (from the `.torrent` file's creation date - see DESIGN.md for why not an upload date) before keep-at will consider downloading a torrent. Gives Academic Torrents' moderators time to catch anything that shouldn't be there. Set to `0` to disable the age gate entirely, which also lets torrents with no posted creation date through.
+
+### `scan.stall_eviction_timeout` / `--stall-eviction-timeout`
+
+*Default: `336h` (two weeks).* How long a held torrent can sit with **zero seeders and no download progress** before keep-at removes it to free the slot and disk for a torrent that can actually complete. Every scan refreshes how many pieces a held torrent has stored; a torrent that gains no new pieces for this entire timeout while having zero seeders can never finish (no one can serve its missing pieces), so it's evicted. The clock starts at a torrent's first observation and resets whenever it gains a piece, so slow-but-alive downloads are never evicted. Set to `0` to disable stalled-torrent eviction entirely.
 
 ### `aggressiveness` / `--aggressiveness`
 
@@ -170,7 +178,7 @@ runtime stats (as of 2026-08-08 20:55:00 UTC, uptime 2h0m0s):
 
 **Useful** transfer is the piece data that actually mattered: bytes sent to peers that requested them, and bytes received that keep-at needed. **Total network** is everything that moved over peer connections since boot - useful payload plus protocol overhead, handshakes, and duplicate/wasted chunks received from the swarm. The gap between the two is the cost of swarming, which is why a naive "downloaded" figure can far exceed what actually ended up on disk. The average rates are total-network bytes since boot divided by uptime, in bits per second.
 
-Disk utilization is measured against keep-at's **configured storage limits** (the `storage.locations`/`--storage-limit` totals), not raw filesystem usage - 100% means keep-at has reached the limit it was given. "Since boot" means since this keep-at process started.
+Disk utilization is measured against keep-at's **configured storage limits** (the `storage.locations`/`--storage-limit` totals), not raw filesystem usage - 100% means keep-at has reached the limit it was given. Disk *used* is reported as actual on-disk bytes (post-compression), so a location full of compressible torrents shows less usage than its nominal catalog sizes would suggest - the compression gains read as headroom, exactly as keep-at's placement math treats them. "Since boot" means since this keep-at process started.
 
 ## Flags that aren't config fields
 
@@ -179,4 +187,3 @@ A few flags control CLI behavior rather than keep-at's own settings, and don't h
 * `--config PATH` - use a config file (see precedence above).
 * `--foreground` (`start` only) - run attached instead of daemonizing. Implied automatically inside a container.
 * `--user` (`service install` only) - which user the systemd unit runs as (default `root`).
-* `--data-dir` (`stop`/`status`/`network-status` only) - override where to look for a running instance's PID/log/state, when you're not using `--config` and haven't installed keep-at as a service.

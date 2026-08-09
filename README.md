@@ -109,6 +109,29 @@ api_key: "uid=12345;pass=abcdef..."
 
 Every field here, plus its CLI flag equivalent and what it actually does, is documented in [docs/CONFIG.md](docs/CONFIG.md).
 
+### Filling a dedicated drive: `limit: all`
+
+A storage location's `limit` can be the literal `all` (or `--storage-limit all`) instead of a byte count. keep-at then resolves it at startup to **97.5% of the device's total formatted capacity** - it measures the filesystem with statfs and leaves the last 2.5% (plus whatever the filesystem itself reserves) for the journal, metadata, and the OS's emergency operations.
+
+```
+keep-at run --storage-limit all
+```
+
+```yaml
+storage:
+    locations:
+        - path: /mnt/dedicated-drive/keep-at
+          limit: all
+```
+
+> **DANGER: dedicated drives only. Never use `all` on an OS drive.** With `limit: all`, keep-at will attempt to fill the device to the resolved fraction - on a system disk that can choke the OS out of space for logs, swap, package managers, and the boot process itself. Use it only on a drive whose entire purpose is storing torrent data. A fixed byte limit is always safer if you're unsure.
+
+Two things make `all` safe on a dedicated drive. First, keep-at's space accounting is **post-compression**: the limit is compared against actual on-disk bytes, so a torrent that compresses well (and much of Academic Torrents is textual or structured data) consumes less of the limit than its nominal size - compression gains become free space and are used to fit more torrents. Second, free-space checks are capped by what the device actually reports free, so filesystem overhead can't let accounting drift past real capacity.
+
+### Stalled downloads free themselves
+
+A torrent that falls to zero seeders and never completes can't ever finish - with no seeders, nobody can serve its missing pieces. keep-at tracks download progress per held torrent and, after `scan.stall_eviction_timeout` (default **two weeks**, configurable via `--stall-eviction-timeout` or `stall_eviction_timeout` in a config file; `0` disables), removes any held torrent that has stayed at zero seeders and gained no new pieces, freeing its slot and disk for a torrent that can actually complete. A torrent is only ever considered stalled once its clock has run a full quiet period - progress resets it - so slow-but-alive downloads are never evicted.
+
 ### Academic Torrents API Keys
 
 *Optional.* keep-at works exactly the same with or without an API key - if you don't set one, you seed anonymously and nothing about what keep-at holds or how it behaves changes. The only difference is attribution.

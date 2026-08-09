@@ -25,6 +25,15 @@ type Torrent struct {
 	// swap decisions without a fresh scrape of every held torrent on every
 	// call.
 	LastKnownSeeders int `json:"last_known_seeders"`
+
+	// CompletedPieces and LastProgressAt drive stalled-download eviction
+	// (see engine's scan-time eviction check). CompletedPieces is how many
+	// of the torrent's pieces were fully stored the last time keep-at
+	// looked; LastProgressAt is when it last saw that count grow. A torrent
+	// with zero seeders that gains no pieces for the configured stall
+	// timeout is removed to free its slot.
+	CompletedPieces int       `json:"completed_pieces"`
+	LastProgressAt  time.Time `json:"last_progress_at"`
 }
 
 // State is keep-at's full persisted view of what it's holding. It's safe for

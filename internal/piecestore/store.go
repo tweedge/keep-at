@@ -99,3 +99,50 @@ func (c *Client) DiskUsage(infoHash metainfo.Hash) (int64, error) {
 	}
 	return total, nil
 }
+
+// DiskUsageAll reports the total actual on-disk (compressed) bytes in the
+// whole location, summing every torrent's stored pieces (staging included).
+// This is what keep-at's space accounting subtracts from a location's limit:
+// since pieces are gzip-compressed, the real footprint is the on-disk bytes,
+// not the nominal torrent sizes.
+func (c *Client) DiskUsageAll() (int64, error) {
+	var total int64
+	err := filepath.Walk(c.baseDir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("piecestore: computing disk usage for %s: %w", c.baseDir, err)
+	}
+	return total, nil
+}
+
+// CompletedPieceCount counts how many of a torrent's pieces are fully stored
+// (compressed, final .piece.gz files). Incomplete pieces live in a staging/
+// subdirectory and don't count. Used to detect stalled downloads: a torrent
+// that isn't gaining pieces is stuck.
+func (c *Client) CompletedPieceCount(infoHash metainfo.Hash) (int, error) {
+	dir := c.torrentDir(infoHash)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("piecestore: listing torrent dir %s: %w", dir, err)
+	}
+	count := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if len(e.Name()) > len(".piece.gz") && e.Name()[len(e.Name())-len(".piece.gz"):] == ".piece.gz" {
+			count++
+		}
+	}
+	return count, nil
+}
