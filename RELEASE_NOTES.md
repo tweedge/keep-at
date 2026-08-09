@@ -1,6 +1,12 @@
 # keep-at release notes
 
-## v0.5.3 - honest transfer stats, age-gate off switch, foreground status
+## v0.5.4 - portable foreground detection, honest transfer stats, age-gate off switch
+
+### `keep-at status` detects foreground runs on every platform
+
+`keep-at status` previously reported "not running" for an instance started with `keep-at run` in the foreground, because only daemonized `keep-at start` writes a PID file. It now scans the process table and reports `keep-at is running in the foreground (pid N), not as a service` when it finds one using the same data dir.
+
+On macOS and Windows, where the Linux `/proc` process scan isn't available, status falls back to a portable liveness check: the engine writes `runtime-stats.json` into the data dir at startup and every `stats_interval`, so a recently-updated file means keep-at is running there. Those platforms report the foreground instance without a PID.
 
 ### Transfer stats now separate useful data from total network traffic
 
@@ -14,7 +20,3 @@ Both figures also come with **average rates since boot** (total-network bytes ov
 ### Age gate can be fully disabled
 
 `moderation_delay: 0` (or `--moderation-delay 0`) now disables the moderation-age gate entirely, including letting through torrents with no posted creation date. Previously a zero `createdAt` was always treated as ineligible even when the delay was off.
-
-### `keep-at status` detects foreground runs
-
-`keep-at status` previously reported "not running" for an instance started with `keep-at run` in the foreground, because only daemonized `keep-at start` writes a PID file. It now scans the process table and reports `keep-at is running in the foreground (pid N), not as a service` when it finds one using the same data dir.
