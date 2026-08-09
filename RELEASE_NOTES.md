@@ -1,11 +1,20 @@
 # keep-at release notes
 
-## v0.5.2 - lighter scans, usable on 1GB-RAM devices
+## v0.5.3 - honest transfer stats, age-gate off switch, foreground status
 
-Full-catalog scans no longer hold every candidate's parsed `.torrent` metadata in memory. The scan previously kept the complete metadata - including every torrent's piece-hash arrays, which scale with the library's total size - resident for the whole scan, pushing a first scan past 3GB of RAM even on a machine with a modest library. Now:
+### Transfer stats now separate useful data from total network traffic
 
-- **Candidates stay lightweight during the scan.** Only the facts ranking needs (title, infohash, size, scraped swarm counts) are kept in memory. The full `.torrent` metadata is cached to `torrent-cache/` during evaluation and re-read from disk only when keep-at actually acts on a candidate. Scan memory is proportional to the number of candidates, not the size of the library.
-- **Ranking work is bounded.** Acting happens once per batch of concurrent evaluations (plus a final flush) instead of re-ranking the whole catalog on every single candidate arrival.
-- **Scrape progress logs less often.** The "scrape in progress" line now prints every 5 minutes instead of every 2.
+"Downloaded since boot" previously counted every piece chunk received over the wire, including duplicate/wasted chunks from the swarm - which is why a naive reading could show far more "downloaded" than what ended up on disk. keep-at now reports both figures, in the periodic runtime-stats log and in `keep-at status`:
 
-The result: a full-catalog scan's memory footprint stays modest even on a 1GB-RAM Raspberry Pi-class device, while seeding still starts within minutes.
+- **useful** - the piece data that actually mattered (bytes sent to peers that requested them; bytes received that keep-at needed),
+- **total network** - everything over peer connections since boot, useful payload plus protocol overhead, handshakes, and duplicate/wasted chunks. The gap is the cost of swarming.
+
+Both figures also come with **average rates since boot** (total-network bytes over uptime, in bps/kbps/mbps/gbps), so the log and status show e.g. `uploaded_useful=5.0G uploaded_total=5.2G upload_rate_avg=500 kbps`.
+
+### Age gate can be fully disabled
+
+`moderation_delay: 0` (or `--moderation-delay 0`) now disables the moderation-age gate entirely, including letting through torrents with no posted creation date. Previously a zero `createdAt` was always treated as ineligible even when the delay was off.
+
+### `keep-at status` detects foreground runs
+
+`keep-at status` previously reported "not running" for an instance started with `keep-at run` in the foreground, because only daemonized `keep-at start` writes a PID file. It now scans the process table and reports `keep-at is running in the foreground (pid N), not as a service` when it finds one using the same data dir.

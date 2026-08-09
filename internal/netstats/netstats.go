@@ -102,11 +102,18 @@ type RuntimeStats struct {
 	DiskUsedBytes  int64 `json:"disk_used_bytes"`
 	DiskLimitBytes int64 `json:"disk_limit_bytes"`
 
-	// BytesUploaded and BytesDownloaded are data payload bytes transferred
-	// over peer connections since keep-at started, excluding protocol
-	// overhead.
-	BytesUploaded   int64 `json:"bytes_uploaded"`
-	BytesDownloaded int64 `json:"bytes_downloaded"`
+	// UsefulBytesUploaded and UsefulBytesDownloaded are the piece data that
+	// actually mattered: bytes keep-at sent to peers that requested it, and
+	// bytes it received that it needed. This is the "real" transfer figure.
+	//
+	// TotalBytesUploaded and TotalBytesDownloaded are everything that moved
+	// over peer connections since boot - the useful payload plus protocol
+	// overhead, handshakes, and duplicate/wasted chunks received from the
+	// swarm. The gap between useful and total is the cost of swarming.
+	UsefulBytesUploaded   int64 `json:"useful_bytes_uploaded"`
+	UsefulBytesDownloaded int64 `json:"useful_bytes_downloaded"`
+	TotalBytesUploaded    int64 `json:"total_bytes_uploaded"`
+	TotalBytesDownloaded  int64 `json:"total_bytes_downloaded"`
 
 	// ActivePeers is the number of peer connections keep-at has open right
 	// now across all held torrents.
@@ -116,6 +123,24 @@ type RuntimeStats struct {
 // Uptime returns how long keep-at has been running.
 func (s RuntimeStats) Uptime() time.Duration {
 	return time.Duration(s.UptimeSeconds) * time.Second
+}
+
+// UploadBitsPerSec returns the average total-network upload rate since
+// boot, in bits per second (bytes * 8 / uptime).
+func (s RuntimeStats) UploadBitsPerSec() float64 {
+	if s.UptimeSeconds <= 0 {
+		return 0
+	}
+	return float64(s.TotalBytesUploaded) * 8 / float64(s.UptimeSeconds)
+}
+
+// DownloadBitsPerSec returns the average total-network download rate since
+// boot, in bits per second (bytes * 8 / uptime).
+func (s RuntimeStats) DownloadBitsPerSec() float64 {
+	if s.UptimeSeconds <= 0 {
+		return 0
+	}
+	return float64(s.TotalBytesDownloaded) * 8 / float64(s.UptimeSeconds)
 }
 
 // DiskUsedPct returns the percentage of keep-at's configured storage

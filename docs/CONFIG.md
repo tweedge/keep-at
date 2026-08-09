@@ -65,7 +65,7 @@ Defaults to the same OS-appropriate base directory as `--storage` (see above), u
 
 ### `scan.moderation_delay` / `--moderation-delay`
 
-*Default: `168h` (one week).* Minimum age (from the `.torrent` file's creation date - see DESIGN.md for why not an upload date) before keep-at will consider downloading a torrent. Gives Academic Torrents' moderators time to catch anything that shouldn't be there.
+*Default: `168h` (one week).* Minimum age (from the `.torrent` file's creation date - see DESIGN.md for why not an upload date) before keep-at will consider downloading a torrent. Gives Academic Torrents' moderators time to catch anything that shouldn't be there. Set to `0` to disable the age gate entirely, which also lets torrents with no posted creation date through.
 
 ### `aggressiveness` / `--aggressiveness`
 
@@ -148,10 +148,10 @@ download_rate_limit: 20M
 
 ### `stats_interval` / `--stats-interval`
 
-*Default: `30m`.* How often keep-at logs a brief summary of what it's doing - torrents held/seeding/downloading, disk utilization, bytes uploaded and downloaded since boot, active peers, and uptime - and writes that same summary to disk (in `data_dir/runtime-stats.json`) so `keep-at status` can display it. A summary is always written once at startup; `stats_interval: 0` disables the periodic ones. The log line looks like:
+*Default: `30m`.* How often keep-at logs a brief summary of what it's doing - torrents held/seeding/downloading, disk utilization, transfer since boot (both useful payload and total network traffic, with average rates), active peers, and uptime - and writes that same summary to disk (in `data_dir/runtime-stats.json`) so `keep-at status` can display it. A summary is always written once at startup; `stats_interval: 0` disables the periodic ones. The log line looks like:
 
 ```
-runtime stats kind=periodic held=12 seeding=10 downloading=2 disk_used=50.0G disk_limit=100.0G disk_used_pct=50 uploaded=5.0G downloaded=1.0G peers=24 uptime=2h0m0s
+runtime stats kind=periodic held=12 seeding=10 downloading=2 disk_used=50.0G disk_limit=100.0G disk_used_pct=50 uploaded_useful=5.0G downloaded_useful=1.0G uploaded_total=5.2G downloaded_total=1.4G upload_rate_avg=500 kbps download_rate_avg=100 kbps peers=24 uptime=2h0m0s
 ```
 
 and `keep-at status` prints the same picture:
@@ -161,10 +161,14 @@ keep-at is running (pid 12345)
 runtime stats (as of 2026-08-08 20:55:00 UTC, uptime 2h0m0s):
   torrents: 12 held, 10 seeding, 2 downloading
   disk: 50.0 GB used of 100.0 GB configured (50.0%)
-  uploaded since boot: 5.0 GB
-  downloaded since boot: 1.0 GB
+  useful upload since boot: 5.0 GB (total network 5.2 GB)
+  useful download since boot: 1.0 GB (total network 1.4 GB)
+  avg upload since boot: 500 kbps
+  avg download since boot: 100 kbps
   active peers: 24
 ```
+
+**Useful** transfer is the piece data that actually mattered: bytes sent to peers that requested them, and bytes received that keep-at needed. **Total network** is everything that moved over peer connections since boot - useful payload plus protocol overhead, handshakes, and duplicate/wasted chunks received from the swarm. The gap between the two is the cost of swarming, which is why a naive "downloaded" figure can far exceed what actually ended up on disk. The average rates are total-network bytes since boot divided by uptime, in bits per second.
 
 Disk utilization is measured against keep-at's **configured storage limits** (the `storage.locations`/`--storage-limit` totals), not raw filesystem usage - 100% means keep-at has reached the limit it was given. "Since boot" means since this keep-at process started.
 

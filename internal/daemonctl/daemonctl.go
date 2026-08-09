@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/tweedge/keep-at/internal/config"
 )
 
 // Manager owns one keep-at process's PID file and log file.
@@ -130,4 +133,94 @@ func processAlive(pid int) bool {
 	// Signal 0 doesn't actually send a signal; it just checks whether the
 	// process exists and is signalable by us.
 	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+// FindForeground scans the process table for a keep-at instance that was
+// started with `keep-at run` in the foreground rather than daemonized with a
+// PID file, and that uses dataDir. It returns its PID and true if one is
+// running. This is what lets `keep-at status` report a foreground instance
+// as running instead of wrongly concluding keep-at isn't running at all just
+// because there's no PID file.
+//
+// A foreground instance is identified as a process running the keep-at
+// binary (matched by executable basename, so a differently-named or -copied
+// install still counts) whose command line has `run` as the subcommand and
+// whose effective data dir - from its --data-dir/--config flags, or the
+// default if neither is given - matches dataDir. A daemonized service also
+// runs `keep-at run` internally, but in that case the PID file exists and
+// Status already reports it, so FindForeground is only consulted when there
+// is no (alive) PID file - i.e. the instance was genuinely started in the
+// foreground.
+func FindForeground(dataDir string) (int, bool) {
+	selfPid := os.Getpid()
+
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, false
+	}
+	for _, proc := range procs {
+		if !proc.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(proc.Name())
+		if err != nil || pid == selfPid {
+			continue
+		}
+
+		// Running the keep-at binary (basename match).
+		exe, err := os.Readlink(filepath.Join("/proc", proc.Name(), "exe"))
+		if err != nil {
+			continue
+		}
+		if filepath.Base(exe) != "keep-at" {
+			continue
+		}
+
+		// `run` subcommand, not `status`/`stop`/etc.
+		cmdline, err := os.ReadFile(filepath.Join("/proc", proc.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+		if len(args) < 2 || args[1] != "run" {
+			continue
+		}
+
+		if processDataDir(args) == dataDir {
+			return pid, true
+		}
+	}
+	return 0, false
+}
+
+// processDataDir figures out which data dir a `keep-at run` process uses
+// from its command line: the --data-dir flag if given, otherwise the data
+// dir implied by --config, otherwise the default.
+func processDataDir(args []string) string {
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--data-dir" && i+1 < len(args):
+			return args[i+1]
+		case strings.HasPrefix(args[i], "--data-dir="):
+			return strings.TrimPrefix(args[i], "--data-dir=")
+		case args[i] == "--config" && i+1 < len(args):
+			return configDataDirFromFile(args[i+1])
+		case strings.HasPrefix(args[i], "--config="):
+			return configDataDirFromFile(strings.TrimPrefix(args[i], "--config="))
+		}
+	}
+	return config.DefaultDataDir()
+}
+
+// configDataDirFromFile returns the data dir a config file sets, or the
+// default if the file can't be read or doesn't specify one. Best effort: a
+// foreground instance identified this way still needs its data dir to match
+// the caller's, so a wrong guess just means status falls through to "not
+// running" rather than misreporting a different instance.
+func configDataDirFromFile(path string) string {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return config.DefaultDataDir()
+	}
+	return cfg.DataDir
 }

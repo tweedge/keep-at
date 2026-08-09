@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 
+	"github.com/tweedge/keep-at/internal/daemonctl"
 	"github.com/tweedge/keep-at/internal/netstats"
 )
 
@@ -28,6 +29,8 @@ func cmdStatus(args []string) error {
 
 	if status.Running {
 		fmt.Printf("keep-at is running (pid %d)\n", status.PID)
+	} else if pid, ok := daemonctl.FindForeground(dir); ok {
+		fmt.Printf("keep-at is running in the foreground (pid %d), not as a service\n", pid)
 	} else {
 		fmt.Println("keep-at is not running")
 	}
@@ -59,8 +62,14 @@ func cmdStatus(args []string) error {
 			netstats.HumanBytes(runtimeStats.DiskLimitBytes),
 			runtimeStats.DiskUsedPct())
 	}
-	fmt.Printf("  uploaded since boot: %s\n", netstats.HumanBytes(runtimeStats.BytesUploaded))
-	fmt.Printf("  downloaded since boot: %s\n", netstats.HumanBytes(runtimeStats.BytesDownloaded))
+	fmt.Printf("  useful upload since boot: %s (total network %s)\n",
+		netstats.HumanBytes(runtimeStats.UsefulBytesUploaded),
+		netstats.HumanBytes(runtimeStats.TotalBytesUploaded))
+	fmt.Printf("  useful download since boot: %s (total network %s)\n",
+		netstats.HumanBytes(runtimeStats.UsefulBytesDownloaded),
+		netstats.HumanBytes(runtimeStats.TotalBytesDownloaded))
+	fmt.Printf("  avg upload since boot: %s\n", netstats.HumanBitsPerSec(runtimeStats.UploadBitsPerSec()))
+	fmt.Printf("  avg download since boot: %s\n", netstats.HumanBitsPerSec(runtimeStats.DownloadBitsPerSec()))
 	fmt.Printf("  active peers: %d\n", runtimeStats.ActivePeers)
 	return nil
 }

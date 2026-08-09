@@ -44,16 +44,24 @@ func (e *Engine) collectRuntimeStats() netstats.RuntimeStats {
 
 	stats := e.torrentClient.Stats()
 
+	// Useful data is what actually mattered: pieces sent to peers that
+	// requested them, and pieces received that keep-at needed. Total network
+	// is everything over peer connections - useful payload plus protocol
+	// overhead, handshakes, and duplicate/wasted chunks from the swarm. The
+	// gap between the two is the cost of swarming, and it's why a naive
+	// "downloaded" figure can far exceed what actually ended up on disk.
 	return netstats.RuntimeStats{
-		CollectedAt:      time.Now().UTC(),
-		UptimeSeconds:    int64(time.Since(e.startedAt).Seconds()),
-		HeldTorrents:     len(held),
-		SeedingTorrents:  seeding,
-		DiskUsedBytes:    diskUsed,
-		DiskLimitBytes:   diskLimit,
-		BytesUploaded:    stats.PeerConns.BytesWrittenData.Int64(),
-		BytesDownloaded:  stats.PeerConns.BytesReadData.Int64(),
-		ActivePeers:      stats.TotalPeers,
+		CollectedAt:         time.Now().UTC(),
+		UptimeSeconds:       int64(time.Since(e.startedAt).Seconds()),
+		HeldTorrents:        len(held),
+		SeedingTorrents:     seeding,
+		DiskUsedBytes:       diskUsed,
+		DiskLimitBytes:      diskLimit,
+		UsefulBytesUploaded: stats.PeerConns.BytesWrittenData.Int64(),
+		UsefulBytesDownloaded: stats.PeerConns.BytesReadUsefulData.Int64(),
+		TotalBytesUploaded:  stats.PeerConns.BytesWritten.Int64(),
+		TotalBytesDownloaded: stats.PeerConns.BytesRead.Int64(),
+		ActivePeers:         stats.TotalPeers,
 	}
 }
 
@@ -77,8 +85,12 @@ func (e *Engine) logAndSaveRuntimeStats(kind string) {
 		"disk_used", humanBytes(s.DiskUsedBytes),
 		"disk_limit", humanBytes(s.DiskLimitBytes),
 		"disk_used_pct", s.DiskUsedPct(),
-		"uploaded", humanBytes(s.BytesUploaded),
-		"downloaded", humanBytes(s.BytesDownloaded),
+		"uploaded_useful", humanBytes(s.UsefulBytesUploaded),
+		"downloaded_useful", humanBytes(s.UsefulBytesDownloaded),
+		"uploaded_total", humanBytes(s.TotalBytesUploaded),
+		"downloaded_total", humanBytes(s.TotalBytesDownloaded),
+		"upload_rate_avg", netstats.HumanBitsPerSec(s.UploadBitsPerSec()),
+		"download_rate_avg", netstats.HumanBitsPerSec(s.DownloadBitsPerSec()),
 		"peers", s.ActivePeers,
 		"uptime", s.Uptime().String(),
 	)

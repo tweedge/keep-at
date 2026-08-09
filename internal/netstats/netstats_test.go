@@ -120,16 +120,18 @@ func TestRuntimeStatsRoundTrip(t *testing.T) {
 	}
 
 	want := RuntimeStats{
-		CollectedAt:      time.Now().UTC(),
-		UptimeSeconds:    3600,
-		HeldTorrents:     12,
-		SeedingTorrents:  10,
+		CollectedAt:         time.Now().UTC(),
+		UptimeSeconds:       3600,
+		HeldTorrents:        12,
+		SeedingTorrents:     10,
 		DownloadingTorrents: 2,
-		DiskUsedBytes:    50 << 30,
-		DiskLimitBytes:   100 << 30,
-		BytesUploaded:    5 << 30,
-		BytesDownloaded:  1 << 30,
-		ActivePeers:      24,
+		DiskUsedBytes:       50 << 30,
+		DiskLimitBytes:      100 << 30,
+		UsefulBytesUploaded: 5 << 30,
+		UsefulBytesDownloaded: 1 << 30,
+		TotalBytesUploaded:  8 << 30,
+		TotalBytesDownloaded: 2 << 30,
+		ActivePeers:         24,
 	}
 	if err := SaveRuntime(path, want); err != nil {
 		t.Fatalf("SaveRuntime: %v", err)
@@ -161,5 +163,39 @@ func TestRuntimeStatsDiskUsedPct(t *testing.T) {
 		if got := s.DiskUsedPct(); got != c.wantPct {
 			t.Errorf("%s: DiskUsedPct() = %v, want %v", c.name, got, c.wantPct)
 		}
+	}
+}
+
+func TestHumanBitsPerSec(t *testing.T) {
+	cases := []struct {
+		bps  float64
+		want string
+	}{
+		{0, "0 bps"},
+		{-5, "0 bps"},
+		{512, "512 bps"},
+		{1500, "1.5 kbps"},
+		{5e6, "5.0 mbps"},
+		{2e9, "2.0 gbps"},
+	}
+	for _, c := range cases {
+		if got := HumanBitsPerSec(c.bps); got != c.want {
+			t.Errorf("HumanBitsPerSec(%v) = %q, want %q", c.bps, got, c.want)
+		}
+	}
+}
+
+func TestRuntimeStatsRates(t *testing.T) {
+	// 8 GiB total transferred over 1 hour = 8 * 1024^3 bytes * 8 bits / 3600s.
+	s := RuntimeStats{UptimeSeconds: 3600, TotalBytesUploaded: 1 << 30, TotalBytesDownloaded: 2 << 30}
+	if got := s.UploadBitsPerSec(); got != float64(1<<30)*8/3600 {
+		t.Errorf("UploadBitsPerSec = %v", got)
+	}
+	if got := s.DownloadBitsPerSec(); got != float64(2<<30)*8/3600 {
+		t.Errorf("DownloadBitsPerSec = %v", got)
+	}
+	zero := RuntimeStats{UptimeSeconds: 0}
+	if got := zero.UploadBitsPerSec(); got != 0 {
+		t.Errorf("zero uptime UploadBitsPerSec = %v, want 0", got)
 	}
 }
