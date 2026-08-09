@@ -1,8 +1,44 @@
-## v0.5.0 - batched tracker scrapes and detailed scan statistics
+## v0.5.1 - bugfix: revert batched scrapes, stop logging the API key, smoke-test at scale
 
-Full-catalog scrapes were dominated by one rate-limited HTTP request per candidate: every candidate's tracker was scraped individually (and AT torrents list two AT trackers, so it was often two). keep-at now **batches tracker scrapes** - a single BEP 48 multi-hash scrape request covers up to 64 candidates per tracker, with one rate-limiter wait per batch instead of per candidate. The scrape phase drops from thousands of rate-limited requests to a few dozen, which is the dominant structural speedup for a large catalog. Scrapes only ever target Academic Torrents' own trackers now (AT is authoritative for AT torrents); dead third-party trackers, which previously cost a 15-second timeout each, are skipped during the scan.
+### Reverted: batched multi-hash tracker scrapes
 
-When a scrape completes, keep-at also logs a detailed breakdown of what the scan actually did:
+v0.5.0 briefly included an attempt to batch tracker scrapes into multi-hash (BEP 48) requests. Real-world testing showed **Academic Torrents' tracker does not support multi-hash scrapes** - it returns data for only one hash per request, silently dropping the rest. With 64 candidates per batch, that made 63 of every 64 look unscrapeable, so almost the whole catalog was skipped as "could not scrape trackers". keep-at now scrapes one candidate per tracker request again, which is what AT actually supports.
+
+### Fixed: API key no longer appears in logs
+
+The startup warning logged the configured Academic Torrents API key when the `userannounce` resolution failed. Even though the `pass=` portion was redacted, the key's `uid=` portion was still written to the log. The key (and its uid) is now never logged at all.
+
+### New: real-catalog subset smoke test
+
+The two-item smoke test was too small to catch the batched-scrape regression - with only two candidates, no batch ever held more than one hash. keep-at now has a second, scale-realistic smoke test (`KEEPAT_SMOKE_SUBSET=1`) that:
+
+- fetches the live catalog and takes the smallest ~100 entries by size,
+- runs a real scan out of /tmp against live Academic Torrents,
+- asserts structural invariants: every candidate that survived evaluation issued a tracker scrape (`scrape_requests >= eligible` - the exact invariant batching violated), scrape failures stay under half of processed, the scan finishes within the time budget, and at least one held torrent completes a real download with data on disk.
+
+The 100-item run completes in roughly five minutes on a normal connection. See docs/DESIGN.md under "The smoke test standard" for the full writeup, and the rule: scale-sensitive behavior gets asserted in the subset test, not just the two-item one.
+
+---
+
+## v0.5.0 - detailed scan statistics
+
+When a scrape completes, keep-at now logs a detailed breakdown of what the scan actually did, so operators can see how much work actually hit Academic Torrents versus keep-at's caches, how big the library is, and why individual candidates were skipped:
+
+```
+scrape complete, updating what keep-at holds available=2 processed=2 total=2 elapsed=14s
+  library_size=1M metadata_fetched=2 metadata_cached=0
+  scrape_requests=2 scrape_cached=0
+  skipped_held=0 skipped_blocked=0 skipped_age=0 skipped_fetch_err=0 skipped_scrape_err=0
+  eligible=2
+```
+
+- `library_size` - total bytes of the whole catalog
+- `metadata_fetched` / `metadata_cached` - `.torrent` files pulled from AT vs served from keep-at's on-disk torrent cache
+- `scrape_requests` / `scrape_cached` - tracker scrapes issued vs reused from the swarm cache
+- `skipped_*` - candidates skipped, by reason (already held, keyword-blocked, too new, metadata fetch failed, tracker scrape failed)
+- `eligible` - candidates that made it through evaluation and can be added
+
+(A note for anyone who ran an early v0.5.0: an attempt at batching tracker scrapes into multi-hash requests was briefly included, but Academic Torrents' tracker does not support BEP 48 multi-hash scrapes - it returns data for only one hash per request - so batching made most candidates appear unscrapeable and was removed. keep-at scrapes one candidate per tracker request, which is what AT supports.)
 
 ```
 scrape complete, updating what keep-at holds available=2 processed=2 total=2 elapsed=14s

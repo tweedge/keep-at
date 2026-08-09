@@ -82,6 +82,12 @@ type Engine struct {
 	// for the "since boot" transfer and uptime figures in RuntimeStats.
 	startedAt time.Time
 
+	// lastScanStats is the most recent scan's counters (see scanStats),
+	// retained after ScanOnce returns so tests and callers can assert on
+	// what the scan actually did. Guarded by the same lock that serializes
+	// scans (Run runs one scan at a time), so no extra synchronization.
+	lastScanStats *scanStats
+
 	catalogFetcher *atcatalog.Fetcher
 	torrentFetcher *attorrent.Fetcher
 	httpClient     *http.Client
@@ -175,7 +181,7 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		cancel()
 		if err != nil {
 			logger.Warn("could not resolve Academic Torrents API key to a user announce URL; seeded torrents won't be attributed to your account",
-				"api_key", sanitizeAPIKey(cfg.APIKey), "err", err)
+				"err", err)
 		} else {
 			userAnnounceURL, userAnnounceIPv6URL = ua, ua6
 			logger.Info("Academic Torrents API key resolved; seeded torrents will be attributed to your account")

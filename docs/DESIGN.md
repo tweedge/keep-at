@@ -132,6 +132,23 @@ The first scan still takes a while (it must fetch and scrape the catalog once, a
 
 After the fixes above, a real run against the entire live catalog (2,850 items, 10GB cap in `/tmp`) completed its first full scan in 4h19m with zero crashes and bounded memory (peaked around 5GB, not the tens of gigabytes it was on track for before the mid-scan probe reset), selected 538 torrents to hold, and stayed stable for another 2+ hours of real downloading and seeding afterward. Every fix above was found and confirmed this way - none of them reproduced in anything smaller than the real catalog at real duration.
 
+### The smoke test standard
+
+That "small runs won't reproduce scale bugs" lesson is exactly why keep-at has two levels of live smoke test, both skipped unless explicitly opted in:
+
+- **`KEEPAT_SMOKE_TEST=1`** - the fast one. Two hand-picked, verified-seeded torrents through the whole pipeline (catalog -> `.torrent` fetch -> scrape -> probe -> download -> store) in under a minute. Good for a quick "is the plumbing connected" check, but too small to exercise anything scale-dependent.
+
+- **`KEEPAT_SMOKE_SUBSET=1`** - the real one, aimed at fitting in ~10 minutes. It fetches the live catalog, takes the smallest ~100 entries by size (the most likely to still be seeded), runs a real scan out of `/tmp`, and **asserts structural invariants rather than "didn't crash"**:
+
+  - every candidate that survived evaluation actually issued a tracker scrape (`scrape_requests >= eligible`) - this is what catches a change like batching scrapes into multi-hash requests, which AT's tracker silently doesn't support;
+  - scrape failures stay under half of processed candidates;
+  - the scan actually finishes within the time budget (`processed == catalog size`);
+  - at least one held torrent completes a real download with data on disk.
+
+  Run it with `KEEPAT_SMOKE_SUBSET=1 go test ./internal/engine/ -run TestSmokeRealCatalogSubset -timeout 15m -v`. `KEEPAT_SMOKE_SIZE` and `KEEPAT_SMOKE_RATE` tune the catalog count and requests/second to AT. On a normal connection the 100-item scan completes in roughly five minutes.
+
+The rule of thumb for new behavior that could interact with the catalog at scale: add it to the subset test's invariants, not just the two-item test. The batched-scrape regression was shipped because the two-item test looked like enough - it wasn't.
+
 ## Storage
 
 keep-at stores each verified piece as its own gzip-compressed file, keyed by piece index under a directory named after the torrent's infohash. There's no attempt to reconstruct the original file layout on disk - keep-at prioritized conflict-free, efficient local storage, rather than being locally readable. Giving up on that constraint makes per-piece compression simple. Deleting a torrent just removes its directory and pieces.

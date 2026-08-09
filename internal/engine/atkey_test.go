@@ -113,12 +113,3 @@ func TestKeyedTrackersNoKeyPassesThrough(t *testing.T) {
 		t.Errorf("keyedTrackers with no key changed the list: %v", got)
 	}
 }
-
-func TestSanitizeAPIKey(t *testing.T) {
-	if s := sanitizeAPIKey("uid=19791;pass=596a3c9973a5eecf2dcd68d1d7e55493"); strings.Contains(s, "596a3c9973a5eecf2dcd68d1d7e55493") {
-		t.Errorf("sanitizeAPIKey leaked the pass: %q", s)
-	}
-	if !strings.Contains(sanitizeAPIKey("uid=19791;pass=x"), "pass=<redacted>") {
-		t.Errorf("sanitizeAPIKey didn't redact pass: %q", sanitizeAPIKey("uid=19791;pass=x"))
-	}
-}

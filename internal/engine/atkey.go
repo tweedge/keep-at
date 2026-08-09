@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 )
 
 // userAnnounceEndpoint is Academic Torrents' per-user announce resolution
@@ -118,13 +117,4 @@ func keyedTrackers(trackers [][]string, userAnnounce, userAnnounceIPv6 string) [
 		out = append(out, newTier)
 	}
 	return out
-}
-
-// sanitizeAPIKey renders a key for logging without exposing the pass/secret
-// portion. The uid is not secret; the pass is.
-func sanitizeAPIKey(apiKey string) string {
-	if i := strings.Index(apiKey, "pass="); i >= 0 {
-		return apiKey[:i] + "pass=<redacted>"
-	}
-	return "<redacted>"
 }
