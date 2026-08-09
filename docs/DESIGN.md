@@ -111,7 +111,7 @@ A real full-catalog run crashed with a nil pointer dereference deep inside anacr
 A full-catalog scrape can run for a long time (see above), and a log that goes quiet for that long looks the same whether keep-at is working or stuck. Three log lines mark the phase:
 
 * `"starting scrape"`, once, right before evaluation begins - stating explicitly that it can take a while, and that downloads start gradually as the highest-priority candidates are found rather than waiting for the whole scrape to finish (see "Scans act incrementally" below).
-* `"scrape in progress"`, every `progressLogInterval` (2 minutes) while it runs, with percent complete and an ETA.
+* `"scrape in progress"`, every `progressLogInterval` (5 minutes) while it runs, with percent complete and an ETA.
 * `"scrape complete, updating what keep-at holds"`, once, when it finishes, right before acting on the results.
 
 The ETA is a straight-line extrapolation - elapsed time divided by candidates processed so far, multiplied by candidates remaining - not a measured prediction. It assumes the rest of the catalog behaves like what's already been seen, which mostly holds since Academic Torrents rate limiting dominates the per-candidate cost fairly evenly, but it's a rough guide, not a countdown to trust precisely.
@@ -125,6 +125,8 @@ keep-at used to evaluate the entire pending candidate list before acting on anyt
 - **Swarm probing moved to decision time.** The anti-cascade probe (which waits several seconds per candidate to count other keep-at nodes) used to run for every available candidate during evaluation. It now runs only for the candidates keep-at is actually about to act on, so probe time drops from "every available candidate" to "everything we decide to seed."
 
 - **Acting is windowed by the torrent cap.** Each batch, keep-at ranks everything evaluated so far and acts only on the top `min(maxTorrents, evaluated)` candidates. Because `maxTorrents` is the most torrents keep-at can hold (see the RAM section), this guarantees it never seeds something that is not genuinely among the best it could hold, while still filling the best slots early. Lower-priority candidates evaluated later only get acted on if they earn a place in that top window.
+
+- **Evaluated candidates stay lightweight.** The incremental model keeps every evaluated candidate around for the whole scan (ranking re-considers the running top window each batch). What it keeps is deliberately *small*: just title, infohash, size, and scraped swarm counts. The full parsed `.torrent` metadata - whose piece-hash arrays scale with the library's total size, not its torrent count - is written to `torrent-cache/` during evaluation and re-read from disk only when keep-at actually acts on a candidate. A full-catalog scan's memory footprint is therefore proportional to the number of candidates, not the size of the library, which is what keeps keep-at usable on a 1 GB-RAM device. To keep ranking work proportional too, acting happens once per `evaluateConcurrency` arrivals rather than once per candidate (plus a final flush), so the per-arrival re-rank is bounded instead of O(N² log N) across the whole scan.
 
 The first scan still takes a while (it must fetch and scrape the catalog once, and probes the torrents it actually chooses), but configured storage stops sitting idle: the most urgent torrents start seeding within minutes, not after the full walk.
 

@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anacrolix/torrent/metainfo"
+
 	"github.com/tweedge/keep-at/internal/atcatalog"
 	"github.com/tweedge/keep-at/internal/attorrent"
 	"github.com/tweedge/keep-at/internal/filter"
@@ -41,7 +43,7 @@ const progressSaveInterval = 2 * time.Second
 // this one is meant to reassure an operator watching the log that a
 // scrape that can run for a long time on a large catalog is still making
 // progress, without flooding the log while it does.
-const progressLogInterval = 2 * time.Minute
+const progressLogInterval = 5 * time.Minute
 
 // probeClientResetInterval bounds how many candidates' worth of probed
 // torrents accumulate in the probe client (see resetProbeClient) before
@@ -71,10 +73,20 @@ const probeClientResetInterval = 250
 // deliberately NOT done here - it waits several seconds per candidate and is
 // only needed at the moment of decision, so tryAdd probes on demand for just
 // the candidates keep-at is actually about to act on.
+//
+// It deliberately carries only the lightweight facts ranking needs (title,
+// infohash, size, swarm counts) rather than the full parsed .torrent
+// metadata. The full metadata - whose piece-hash arrays are the dominant
+// memory cost of a scan - is cached to disk in torrent-cache by
+// fetchMetadata and is re-read from there only when keep-at actually acts on
+// a candidate (see actOnCandidate). This keeps a full-catalog scan's memory
+// footprint proportional to the number of candidates, not to the total size
+// of the library, which is what makes keep-at usable on a 1GB-RAM device.
 type evaluatedCandidate struct {
-	title    string
-	metadata *attorrent.Metadata
-	swarm    attorrent.SwarmCounts
+	title     string
+	infoHash  metainfo.Hash
+	sizeBytes int64
+	swarm     attorrent.SwarmCounts
 }
 
 // scanStats accumulates what a single scan actually did, so the completion
@@ -175,13 +187,23 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	processed := 0
 	ramBound := heldCount >= e.maxTorrents
 
+	// Act incrementally, but not on every single candidate. actOnWindowed
+	// re-ranks everything evaluated so far each time it's called, so acting
+	// per-candidate would make ranking O(N^2 log N) across a full-catalog
+	// scan. Evaluating and acting once per evaluateConcurrency arrivals keeps
+	// the "top candidates start seeding within minutes" property while
+	// keeping ranking work proportional to N * log N (plus one final flush
+	// for whatever the last partial batch leaves).
+	actEvery := evaluateConcurrency
 	for c := range candChan {
 		processed++
 		evaluated = append(evaluated, c)
-		// Act on whatever is currently in the top window and not yet acted
-		// on. As more candidates arrive, the top window shifts and we act on
-		// the new arrivals that earn a slot; candidates that fall out of the
-		// window simply never get acted on (they weren't worth it).
+		if processed%actEvery == 0 {
+			ramBound = heldCount >= e.maxTorrents
+			e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker)
+		}
+	}
+	if len(evaluated) > 0 {
 		ramBound = heldCount >= e.maxTorrents
 		e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker)
 	}
@@ -241,7 +263,7 @@ func (e *Engine) actOnWindowed(ctx context.Context, evaluated []evaluatedCandida
 	}
 	for i := 0; i < window; i++ {
 		c := ranked[i]
-		key := c.metadata.InfoHash.HexString()
+		key := c.infoHash.HexString()
 		if acted[key] {
 			continue
 		}
@@ -460,7 +482,16 @@ func (e *Engine) evaluateOneCandidate(ctx context.Context, item atcatalog.Item, 
 	// No swarm probe here: probing waits several seconds per candidate and is
 	// only needed at decision time, so tryAdd does it on demand for just the
 	// candidates keep-at is about to act on.
-	return evaluatedCandidate{title: item.Title, metadata: md, swarm: swarm}, true
+	//
+	// Only lightweight facts are carried onward (see evaluatedCandidate); the
+	// full metadata is already cached to disk by fetchMetadata and will be
+	// re-read from there if this candidate is acted on.
+	return evaluatedCandidate{
+		title:     item.Title,
+		infoHash:  item.InfoHash,
+		sizeBytes: md.Info.TotalLength(),
+		swarm:     swarm,
+	}, true
 }
 
 func (e *Engine) saveNetworkStats(snapshot netstats.Snapshot) {
@@ -511,13 +542,13 @@ func rankEvaluated(candidates []evaluatedCandidate, ramBound bool) []evaluatedCa
 	byHash := make(map[string]evaluatedCandidate, len(candidates))
 	for i, c := range candidates {
 		sel[i] = selector.Candidate{
-			InfoHash:  c.metadata.InfoHash,
+			InfoHash:  c.infoHash,
 			Title:     c.title,
-			SizeBytes: c.metadata.Info.TotalLength(),
+			SizeBytes: c.sizeBytes,
 			Seeders:   c.swarm.Seeders,
 			Leechers:  c.swarm.Leechers,
 		}
-		byHash[c.metadata.InfoHash.HexString()] = c
+		byHash[c.infoHash.HexString()] = c
 	}
 
 	ranked := selector.RankCandidates(sel, ramBound)
@@ -540,7 +571,20 @@ func rankEvaluated(candidates []evaluatedCandidate, ramBound bool) []evaluatedCa
 // keep-at is holding the maximum number of torrents its RAM budget allows, it
 // stops adding new ones and only swaps (which keeps or lowers the count).
 func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldCount *int, tracker *netstats.Tracker) {
-	sizeBytes := c.metadata.Info.TotalLength()
+	// Re-read the full metadata from keep-at's on-disk torrent cache now
+	// that we're actually about to act on this candidate. It was fetched (and
+	// cached) during evaluation but deliberately not kept in memory - the
+	// piece-hash arrays are the biggest single memory cost of a scan, and
+	// keeping them only for the handful of candidates acted on is what makes
+	// keep-at's scan footprint work on small-RAM devices. This read hits the
+	// torrent-cache directory, never the network.
+	md, err := e.fetchMetadata(ctx, c.infoHash, nil)
+	if err != nil {
+		e.logger.Warn("could not reload cached metadata for candidate", "title", c.title, "err", err)
+		return
+	}
+
+	sizeBytes := md.Info.TotalLength()
 
 	// Probe this candidate's swarm on demand - only now, at decision time,
 	// not during catalog evaluation. This is the anti-cascade signal
@@ -549,7 +593,7 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 	// actually about to act on, so it's a tiny fraction of the old cost.
 	keepAtPeers := 0
 	if c.swarm.Seeders+c.swarm.Leechers > 0 {
-		observed, err := e.probeSwarm(ctx, c.metadata.MetaInfo, e.probeTimeout)
+		observed, err := e.probeSwarm(ctx, md.MetaInfo, e.probeTimeout)
 		if err != nil {
 			e.logger.Warn("could not probe swarm", "title", c.title, "err", err)
 		}
@@ -569,7 +613,7 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 	// the cap as a backstop.
 	if heldCount == nil || *heldCount < e.maxTorrents {
 		if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeBytes, rand.Float64()); err == nil {
-			if e.tryAdd(c, sizeBytes, location, nil, heldCount, keepAtPeers) {
+			if e.tryAdd(c, md, sizeBytes, location, nil, heldCount, keepAtPeers) {
 				return
 			}
 		}
@@ -578,7 +622,7 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 			"title", c.title, "held", *heldCount, "max_torrents", e.maxTorrents)
 	}
 
-	e.trySwap(c, sizeBytes, heldCount, keepAtPeers)
+	e.trySwap(c, md, sizeBytes, heldCount, keepAtPeers)
 }
 
 // tryAdd runs the anti-cascade decision and, if it passes, starts downloading
@@ -590,7 +634,7 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 // can bump it (a swap passes a non-nil displaced and keeps the count
 // constant). A plain fill past the RAM-driven torrent cap is rejected
 // outright: RAM scales per-torrent, so the count cap is the real memory bound.
-func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, displaced []selector.Held, heldCount *int, keepAtPeers int) bool {
+func (e *Engine) tryAdd(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, location string, displaced []selector.Held, heldCount *int, keepAtPeers int) bool {
 	if heldCount != nil && displaced == nil && *heldCount >= e.maxTorrents {
 		e.logger.Debug("rejected candidate: would exceed RAM-driven torrent cap",
 			"title", c.title, "held", *heldCount, "max_torrents", e.maxTorrents)
@@ -598,7 +642,7 @@ func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, 
 	}
 
 	candidate := selector.Candidate{
-		InfoHash:    c.metadata.InfoHash,
+		InfoHash:    c.infoHash,
 		Title:       c.title,
 		SizeBytes:   sizeBytes,
 		Seeders:     c.swarm.Seeders,
@@ -614,7 +658,7 @@ func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, 
 		return false
 	}
 
-	if err := e.AddCandidate(c.metadata, location, sizeBytes, c.title); err != nil {
+	if err := e.AddCandidate(md, location, sizeBytes, c.title); err != nil {
 		e.logger.Error("failed to add candidate", "title", c.title, "err", err)
 		return false
 	}
@@ -638,7 +682,7 @@ func (e *Engine) tryAdd(c evaluatedCandidate, sizeBytes int64, location string, 
 // the largest torrents that fit - which is exactly the "prioritize larger
 // torrents when RAM is the binding constraint" behavior. keepAtPeers is the
 // on-demand swarm-probe count from the caller, fed into the swap decision.
-func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64, heldCount *int, keepAtPeers int) {
+func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, heldCount *int, keepAtPeers int) {
 	ramBound := heldCount != nil && *heldCount >= e.maxTorrents
 	held := e.state.All()
 
@@ -658,7 +702,7 @@ func (e *Engine) trySwap(c evaluatedCandidate, sizeBytes int64, heldCount *int, 
 			selHeld[i] = selector.Held{InfoHash: h.InfoHash, Title: h.Title, SizeBytes: h.SizeBytes, Seeders: h.LastKnownSeeders}
 		}
 
-		if e.tryAdd(c, sizeBytes, location, selHeld, heldCount, keepAtPeers) {
+		if e.tryAdd(c, md, sizeBytes, location, selHeld, heldCount, keepAtPeers) {
 			for _, h := range displaced {
 				if err := e.RemoveTorrent(h.InfoHash, h.StorageLocation); err != nil {
 					e.logger.Error("failed to remove displaced torrent", "title", h.Title, "err", err)
