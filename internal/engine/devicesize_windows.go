@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"syscall"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/tweedge/keep-at/internal/config"
 )
@@ -37,34 +38,37 @@ func resolveAllLimits(cfg config.Config, logger *slog.Logger) (config.Config, er
 	return cfg, nil
 }
 
-func deviceTotalBytes(path string) (int64, error) {
+func volumeFreeSpace(path string) (freeAvail, total, freeTotal uint64, err error) {
 	dir := path
 	for {
-		var freeAvail, total, freeTotal uint64
-		err := syscall.GetDiskFreeSpaceEx(syscall.StringToUTF16Ptr(dir), &freeAvail, &total, &freeTotal)
+		dirPtr, convErr := windows.UTF16PtrFromString(dir)
+		if convErr != nil {
+			return 0, 0, 0, convErr
+		}
+		err = windows.GetDiskFreeSpaceEx(dirPtr, &freeAvail, &total, &freeTotal)
 		if err == nil {
-			return int64(total), nil
+			return freeAvail, total, freeTotal, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return 0, fmt.Errorf("no existing ancestor of %s to query", path)
+			return 0, 0, 0, fmt.Errorf("no existing ancestor of %s to query: %w", path, err)
 		}
 		dir = parent
 	}
 }
 
-func deviceFreeBytes(path string) (int64, error) {
-	dir := path
-	for {
-		var freeAvail, total, freeTotal uint64
-		err := syscall.GetDiskFreeSpaceEx(syscall.StringToUTF16Ptr(dir), &freeAvail, &total, &freeTotal)
-		if err == nil {
-			return int64(freeAvail), nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return 0, fmt.Errorf("no existing ancestor of %s to query", path)
-		}
-		dir = parent
+func deviceTotalBytes(path string) (int64, error) {
+	_, total, _, err := volumeFreeSpace(path)
+	if err != nil {
+		return 0, err
 	}
+	return int64(total), nil
+}
+
+func deviceFreeBytes(path string) (int64, error) {
+	freeAvail, _, _, err := volumeFreeSpace(path)
+	if err != nil {
+		return 0, err
+	}
+	return int64(freeAvail), nil
 }
