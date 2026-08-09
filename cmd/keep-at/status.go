@@ -30,7 +30,11 @@ func cmdStatus(args []string) error {
 	if status.Running {
 		fmt.Printf("keep-at is running (pid %d)\n", status.PID)
 	} else if pid, ok := daemonctl.FindForeground(dir); ok {
-		fmt.Printf("keep-at is running in the foreground (pid %d), not as a service\n", pid)
+		if pid > 0 {
+			fmt.Printf("keep-at is running in the foreground (pid %d), not as a service\n", pid)
+		} else {
+			fmt.Println("keep-at is running in the foreground, not as a service")
+		}
 	} else {
 		fmt.Println("keep-at is not running")
 	}

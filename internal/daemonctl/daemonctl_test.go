@@ -1,6 +1,7 @@
 package daemonctl
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -98,5 +99,28 @@ func TestConfigDataDirFromFile(t *testing.T) {
 	}
 	if got := configDataDirFromFile("/nonexistent.yaml"); got != config.DefaultDataDir() {
 		t.Errorf("missing config should fall back to default, got %q", got)
+	}
+}
+
+func TestRuntimeStatsFresh(t *testing.T) {
+	dir := t.TempDir()
+	if runtimeStatsFresh(dir) {
+		t.Fatal("no runtime-stats.json should mean not fresh")
+	}
+
+	path := filepath.Join(dir, "runtime-stats.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !runtimeStatsFresh(dir) {
+		t.Fatal("a just-written runtime-stats.json should be fresh")
+	}
+
+	old := time.Now().Add(-foregroundFreshWindow - time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if runtimeStatsFresh(dir) {
+		t.Fatal("a stale runtime-stats.json should not be fresh")
 	}
 }

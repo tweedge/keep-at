@@ -151,7 +151,25 @@ func processAlive(pid int) bool {
 // Status already reports it, so FindForeground is only consulted when there
 // is no (alive) PID file - i.e. the instance was genuinely started in the
 // foreground.
+//
+// On platforms without /proc (macOS, Windows) the process scan finds nothing,
+// so the check falls back to a portable liveness signal: the engine writes
+// runtime-stats.json into dataDir at startup and every stats_interval, so a
+// recently-modified file means a keep-at is running there. The PID is
+// unknown in that case (reported as 0).
 func FindForeground(dataDir string) (int, bool) {
+	if pid, ok := findForegroundProc(dataDir); ok {
+		return pid, true
+	}
+	if runtimeStatsFresh(dataDir) {
+		return 0, true
+	}
+	return 0, false
+}
+
+// findForegroundProc is the /proc-based process scan; it's a no-op (returns
+// not-found) on platforms where /proc doesn't exist.
+func findForegroundProc(dataDir string) (int, bool) {
 	selfPid := os.Getpid()
 
 	procs, err := os.ReadDir("/proc")
@@ -191,6 +209,24 @@ func FindForeground(dataDir string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// foregroundFreshWindow is how old runtime-stats.json may be before keep-at
+// is considered to have stopped. The engine writes it at startup and every
+// stats_interval (default 30 minutes), so a window comfortably larger than
+// that (plus one missed write) is enough to confirm liveness without
+// false-positiving on a file from a long-gone process.
+const foregroundFreshWindow = 2 * time.Hour
+
+// runtimeStatsFresh reports whether keep-at has written its runtime stats
+// into dataDir recently enough to be considered running. This is the
+// portable liveness check used on platforms without /proc.
+func runtimeStatsFresh(dataDir string) bool {
+	info, err := os.Stat(filepath.Join(dataDir, "runtime-stats.json"))
+	if err != nil {
+		return false
+	}
+	return time.Since(info.ModTime()) < foregroundFreshWindow
 }
 
 // processDataDir figures out which data dir a `keep-at run` process uses
