@@ -1,5 +1,28 @@
 # keep-at release notes
 
+## v0.6.0 - seed the torrents that need it
+
+keep-at exists to seed *minimally-seeded* torrents - not to put a copy on everything. That's now what the selection logic does, and restarting keep-at no longer re-scrapes the whole catalog needlessly.
+
+### Selection is gated on total seeders, not keep-at peer count
+
+Selection previously gated on how many other keep-at nodes were in a torrent's swarm (`n = aggressiveness ^ keep-at-peers`). With zero keep-at nodes present - the usual case - that roll always succeeded, so keep-at grabbed torrents with a dozen seeders that were already perfectly healthy.
+
+Selection now gates on the torrent's **total seeder count**:
+
+```
+n = aggressiveness ^ (seeders - 1)
+```
+
+- **1 seeder** is keep-at's primary target and passes with probability 1.
+- As seeders grow, the chance shrinks toward zero: 3 seeders -> 0.36, 12 seeders -> 0.36%, 20+ -> effectively never.
+
+A well-seeded torrent is no longer worth a slot, even when disk is free. The keep-at peer count is still gathered, logged per candidate, and reported by `keep-at network-status` - but it no longer drives selection; it's network-status metadata, as the design always intended.
+
+### Restarting no longer triggers an immediate re-scrape
+
+`keep-at run` used to scan immediately on every start. If the last scan completed recently (e.g. you restarted the next morning), keep-at now waits out the remainder of the scan interval instead of re-scraping the whole catalog. It reads the last completion time from `network-stats.json`, so a stale completion, a first run, or a previous process that died mid-scan still scans right away.
+
 ## v0.5.4 - portable foreground detection, honest transfer stats, age-gate off switch
 
 ### `keep-at status` detects foreground runs on every platform
