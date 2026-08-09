@@ -117,8 +117,8 @@ func (e *Engine) RemoveTorrent(infoHash metainfo.Hash, storageLocation string) e
 }
 
 // peerObservation is one connected peer that self-identified as keep-at,
-// with enough detail to feed both the anti-cascade decision (just the
-// count) and network-wide stats (node identity and seed/leech state).
+// with enough detail to feed network-wide stats (node identity and
+// seed/leech state) and to log the keep-at peer count as metadata.
 type peerObservation struct {
 	nodeKey  string // best-effort node identity, see netstats.Tracker's doc comment
 	complete bool   // whether this peer has every piece of this torrent

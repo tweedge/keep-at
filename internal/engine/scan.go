@@ -69,7 +69,7 @@ const probeClientResetInterval = 250
 
 // evaluatedCandidate is a catalog item keep-at has fetched metadata and a
 // fresh scrape for, and is ready to rank and possibly act on. The swarm
-// probe (which counts other keep-at nodes for the anti-cascade check) is
+// probe (which counts other keep-at nodes for network-status) is
 // deliberately NOT done here - it waits several seconds per candidate and is
 // only needed at the moment of decision, so tryAdd probes on demand for just
 // the candidates keep-at is actually about to act on.
@@ -337,10 +337,11 @@ func (e *Engine) refreshHeldSeederCounts(ctx context.Context, held []state.Torre
 // evaluateCandidates walks the catalog and streams, over the returned
 // channel, everything keep-at doesn't already hold, isn't keyword-blocked,
 // and has aged past the moderation delay - each with a fresh metadata fetch
-// (cached where possible) and tracker scrape. The swarm probe that feeds the
-// anti-cascade decision is deliberately NOT done here; it's expensive
-// (waits several seconds per candidate) and only needed at decision time, so
-// ScanOnce probes on demand for just the candidates it's about to act on.
+// (cached where possible) and tracker scrape. The swarm probe that counts
+// other keep-at nodes for network-status is deliberately NOT done here; it's
+// expensive (waits several seconds per candidate) and only needed at
+// decision time, so ScanOnce probes on demand for just the candidates it's
+// about to act on.
 //
 // Candidates are evaluated concurrently (see evaluateConcurrency) and emitted
 // as they complete, so ScanOnce can start acting on the highest-priority ones
@@ -587,10 +588,11 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 	sizeBytes := md.Info.TotalLength()
 
 	// Probe this candidate's swarm on demand - only now, at decision time,
-	// not during catalog evaluation. This is the anti-cascade signal
-	// (how many other keep-at nodes are already here) and the network-status
-	// peer data; it waits up to e.probeTimeout but only for torrents we're
-	// actually about to act on, so it's a tiny fraction of the old cost.
+	// not during catalog evaluation. This counts other keep-at nodes for
+	// network-status and peer data; it waits up to e.probeTimeout but only
+	// for torrents we're actually about to act on, so it's a tiny fraction
+	// of the old cost. The keep-at peer count is metadata only - selection
+	// is gated on total seeders, not on it (see selector.SelectionChance).
 	keepAtPeers := 0
 	if c.swarm.Seeders+c.swarm.Leechers > 0 {
 		observed, err := e.probeSwarm(ctx, md.MetaInfo, e.probeTimeout)
@@ -625,10 +627,13 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 	e.trySwap(c, md, sizeBytes, heldCount, keepAtPeers)
 }
 
-// tryAdd runs the anti-cascade decision and, if it passes, starts downloading
+// tryAdd runs the selection decision and, if it passes, starts downloading
 // the candidate into location. displaced is nil for a plain free-space fill.
-// keepAtPeers is the count of other keep-at nodes observed in this candidate's
-// swarm (gathered by the caller via probeSwarm), feeding the anti-cascade roll.
+// keepAtPeers is the count of other keep-at nodes observed in this
+// candidate's swarm (gathered by the caller via probeSwarm); it's recorded
+// for network-status and logged as metadata, but the selection gate itself
+// is keyed on total seeders - keep-at seeds minimally-seeded torrents, not
+// everything it sees.
 //
 // heldCount points at the running count of held torrents so a successful add
 // can bump it (a swap passes a non-nil displaced and keeps the count

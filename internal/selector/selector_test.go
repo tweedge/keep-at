@@ -5,36 +5,38 @@ import (
 	"testing"
 )
 
-func TestAntiCascadeChance(t *testing.T) {
+func TestSelectionChance(t *testing.T) {
 	cases := []struct {
 		name           string
 		aggressiveness float64
-		keepAtPeers    int
+		seeders        int
 		want           float64
 	}{
-		{"no other keep-at nodes", 0.6, 0, 1.0},
-		{"one other node", 0.6, 1, 0.6},
-		{"two other nodes", 0.6, 2, 0.36},
-		{"negative peers clamped to zero", 0.6, -5, 1.0},
+		{"single seeder is the primary target", 0.6, 1, 1.0},
+		{"two seeders", 0.6, 2, 0.6},
+		{"three seeders", 0.6, 3, 0.36},
+		{"seeders clamped to at least one", 0.6, 0, 1.0},
+		{"seeders clamped to at least one (negative)", 0.6, -5, 1.0},
 	}
 	for _, c := range cases {
-		got := AntiCascadeChance(c.aggressiveness, c.keepAtPeers)
+		got := SelectionChance(c.aggressiveness, c.seeders)
 		if math.Abs(got-c.want) > 1e-9 {
-			t.Errorf("%s: AntiCascadeChance(%v, %d) = %v, want %v", c.name, c.aggressiveness, c.keepAtPeers, got, c.want)
+			t.Errorf("%s: SelectionChance(%v, %d) = %v, want %v", c.name, c.aggressiveness, c.seeders, got, c.want)
 		}
 	}
 }
 
-func TestAntiCascadeChanceDecreasesAsNodesJoin(t *testing.T) {
-	// This is the whole point of the mechanism: each additional keep-at node
-	// already on a torrent should make it strictly less likely (or at least
-	// no more likely) that yet another node piles on.
+func TestSelectionChanceDecreasesAsSeedersIncrease(t *testing.T) {
+	// keep-at exists to seed minimally-seeded torrents: every additional
+	// seeder makes a torrent more healthy on its own, so it should be
+	// strictly less likely (or at least no more likely) that keep-at selects
+	// it. A torrent with many seeders is effectively never selected.
 	aggressiveness := 0.6
-	prev := AntiCascadeChance(aggressiveness, 0)
-	for n := 1; n <= 20; n++ {
-		cur := AntiCascadeChance(aggressiveness, n)
+	prev := SelectionChance(aggressiveness, 1)
+	for n := 2; n <= 20; n++ {
+		cur := SelectionChance(aggressiveness, n)
 		if cur >= prev {
-			t.Fatalf("chance did not decrease at keepAtPeers=%d: prev=%v cur=%v", n, prev, cur)
+			t.Fatalf("chance did not decrease at seeders=%d: prev=%v cur=%v", n, prev, cur)
 		}
 		prev = cur
 	}
@@ -101,7 +103,7 @@ func TestEvaluateSwapEnforcesSeedMargin(t *testing.T) {
 }
 
 func TestEvaluateSwapAllowsSwapWhenMarginMetAndRollSucceeds(t *testing.T) {
-	candidate := Candidate{Seeders: 1, KeepAtPeers: 0} // chance = 1.0 with 0 peers
+	candidate := Candidate{Seeders: 1, KeepAtPeers: 0} // chance = 1.0 with one seeder
 	displaced := []Held{{Seeders: 10}, {Seeders: 8}}   // min displaced = 8, margin 3 -> need <= 5
 
 	decision := EvaluateSwap(candidate, displaced, 3, 0.6, 0.999)
@@ -109,24 +111,30 @@ func TestEvaluateSwapAllowsSwapWhenMarginMetAndRollSucceeds(t *testing.T) {
 		t.Fatalf("expected swap to proceed, got %+v", decision)
 	}
 	if decision.Chance != 1.0 {
-		t.Fatalf("expected chance 1.0 with zero keep-at peers, got %v", decision.Chance)
+		t.Fatalf("expected chance 1.0 with a single seeder, got %v", decision.Chance)
 	}
 }
 
-func TestEvaluateSwapBacksOffWhenManyKeepAtPeersPresent(t *testing.T) {
-	candidate := Candidate{Seeders: 1, KeepAtPeers: 10}
-	// chance = 0.6^10 ~= 0.006; a roll of 0.5 should fail to swap.
+func TestEvaluateSwapBacksOffWhenManySeedersPresent(t *testing.T) {
+	// keep-at's purpose is to seed minimally-seeded torrents. A candidate
+	// with many seeders is already healthy on its own and should effectively
+	// never be selected, regardless of the keep-at peer count.
+	candidate := Candidate{Seeders: 12, KeepAtPeers: 0}
+	// chance = 0.6^11 ~= 0.0036; a roll of 0.5 should fail to swap.
 	decision := EvaluateSwap(candidate, nil, 3, 0.6, 0.5)
 	if decision.ShouldSwap {
-		t.Fatalf("expected swap to be rejected with many keep-at peers already present, got %+v", decision)
+		t.Fatalf("expected swap to be rejected for a well-seeded torrent, got %+v", decision)
 	}
 }
 
-func TestEvaluateSwapWithNoDisplacementSkipsMarginCheck(t *testing.T) {
-	// Used for filling free space, not just swapping - no torrents to beat.
+func TestEvaluateSwapWithNoDisplacementSkipsMarginCheckButStillGatesOnSeeders(t *testing.T) {
+	// Used for filling free space, not just swapping - no torrents to beat,
+	// so the margin check passes. But the seed-scarcity gate still applies:
+	// a torrent with many seeders shouldn't be filled just because space is
+	// free.
 	candidate := Candidate{Seeders: 100, KeepAtPeers: 0}
 	decision := EvaluateSwap(candidate, nil, 3, 0.6, 0.5)
-	if !decision.ShouldSwap {
-		t.Fatalf("expected swap to proceed when nothing is displaced, got %+v", decision)
+	if decision.ShouldSwap {
+		t.Fatalf("expected well-seeded torrent to be rejected even with free space, got %+v", decision)
 	}
 }

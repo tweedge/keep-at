@@ -8,19 +8,21 @@ Every scan, keep-at pulls Academic Torrents' catalog (`database.xml`), filters o
 
 Among available candidates, fewer seeds means higher priority. If keep-at has free space, it fills it with the highest-priority candidate it can. If space is full, it'll displace currently-held torrents for a new candidate, but only if the candidate has at least `min_seed_margin` (default 3) fewer seeds than everything it would replace.
 
-## Avoiding herd mentality
+## Seeding minimally-seeded torrents
 
-Before committing to a download, keep-at checks how many other keep-at nodes are already in that torrent's swarm (it identifies itself in the BitTorrent extended handshake, and looks for peers reporting the same string). This exists to stop every keep-at node globally from swapping to the same under-seeded torrent at once and just moving the problem somewhere else. The chance keep-at proceeds is:
+keep-at's purpose is to seed the torrents that need seeding - not to put a keep-at copy on everything. A torrent with one live seed is exactly what keep-at is for; a torrent with a dozen seeders is already healthy on its own and doesn't need keep-at's help. So before committing to a download, keep-at gates on how many seeders the torrent already has. The chance keep-at proceeds is:
 
 ```
-n = aggressiveness ^ (keep-at peers already in the swarm)
+n = aggressiveness ^ (seeders - 1)
 ```
 
-With zero other keep-at nodes present, n is 1: go ahead confidently. As more keep-at nodes join, n shrinks toward zero (aggressiveness defaults to 0.6, and is always between 0 and 1), so later nodes progressively back off. keep-at rolls a random float and proceeds only if the roll is below n.
+With a single seeder, n is 1: go ahead confidently - that's the primary target. As a torrent gains more seeders, n shrinks toward zero (aggressiveness defaults to 0.6, and is always between 0 and 1), so a torrent with many seeders is effectively never selected. keep-at rolls a random float and proceeds only if the roll is below n.
 
-This same anti-cascade check runs whether keep-at is filling free space or displacing something, so it also naturally discourages every keep-at node from racing to grab the same freshly-added torrent.
+This gate runs whether keep-at is filling free space or displacing something, so it applies even when there's plenty of empty disk - a well-seeded torrent isn't worth a slot that could go to one that actually needs it.
 
-One correction worth documenting: an earlier draft of this design described rolling *above* n to proceed. That's backwards from what n is defined to mean ("the chance keep-at swaps") and produces the opposite of the intended effect - a shrinking n would make later nodes pile on *more* eagerly, not less. keep-at implements the definition, not the inverted comparison: `selector.EvaluateSwap` swaps when `roll < n`.
+The number of other keep-at nodes in a torrent's swarm is deliberately **not** part of this gate. It's network-status data (see "Network-wide stats" below) and is logged as metadata per candidate, but it doesn't change whether keep-at selects a torrent. What matters is how healthy the torrent is overall, which only the total seeder count captures.
+
+One correction worth documenting: an earlier draft of this design described rolling *above* n to proceed. That's backwards from what n is defined to mean ("the chance keep-at swaps") and produces the opposite of the intended effect - a shrinking n would make keep-at select well-seeded torrents *more* eagerly, not less. keep-at implements the definition, not the inverted comparison: `selector.EvaluateSwap` swaps when `roll < n`.
 
 ## Multi-torrent swaps
 
@@ -44,7 +46,7 @@ Academic Torrents' `database.xml` doesn't include an upload date, and neither do
 
 ## Network-wide stats
 
-While scanning, keep-at briefly joins the swarm of every candidate anyone at all is seeding or leeching - the same probe that counts keep-at peers for the anti-cascade check - and records, per keep-at peer found: its (best-effort) node identity, and whether it has the whole torrent (seeding) or not (leeching). `keep-at network-status` reports the totals.
+While scanning, keep-at briefly joins the swarm of every candidate anyone at all is seeding or leeching, and records, per keep-at peer found: its (best-effort) node identity, and whether it has the whole torrent (seeding) or not (leeching). `keep-at network-status` reports the totals. This keep-at peer count is metadata only - it does not gate which torrents keep-at selects (see "Seeding minimally-seeded torrents" above).
 
 This is necessarily an estimate, not a census:
 
@@ -66,7 +68,7 @@ keep-at pins `github.com/anacrolix/torrent` to **v1.60.0**, the release immediat
 
 ### Why probing uses a second, disposable torrent client
 
-Independent of the above, probing a candidate's swarm (see "Avoiding herd mentality") works by adding a torrent just to inspect its peers - and earlier versions of this code dropped it again immediately afterward. Rapid add-then-drop across thousands of candidates per scan is exactly the kind of churn that triggers bugs like the one above, library version notwithstanding.
+Independent of the above, probing a candidate's swarm (see "Seeding minimally-seeded torrents") works by adding a torrent just to inspect its peers - and earlier versions of this code dropped it again immediately afterward. Rapid add-then-drop across thousands of candidates per scan is exactly the kind of churn that triggers bugs like the one above, library version notwithstanding.
 
 So probing now happens on a dedicated `*torrent.Client` that:
 
@@ -122,7 +124,7 @@ keep-at used to evaluate the entire pending candidate list before acting on anyt
 
 - **Scrape results are cached across scans.** `scrapeSwarm` remembers each torrent's seeder/leecher counts in `scrape-cache.json` (TTL = the scan interval). A weekly re-scan reuses last week's counts instead of re-querying Academic Torrents' tracker for every catalog item, so repeat scans cost almost nothing beyond the per-candidate swarm probe.
 
-- **Swarm probing moved to decision time.** The anti-cascade probe (which waits several seconds per candidate to count other keep-at nodes) used to run for every available candidate during evaluation. It now runs only for the candidates keep-at is actually about to act on, so probe time drops from "every available candidate" to "everything we decide to seed."
+- **Swarm probing moved to decision time.** The probe (which waits several seconds per candidate to count keep-at peers for network-status) used to run for every available candidate during evaluation. It now runs only for the candidates keep-at is actually about to act on, so probe time drops from "every available candidate" to "everything we decide to seed."
 
 - **Acting is windowed by the torrent cap.** Each batch, keep-at ranks everything evaluated so far and acts only on the top `min(maxTorrents, evaluated)` candidates. Because `maxTorrents` is the most torrents keep-at can hold (see the RAM section), this guarantees it never seeds something that is not genuinely among the best it could hold, while still filling the best slots early. Lower-priority candidates evaluated later only get acted on if they earn a place in that top window.
 
@@ -163,6 +165,6 @@ Cross-torrent deduplication (storing identical pieces once even if they appear i
 
 * **macOS and Windows service management.** The binary runs fine on both; `keep-at service install` doesn't (systemd/Linux only).
 * **Peer-map availability.** See "Reasoning quickly about availability" above.
-* **Authenticated node identity.** The anti-cascade check and network-status both trust the BitTorrent extended handshake's claimed client name at face value.
+* **Authenticated node identity.** network-status trusts the BitTorrent extended handshake's claimed client name at face value.
 * **Incremental action during a scan.** Done - see "Scans act incrementally, and re-scans are cheap" above.
 * **Pinned anacrolix/torrent version.** v1.61.0 has a crashing bug (see "Running against the real catalog"); keep-at is on v1.60.0 until a fix lands upstream.

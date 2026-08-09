@@ -14,12 +14,18 @@ import (
 // Candidate is a torrent keep-at is considering downloading, combining
 // catalog metadata with a fresh tracker scrape.
 type Candidate struct {
-	InfoHash    metainfo.Hash
-	Title       string
-	SizeBytes   int64
-	Seeders     int
-	Leechers    int
-	KeepAtPeers int // peers in the swarm that self-identified as keep-at, see buildinfo.ClientName
+	InfoHash  metainfo.Hash
+	Title     string
+	SizeBytes int64
+	Seeders   int
+	Leechers  int
+	// KeepAtPeers is how many other keep-at nodes were observed in the
+	// swarm, gathered by probing. It feeds network-status reporting and is
+	// logged as metadata; it deliberately does NOT drive the selection
+	// decision - keep-at exists to seed minimally-seeded torrents, so the
+	// gate below is keyed on total Seeders, not on how many keep-at nodes
+	// happen to be present.
+	KeepAtPeers int
 }
 
 // Available reports whether a candidate meets the availability bar: at
@@ -72,20 +78,27 @@ func RankCandidates(candidates []Candidate, ramBound bool) []Candidate {
 	return ranked
 }
 
-// AntiCascadeChance is n: the probability keep-at proceeds with a
-// candidate given how many other keep-at nodes are already on it. See
-// DESIGN.md for the full rationale.
+// SelectionChance is n: the probability keep-at proceeds with a candidate
+// given how many seeders it already has. See DESIGN.md for the full
+// rationale.
 //
-// With zero other keep-at nodes present, n is 1: go ahead confidently. As
-// more keep-at nodes join the swarm, n shrinks toward zero, since
-// aggressiveness is strictly between 0 and 1. This is the direction that
-// actually prevents a cascade - later keep-at nodes progressively back off
-// from a torrent the swarm has already piled onto.
-func AntiCascadeChance(aggressiveness float64, keepAtPeers int) float64 {
-	if keepAtPeers < 0 {
-		keepAtPeers = 0
+// keep-at's purpose is to seed minimally-seeded torrents - not to put a
+// keep-at copy on everything. A torrent with one live seed is exactly what
+// keep-at is for, so n is 1 there (go ahead confidently). As a torrent
+// gains more seeders it's increasingly healthy on its own, and n shrinks
+// toward zero (aggressiveness is strictly between 0 and 1), so well-seeded
+// torrents are effectively never selected. This is the direction that
+// matters: keep-at should spend its slots on the torrents that need them,
+// not pile copies onto ones that are already fine.
+//
+// Note this is deliberately keyed on TOTAL seeders, not on how many other
+// keep-at nodes are in the swarm. The keep-at peer count is network-status
+// metadata (see Candidate.KeepAtPeers); it doesn't gate selection.
+func SelectionChance(aggressiveness float64, seeders int) float64 {
+	if seeders < 1 {
+		seeders = 1
 	}
-	return math.Pow(aggressiveness, float64(keepAtPeers))
+	return math.Pow(aggressiveness, float64(seeders-1))
 }
 
 // MeetsSeedMargin reports whether candidateSeeders is at least minSeedMargin
@@ -117,8 +130,14 @@ type SwapDecision struct {
 
 // EvaluateSwap decides whether to start downloading candidate, optionally
 // displacing the torrents in displaced to make room. It swaps when roll <
-// n: see DESIGN.md for why that comparison direction, not the reverse, is
-// what actually discourages a cascade.
+// n: see DESIGN.md for why that comparison direction is what actually
+// keeps keep-at from wasting slots on torrents that are already healthy.
+//
+// The gate (n) is keyed on the candidate's TOTAL seeders: a torrent with
+// one seed is keep-at's primary target and passes confidently, while a
+// torrent with many seeds - already healthy on its own - is effectively
+// never selected. The keep-at peer count (Candidate.KeepAtPeers) does not
+// gate selection; it's network-status metadata only.
 //
 // roll must be a fresh uniform [0, 1) draw per call; it's a parameter
 // rather than generated internally so this stays deterministic to test.
@@ -131,12 +150,12 @@ func EvaluateSwap(candidate Candidate, displaced []Held, minSeedMargin int, aggr
 		return SwapDecision{ShouldSwap: false, Reason: "candidate does not beat displaced torrents by the required margin"}
 	}
 
-	chance := AntiCascadeChance(aggressiveness, candidate.KeepAtPeers)
+	chance := SelectionChance(aggressiveness, candidate.Seeders)
 	shouldSwap := roll < chance
 
-	reason := "anti-cascade roll succeeded"
+	reason := "seed-scarcity roll succeeded"
 	if !shouldSwap {
-		reason = "anti-cascade roll failed; backing off while other keep-at nodes are already on this torrent"
+		reason = "seed-scarcity roll failed; candidate already has enough seeders"
 	}
 
 	return SwapDecision{ShouldSwap: shouldSwap, Chance: chance, Roll: roll, Reason: reason}

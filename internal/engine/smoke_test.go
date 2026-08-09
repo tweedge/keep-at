@@ -359,26 +359,52 @@ func TestSmokeRealCatalogSubset(t *testing.T) {
 		t.Fatalf("expected at least 2 eligible candidates, got %d", eligible)
 	}
 
-	held := e.state.All()
-	if len(held) == 0 {
-		t.Fatal("expected at least one torrent to be held")
+	// The selection gate (see selector.SelectionChance) is unit-tested
+	// separately; the smoke test's job is to prove the pipeline works. That
+	// gate rightly rejects well-seeded catalog items (keep-at exists to seed
+	// minimally-seeded torrents), so relying on it here would make the
+	// download check depend on live seeder counts and a random roll. Instead,
+	// directly add a couple of the hand-picked, verified-downloadable
+	// candidates - whose metadata ScanOnce already fetched and cached - and
+	// require one to finish a real download with data on disk. This proves
+	// fetch -> scrape -> probe -> download -> store works end to end against
+	// live infrastructure.
+	added := 0
+	for _, it := range smokeTestItems {
+		md, err := e.fetchMetadata(ctx, mustHash(t, it.infoHash), nil)
+		if err != nil {
+			t.Logf("could not reload cached metadata for %s: %v", it.title, err)
+			continue
+		}
+		if err := e.AddCandidate(md, storageDir, it.size, it.title); err != nil {
+			t.Logf("could not add %s: %v", it.title, err)
+			continue
+		}
+		added++
 	}
-	t.Logf("keep-at selected %d torrent(s) from the subset catalog", len(held))
-	for _, h := range held {
-		t.Logf("held: %s (%s, %d bytes)", h.Title, h.InfoHash.HexString(), h.SizeBytes)
+	if added == 0 {
+		t.Fatal("could not add any hand-picked torrent for the download check")
 	}
 
-	// Require at least one held torrent to finish a real download and store
-	// data, proving the whole pipeline (fetch -> scrape -> probe -> download
-	// -> store) works end to end against live infrastructure. All held
-	// torrents are polled in parallel against one budget so this step is
-	// bounded even when the scan holds dozens of torrents.
+	held := e.state.All()
 	completed, bytesOnDisk := atLeastOneTorrentCompleted(e, held, 3*time.Minute)
 	if len(completed) == 0 {
-		t.Fatal("no held torrent completed a real download from Academic Torrents")
+		t.Fatal("no added torrent completed a real download from Academic Torrents")
 	}
 	t.Logf("completed real downloads: %d torrent(s), %s on disk total:", len(completed), netstats.HumanBytes(bytesOnDisk))
 	for _, title := range completed {
 		t.Logf("  downloaded: %s", title)
 	}
+}
+
+// mustHash parses a hex infohash, failing the test if it's malformed. It
+// exists so smoke-test code can build a metainfo.Hash inline without
+// sprinkling error handling through assertions.
+func mustHash(t *testing.T, hex string) metainfo.Hash {
+	t.Helper()
+	var h metainfo.Hash
+	if err := h.FromHexString(hex); err != nil {
+		t.Fatalf("bad infohash %q: %v", hex, err)
+	}
+	return h
 }

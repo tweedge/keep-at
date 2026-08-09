@@ -69,7 +69,7 @@ Defaults to the same OS-appropriate base directory as `--storage` (see above), u
 
 ### `aggressiveness` / `--aggressiveness`
 
-*Default: `0.6`.* Must be strictly between 0 and 1. Base of the anti-cascade probability `aggressiveness ^ (other keep-at nodes already in the swarm)` - lower values make keep-at back off faster as more keep-at nodes pile onto the same torrent. See DESIGN.md for the full explanation and the math.
+*Default: `0.6`.* Must be strictly between 0 and 1. Base of the seed-scarcity probability `aggressiveness ^ (seeders - 1)` - keep-at's purpose is to seed minimally-seeded torrents, so this is the chance it proceeds with a candidate given how many seeders it already has. A torrent with one seed passes with probability 1; a torrent with many seeds is effectively never selected. Lower values make keep-at even more selective. See DESIGN.md for the full explanation and the math.
 
 ## Filtering
 

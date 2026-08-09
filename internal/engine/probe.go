@@ -22,12 +22,14 @@ const (
 // probeSwarm briefly joins a candidate's swarm - without allowing any
 // actual data transfer - just to see which connected peers self-identify
 // as keep-at nodes, and whether each one has the whole torrent already.
-// This is the only way to answer "how many keep-at nodes are already on
-// this torrent" (feeding the anti-cascade decision) and "are they seeding
-// or still downloading it" (feeding network-status) for a torrent keep-at
+// This is the only way to answer "how many keep-at nodes are on this
+// torrent" (feeding network-status) and "are they seeding or still
+// downloading it" (also feeding network-status) for a torrent keep-at
 // isn't itself downloading yet: that information only exists on the wire,
 // in each peer's BitTorrent extended handshake and piece bitfield, not in
-// any catalog or tracker response.
+// any catalog or tracker response. The keep-at peer count is metadata only;
+// it does not gate which torrents keep-at selects (see
+// selector.SelectionChance).
 //
 // The torrent is deliberately never dropped from the probe client here -
 // see resetProbeClient for why. Callers that decide to proceed add the
