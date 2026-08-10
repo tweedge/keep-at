@@ -11,10 +11,18 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+// keep-at pins anacrolix/torrent at v1.61.0 with two backported bug fixes
+// carried in a fork (tweedge/anacrolix-torrent): the webseed desync panic
+// (anacrolix/torrent #1036) and the tracker-announce dispatcher's fatal
+// sync: Unlock of unlocked RWMutex crash. Both are patched at tag
+// v1.61.0-patch1; the v1.60.0 fork tag (v1.60.0-patch1) had the download
+// rate-limiter fix only.
+replace github.com/anacrolix/torrent => github.com/tweedge/anacrolix-torrent v1.61.0-patch1
+
 require (
 	github.com/RoaringBitmap/roaring v1.2.3 // indirect
-	github.com/ajwerner/btree v0.0.0-20211221152037-f427b3e689c0 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
+	github.com/anacrolix/btree v0.0.0-20251201064447-d86c3fa41bd8 // indirect
 	github.com/anacrolix/chansync v0.7.0 // indirect
 	github.com/anacrolix/dht/v2 v2.23.0 // indirect
 	github.com/anacrolix/envpprof v1.4.0 // indirect
@@ -42,6 +50,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/btree v1.1.2 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/huandu/xstrings v1.3.2 // indirect

@@ -60,9 +60,9 @@ Testing against the entire live Academic Torrents catalog (rather than a hand-pi
 
 ### A library bug that took the whole process down
 
-anacrolix/torrent v1.61.0 introduced a rewritten tracker-announce dispatcher (`client-tracker-announcer.go`) with an internal locking bug: under enough concurrent torrent churn, an assertion (`panicif.False`) inside it fails, which manifests as `fatal error: sync: Unlock of unlocked RWMutex` - a Go runtime fatal error, not a normal panic, so it can't be recovered from and kills the whole process outright. It reproduced consistently during a real full-catalog scan, triggered from more than one code path (adding a torrent, dropping one, and even a torrent's own periodic re-announce timer), which meant no single call site could be wrapped around to avoid it.
+anacrolix/torrent v1.61.0 introduced a rewritten tracker-announce dispatcher (`client-tracker-announcer.go`) with an internal locking bug: under enough concurrent torrent churn, an assertion (`panicif.False`) inside it fails, which manifests as `fatal error: sync: Unlock of unlocked RWMutex` - a Go runtime fatal error, not a normal panic, so it can't be recovered from and kills the whole process outright. It reproduced consistently during a real full-catalog scan, triggered from more than one code path (adding a torrent, dropping one, and even a torrent's own periodic re-announce timer), which meant no single call site could be wrapped around to avoid it. The same release also had a webseed desync panic ([anacrolix/torrent #1036](https://github.com/anacrolix/torrent/issues/1036)) that killed the process from a background timer goroutine.
 
-keep-at pins `github.com/anacrolix/torrent` to **v1.60.0**, the release immediately before this dispatcher was introduced, which doesn't have the bug. This is a real dependency downgrade, not a config toggle - revisit it once a fixed version exists upstream.
+Both bugs are now patched in keep-at's fork, `github.com/tweedge/anacrolix-torrent` at tag `v1.61.0-patch1`, via a `replace` directive. The dispatcher fix makes `singleAnnounce` always re-acquire the client lock on exit (even on panic, so the caller's deferred `unlock()` never fires on an unlocked mutex), guards against a missing tracker client, recovers panics on both the announce and timer goroutines, and demotes the dispatcher's churn-induced desync assertions to warnings. The webseed fix demotes the request-view desync check to a warning (`updateWebseedRequests`). The same fork also carries the download rate-limiter fix (stale `ReserveN` timestamps let sustained throughput exceed the configured rate under concurrent connections). Revisit once upstream ships a version that fixes the dispatcher and keeps the rate limiter working.
 
 ### Why probing uses a second, disposable torrent client
 
@@ -71,7 +71,7 @@ Independent of the above, probing a candidate's swarm (see "Seeding minimally-se
 So probing now happens on a dedicated `*torrent.Client` that:
 
 * Is never used for anything else - real downloads (`AddCandidate`, resuming held torrents on startup) always go through the main client.
-* Has DHT disabled. DHT's own per-torrent announce goroutine was one of the two concrete triggers found for the v1.61.0 bug, and DHT isn't needed to answer "who else is in this swarm right now" - regular trackers are enough for that.
+* Has DHT disabled. DHT's own per-torrent announce goroutine was one of the two concrete triggers found for the v1.61.0 dispatcher bug (now patched in the fork), and DHT isn't needed to answer "who else is in this swarm right now" - regular trackers are enough for that.
 * Never has individual torrents dropped from it. Probed torrents just accumulate - not attempting any real transfer - and the entire client is periodically closed and replaced instead (see below), which releases everything through a code path that doesn't share the add/drop race.
 
 DHT stays enabled on the main client: disabling it globally was tried first and measurably hurt real download connectivity (one torrent went from a 15-second download to not finishing within 90 seconds with DHT off). Isolating the churn to a disposable, DHT-free client keeps the crash risk contained without that cost.
@@ -177,4 +177,4 @@ keep-at therefore tracks download progress per held torrent: how many pieces are
 * **Peer-map availability.** See "Reasoning quickly about availability" above.
 * **Authenticated node identity.** network-status trusts the BitTorrent extended handshake's claimed client name at face value.
 * **Incremental action during a scan.** Done - see "Scans act incrementally, and re-scans are cheap" above.
-* **Pinned anacrolix/torrent version.** v1.61.0 has a crashing bug (see "Running against the real catalog"); keep-at is on v1.60.0 until a fix lands upstream.
+* **Pinned anacrolix/torrent version.** keep-at is on v1.61.0 via a `replace` to `tweedge/anacrolix-torrent` (which carries backported fixes for the webseed desync panic and the tracker-announce dispatcher crash - see "A library bug that took the whole process down"). Revisit once upstream fixes the dispatcher.
