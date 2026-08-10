@@ -1,5 +1,25 @@
 # keep-at release notes
 
+## v0.7.5-beta - smooth and speed up scans for RAM-limited hosts
+
+This is a beta release for field validation of the scan changes below; the next stable cut will be identical apart from the version tag.
+
+### Oversized torrents are disqualified before any work is done on them
+
+A torrent larger than every storage location's total capacity can never be stored on the host, no matter how well it compresses or what keep-at displaces. `keep-at network-status` now reports how many catalog candidates are disqualified on that basis, `keep-at` logs it at scrape start (`disqualified oversized candidates before scrape`), and they are skipped before any metadata is fetched, any tracker is scraped, or any swarm is probed. On the host this was developed against, that means the giant noaa-ncei datasets (up to 17TB against a 10GB cap) no longer stall the scrape at all.
+
+### The catalog is walked in shuffled order
+
+Academic Torrents' `database.xml` groups datasets by upload/series, so giant torrents cluster into contiguous runs - hundreds of datasets over 100GB, e.g. the whole noaa-ncei block. Walking the catalog in that order meant all 16 concurrent evaluators were parsing multi-megabyte `.torrent` files at once, stalling the scrape on exactly those segments (observed: 228 of 2816 candidates in 47 minutes, stuck at the noaa-ncei cluster). The walk order is now shuffled, spreading the giants across the whole scan so only a few are in flight at any moment. Every candidate is still evaluated exactly once.
+
+### Scan memory is returned to the OS, not left at its peak
+
+A full-catalog scan parses gigabytes of `.torrent` metadata and the probe client accumulates per-piece bookkeeping for every probed candidate. Go's GC reclaims that heap, but the runtime returns freed memory to the OS lazily, so RSS could sit at the scan's peak long after the work finished - 7GB resident on a host whose held torrents account for ~1-2GB. `keep-at` now forces the reclaimed memory back to the OS after each mid-scan probe-client reset and at scan completion, and drops the accumulated probe client after the scan so its bookkeeping isn't carried into the idle period.
+
+### Slow startup is no longer silent
+
+Resuming held torrents can take a long time when a lot of data is held (the client walks every stored piece to determine completion state - ~17 minutes for 1.6TB across 88 torrents on a slow host, versus well under a second for a handful of small ones). `keep-at` now logs an immediate `resuming held torrents` line, then one `resume in progress` line every 5 minutes naming what it's currently working on and how far through it is, so a slow start isn't a black box.
+
 ## v0.7.4-beta - anchor selection to the catalog's actual health, and quiet the log
 
 This is a beta release for field validation of the selection change below; the next stable cut will be identical apart from the version tag.
