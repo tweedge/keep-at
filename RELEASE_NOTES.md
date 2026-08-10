@@ -1,5 +1,38 @@
 # keep-at release notes
 
+## v0.7.4-beta - anchor selection to the catalog's actual health, and quiet the log
+
+This is a beta release for field validation of the selection change below; the next stable cut will be identical apart from the version tag.
+
+### Selection is now anchored to the catalog's p10 seeder floor
+
+The seed-scarcity gate previously compared each candidate against a fixed baseline of one seeder: `n = aggressiveness ^ (seeders - 1)`. The baseline now comes from the catalog itself. The chance keep-at proceeds with a candidate is:
+
+```
+n = aggressiveness ^ max(0, seeders - x)
+```
+
+where x is the **p10 seeder floor**: the 10th percentile of seeder counts across all catalog torrents the last completed scan saw with at least one seeder, stored in the network-status snapshot and reported by `keep-at network-status`.
+
+The first scan still behaves exactly as before - with no completed scan there's no measured floor, so x is treated as 1 and the gate reduces to the original `aggressiveness ^ (seeders - 1)`, keeping the initial pass conservative. After each completed scan the floor is recomputed from what that scan observed.
+
+This makes keep-at respond to the network's real health instead of assuming it:
+
+- As overall Academic Torrents health improves, the floor rises with it, and keep-at nodes with space available keep finding content to store to fill that space - they don't hold back just because the catalog got healthier.
+- The floor only rises when health genuinely improves. If it doesn't improve above the measured floor, keep-at stays just as effective at smaller scale - it never assumes the whole network is healthier than it actually is.
+
+### Well-seeded candidates no longer flood the log
+
+Rejecting a candidate because its seed-scarcity roll failed - the routine, expected outcome for any well-seeded torrent - is no longer logged. At full-catalog scale that was hundreds of `evaluated candidate ... reason="seed-scarcity roll failed"` lines per scan, drowning out the lines that actually matter. Every other outcome (added, swapped, margin failure, RAM cap) still logs.
+
+### `min_seed_margin` defaults to 2
+
+The swap-specific margin (how many fewer seeds a candidate needs before displacing a held torrent) defaults to 2 rather than 3. With selection anchored to the catalog floor, the margin is the guard on top of that global gate, and 2 keeps keep-at willing to replace a held torrent when the gap is real without demanding an increasingly rare margin as catalog health improves.
+
+### One last tracker-announce dispatcher crash fixed
+
+keep-at now builds against `github.com/tweedge/anacrolix-torrent` at tag `v1.61.0-patch2`. A live node hit `122 > 121` (`trackerAnnounceHead.Len()` vs `len(trackerClients)`) during a started announce: the fork's `recover` kept the process alive, but the announce was aborted and the panic recurred. `v1.61.0-patch2` demotes every remaining dispatcher consistency assertion - length-desync checks, infohash-concurrency reconciliation, the per-tracker concurrency limit, and nil-client/URL sanity checks - to warnings with graceful handling, closing out the last known dispatcher crash. See docs/DESIGN.md's "A library bug that took the whole process down" for the full story.
+
 ## v0.7.3-beta - stop cleanly, however keep-at was started
 
 This is a beta release for field validation of the shutdown fixes below; the next stable cut will be identical apart from the version tag.
