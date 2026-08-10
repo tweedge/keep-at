@@ -1,5 +1,17 @@
 # keep-at release notes
 
+## v0.7.3-beta - stop cleanly, however keep-at was started
+
+This is a beta release for field validation of the shutdown fixes below; the next stable cut will be identical apart from the version tag.
+
+### `keep-at stop` now stops every way keep-at can be running
+
+Previously `keep-at stop` only consulted the PID file, so it reported "daemonctl: not running" for an instance started with `keep-at run` in the foreground, or one running under systemd - both of which don't write a PID file. It now falls back to scanning the process table for such an instance (the same lookup `keep-at status` already used) and signals it, so `keep-at stop` works whether keep-at was daemonized, run in the foreground, or managed by a service.
+
+### `service keep-at stop` no longer hangs mid-scan
+
+The idle path always exited promptly, but if a scan was in flight the scan's drain loop blocked until *every* evaluation worker finished - so a single stuck worker (e.g. a pathological torrent whose metadata parse or tracker scrape never returns) held SIGTERM hostage indefinitely. The drain loop now also aborts on context cancellation, so an interrupted scan shuts down promptly. The systemd unit also gained `TimeoutStopSec=30` as a backstop, so `systemctl stop keep-at` can never block forever even if a future hang bypasses the context handling.
+
 ## v0.7.2 - name the torrent that's stalling
 
 The "scrape in progress" progress log now names every candidate currently being evaluated, longest-stalled first, with how long each has been in flight:
