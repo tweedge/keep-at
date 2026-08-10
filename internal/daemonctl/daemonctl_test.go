@@ -2,12 +2,30 @@ package daemonctl
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/tweedge/keep-at/internal/config"
 )
+
+// startSleepProcess launches a long-running sleep, so a test has a real
+// process to signal and wait on. It reaps the child asynchronously (like
+// Manager.Start does) so an exited process isn't left as a zombie, which
+// would otherwise keep responding to signal-0 liveness checks.
+func startSleepProcess(t *testing.T) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("/bin/sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting sleep: %v", err)
+	}
+	go func() { _ = cmd.Wait() }()
+	t.Cleanup(func() {
+		_ = StopPID(cmd.Process.Pid, 3*time.Second)
+	})
+	return cmd
+}
 
 func TestStartStatusStop(t *testing.T) {
 	dir := t.TempDir()
@@ -47,6 +65,28 @@ func TestStartStatusStop(t *testing.T) {
 	if status.Running {
 		t.Fatalf("expected not running after Stop")
 	}
+}
+
+// TestStopPIDStopsAnArbitraryProcess exercises the PID-based stop path used
+// when keep-at is running in the foreground (no PID file): it must signal
+// the given PID and wait for it to exit, exactly like Manager.Stop does for
+// the daemonized case.
+func TestStopPIDStopsAnArbitraryProcess(t *testing.T) {
+	cmd := startSleepProcess(t)
+
+	if err := StopPID(cmd.Process.Pid, 3*time.Second); err != nil {
+		t.Fatalf("StopPID: %v", err)
+	}
+
+	// Give it a moment to fully exit, then confirm it's gone.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processAlive(cmd.Process.Pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("process %d still alive after StopPID", cmd.Process.Pid)
 }
 
 func TestStartRejectsWhenAlreadyRunning(t *testing.T) {

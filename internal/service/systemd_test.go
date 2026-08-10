@@ -21,6 +21,7 @@ func TestUnitTemplateRendersExpectedFields(t *testing.T) {
 		"ExecStart=/usr/local/bin/keep-at run --config /etc/keep-at/config.yaml",
 		"User=keep-at",
 		"WantedBy=multi-user.target",
+		"TimeoutStopSec=30",
 	}
 	for _, want := range wantSubstrings {
 		if !strings.Contains(out, want) {

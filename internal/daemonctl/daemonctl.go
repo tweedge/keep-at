@@ -77,27 +77,38 @@ func (m Manager) Stop(timeout time.Duration) error {
 		return fmt.Errorf("daemonctl: not running")
 	}
 
-	proc, err := os.FindProcess(status.PID)
+	if err := StopPID(status.PID, timeout); err != nil {
+		return err
+	}
+	_ = os.Remove(m.PIDFile)
+	return nil
+}
+
+// StopPID sends SIGTERM to the process with the given PID and waits up to
+// timeout for it to exit, escalating to SIGKILL if it doesn't. Unlike
+// Manager.Stop it doesn't consult any PID file, so it can stop a
+// foreground instance (`keep-at run`) or one running under a service
+// manager that doesn't go through keep-at's own daemonctl.
+func StopPID(pid int, timeout time.Duration) error {
+	proc, err := os.FindProcess(pid)
 	if err != nil {
-		return fmt.Errorf("daemonctl: finding process %d: %w", status.PID, err)
+		return fmt.Errorf("daemonctl: finding process %d: %w", pid, err)
 	}
 	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("daemonctl: signaling process %d: %w", status.PID, err)
+		return fmt.Errorf("daemonctl: signaling process %d: %w", pid, err)
 	}
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if !processAlive(status.PID) {
-			_ = os.Remove(m.PIDFile)
+		if !processAlive(pid) {
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	if err := proc.Signal(syscall.SIGKILL); err != nil {
-		return fmt.Errorf("daemonctl: force-killing process %d: %w", status.PID, err)
+		return fmt.Errorf("daemonctl: force-killing process %d: %w", pid, err)
 	}
-	_ = os.Remove(m.PIDFile)
 	return nil
 }
 

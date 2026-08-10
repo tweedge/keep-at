@@ -35,6 +35,11 @@ ExecStart={{.ExecStartLine}}
 Restart=on-failure
 RestartSec=5
 User={{.User}}
+# keep-at handles SIGTERM itself and stops promptly even mid-scan (see
+# ScanOnce's ctx-aware drain loop), but this caps how long systemd will wait
+# before force-killing it if something ever hangs, so 'systemctl stop
+# keep-at' can't block forever on a stuck process.
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

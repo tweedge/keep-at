@@ -195,16 +195,35 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	// the "top candidates start seeding within minutes" property while
 	// keeping ranking work proportional to N * log N (plus one final flush
 	// for whatever the last partial batch leaves).
+	//
+	// The drain loop also watches ctx: the channel only closes after every
+	// evaluation worker finishes (evaluateCandidates waits on them), so a
+	// single stuck worker - a pathological torrent whose metadata parse or
+	// tracker scrape never returns - would otherwise hold SIGTERM hostage
+	// forever. Aborting the drain on cancellation is what lets `keep-at
+	// stop` / `systemctl stop` shut down promptly even mid-scan.
 	actEvery := evaluateConcurrency
-	for c := range candChan {
-		processed++
-		evaluated = append(evaluated, c)
-		if processed%actEvery == 0 {
-			ramBound = heldCount >= e.maxTorrents
-			e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker)
+drainLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			break drainLoop
+		case c, ok := <-candChan:
+			if !ok {
+				break drainLoop
+			}
+			processed++
+			evaluated = append(evaluated, c)
+			if processed%actEvery == 0 {
+				ramBound = heldCount >= e.maxTorrents
+				e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker)
+			}
 		}
 	}
-	if len(evaluated) > 0 {
+	if ctx.Err() == nil && len(evaluated) > 0 {
+		// Flush the last partial batch only when the scan wasn't
+		// interrupted; acting on it while shutting down would just start
+		// downloads we're about to abandon.
 		ramBound = heldCount >= e.maxTorrents
 		e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker)
 	}
