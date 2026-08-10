@@ -15,6 +15,7 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 
 	"github.com/tweedge/keep-at/internal/config"
+	"github.com/tweedge/keep-at/internal/netstats"
 )
 
 // buildTestTorrent creates a small single-file torrent on disk and returns
@@ -56,11 +57,24 @@ type academicTorrentsStub struct {
 	metaInfo *metainfo.MetaInfo
 	infoHash metainfo.Hash
 	seeders  int
+
+	// scrapeBlock, when non-nil, makes the /scrape.php handler wait on it
+	// (selecting against the request context) before responding. Tests use
+	// it to hold a scan in flight so they can cancel it mid-scan.
+	scrapeBlock chan struct{}
+	// scrapeReached, when non-nil, is closed the first time /scrape.php is
+	// invoked (before scrapeBlock is waited on), so a test knows the scan is
+	// genuinely in the scrape phase.
+	scrapeReached chan struct{}
 }
 
 func newAcademicTorrentsStub(t *testing.T, title string, content []byte, seeders int) *academicTorrentsStub {
+	return newAcademicTorrentsStubSignaled(t, title, content, seeders, nil, nil)
+}
+
+func newAcademicTorrentsStubSignaled(t *testing.T, title string, content []byte, seeders int, scrapeBlock, scrapeReached chan struct{}) *academicTorrentsStub {
 	t.Helper()
-	stub := &academicTorrentsStub{seeders: seeders}
+	stub := &academicTorrentsStub{seeders: seeders, scrapeBlock: scrapeBlock, scrapeReached: scrapeReached}
 
 	mux := http.NewServeMux()
 	stub.server = httptest.NewServer(mux)
@@ -93,6 +107,20 @@ func newAcademicTorrentsStub(t *testing.T, title string, content []byte, seeders
 	})
 
 	mux.HandleFunc("/scrape.php", func(w http.ResponseWriter, r *http.Request) {
+		if stub.scrapeReached != nil {
+			select {
+			case <-stub.scrapeReached:
+			default:
+				close(stub.scrapeReached)
+			}
+		}
+		if stub.scrapeBlock != nil {
+			select {
+			case <-stub.scrapeBlock:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		payload := map[string]interface{}{
 			"files": map[string]interface{}{
 				string(stub.infoHash.Bytes()): map[string]interface{}{
@@ -196,5 +224,73 @@ func TestScanOnceSkipsUnavailableCandidate(t *testing.T) {
 
 	if held := e.state.All(); len(held) != 0 {
 		t.Fatalf("expected no torrents held (0 seeders means unavailable), got %+v", held)
+	}
+}
+
+// TestScanOnceInterruptedIsNotMarkedComplete verifies that a scan cancelled
+// mid-flight (e.g. ctrl+c) is not persisted as a completed scan. Marking it
+// complete would make the next start wait out the remainder of the scan
+// interval before scanning again, deferring the next real scan indefinitely.
+func TestScanOnceInterruptedIsNotMarkedComplete(t *testing.T) {
+	content := bytes.Repeat([]byte("z"), 64)
+	scrapeBlock := make(chan struct{})
+	scrapeReached := make(chan struct{})
+	stub := newAcademicTorrentsStubSignaled(t, "Interrupted Dataset", content, 1, scrapeBlock, scrapeReached)
+	defer stub.server.Close()
+
+	dataDir := t.TempDir()
+	storageDir := t.TempDir()
+
+	cfg := config.Default()
+	cfg.DataDir = dataDir
+	cfg.Port = 47553
+	cfg.Storage.Locations = []config.StorageLocation{{Path: storageDir, Limit: config.ByteSize(1 << 20)}}
+
+	e, err := New(cfg, Options{
+		CatalogURL:              stub.server.URL + "/database.xml",
+		AcademicTorrentsBaseURL: stub.server.URL,
+		ProbeTimeout:            time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Run the scan in the background. The stub's scrape handler blocks on
+	// scrapeBlock, so the scan stays in flight until the test lets it go -
+	// which is what lets us cancel it mid-scan rather than before or after.
+	scanDone := make(chan error, 1)
+	go func() { scanDone <- e.ScanOnce(ctx) }()
+
+	// Wait until the scrape is genuinely under way, then interrupt it.
+	select {
+	case <-scrapeReached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("scan never reached the scrape phase")
+	}
+
+	cancel()
+	close(scrapeBlock)
+
+	select {
+	case err := <-scanDone:
+		if err == nil {
+			t.Fatalf("expected ScanOnce to return an error after cancellation, got nil")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ScanOnce did not return after cancellation")
+	}
+
+	snap, err := netstats.Load(e.networkStatsPath())
+	if err != nil {
+		t.Fatalf("loading network stats: %v", err)
+	}
+	if !snap.InProgress() {
+		t.Fatalf("interrupted scan was marked complete: snapshot = %+v", snap)
+	}
+	if !snap.ScanCompletedAt.IsZero() {
+		t.Fatalf("interrupted scan persisted a ScanCompletedAt: %v", snap.ScanCompletedAt)
 	}
 }

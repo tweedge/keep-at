@@ -209,6 +209,20 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 		e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker)
 	}
 
+	// A scan that was cut short - ctrl+c, a shutdown signal, or any other
+	// cancellation - is not a completed scan. Marking it complete would set
+	// ScanCompletedAt, which makes the next start wait out the remainder of
+	// the scan interval before scanning again, so an aborted scan would push
+	// the next real scan indefinitely far out. Instead, leave the snapshot
+	// "in progress" (no ScanCompletedAt): the next start sees no completed
+	// scan and scans immediately. The channel draining above is not evidence
+	// of completion on its own - evaluateCandidates closes it after its
+	// in-flight work finishes, which happens even when the catalog loop was
+	// broken out of early by cancellation.
+	if ctx.Err() != nil {
+		return fmt.Errorf("engine: scan interrupted: %w", ctx.Err())
+	}
+
 	e.logger.Info("scrape complete, updating what keep-at holds",
 		"available", len(evaluated),
 		"processed", processed,
