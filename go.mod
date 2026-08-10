@@ -11,13 +11,14 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-// keep-at pins anacrolix/torrent at v1.61.0 with two backported bug fixes
+// keep-at pins anacrolix/torrent at v1.61.0 with backported bug fixes
 // carried in a fork (tweedge/anacrolix-torrent): the webseed desync panic
 // (anacrolix/torrent #1036) and the tracker-announce dispatcher's fatal
-// sync: Unlock of unlocked RWMutex crash. Both are patched at tag
-// v1.61.0-patch1; the v1.60.0 fork tag (v1.60.0-patch1) had the download
-// rate-limiter fix only.
-replace github.com/anacrolix/torrent => github.com/tweedge/anacrolix-torrent v1.61.0-patch1
+// sync: Unlock of unlocked RWMutex crash, plus the download rate-limiter
+// fix. v1.61.0-patch2 additionally demotes every remaining dispatcher
+// consistency assertion (which could fire under churn and abort announces)
+// to a warning.
+replace github.com/anacrolix/torrent => github.com/tweedge/anacrolix-torrent v1.61.0-patch2
 
 require (
 	github.com/RoaringBitmap/roaring v1.2.3 // indirect
