@@ -1,5 +1,15 @@
 # keep-at release notes
 
+## v0.7.2-beta - name the torrent that's stalling
+
+The "scrape in progress" progress log now names every candidate currently being evaluated, longest-stalled first, with how long each has been in flight:
+
+```
+scrape in progress processed=1500 total=2800 percent=53% elapsed=1h2m eta=54m currently_scraping=["Some Problem Dataset" (12m30s) "Another Dataset" (2m1s)]
+```
+
+A pathological torrent - one with a huge piece or file count, or a tracker that never answers - now shows up in the log with its title and how long it's been stuck, instead of the scan just silently slowing down. This is a diagnostic aid while investigating an intermittent high-CPU/high-RAM stall during scrapes; it changes no scan behavior.
+
 ## v0.7.1-beta - fix the crashes and give self-update a beta channel
 
 This is a beta release, published from the same commits the next stable release will come from. It exists so the crash fixes below can be validated in the field before the stable cut.

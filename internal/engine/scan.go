@@ -414,6 +414,57 @@ func (e *Engine) evictStalledTorrents(catalogHashes map[string]bool) {
 	}
 }
 
+// inflightCandidate is one candidate currently being evaluated: its title,
+// when evaluation started, and (in a snapshot) how long it's been stuck.
+type inflightCandidate struct {
+	title     string
+	startedAt time.Time
+	elapsed   time.Duration
+}
+
+// inflightTracker tracks which candidates are currently being evaluated.
+// Concurrent evaluation means up to evaluateConcurrency of them are in
+// flight at once; the tracker exists so the periodic progress log can name
+// them, which is how a pathological torrent (huge piece/file count, a
+// tracker that never answers) gets identified instead of just being an
+// unexplained slowdown.
+type inflightTracker struct {
+	mu   sync.Mutex
+	byIH map[string]inflightCandidate
+}
+
+func newInflightTracker() *inflightTracker {
+	return &inflightTracker{byIH: make(map[string]inflightCandidate)}
+}
+
+func (t *inflightTracker) start(infoHash metainfo.Hash, title string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.byIH[infoHash.HexString()] = inflightCandidate{title: title, startedAt: time.Now()}
+}
+
+func (t *inflightTracker) end(infoHash metainfo.Hash) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.byIH, infoHash.HexString())
+}
+
+// snapshot returns the in-flight candidates with their elapsed durations,
+// longest first, so the longest-stalled one is the first thing an operator
+// sees in the progress log.
+func (t *inflightTracker) snapshot() []inflightCandidate {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]inflightCandidate, 0, len(t.byIH))
+	now := time.Now()
+	for _, c := range t.byIH {
+		c.elapsed = now.Sub(c.startedAt)
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].elapsed > out[j].elapsed })
+	return out
+}
+
 // evaluateCandidates walks the catalog and streams, over the returned
 // channel, everything keep-at doesn't already hold, isn't keyword-blocked,
 // and has aged past the moderation delay - each with a fresh metadata fetch
@@ -437,6 +488,7 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 	)
 	sem := make(chan struct{}, evaluateConcurrency)
 	results := make(chan evaluatedCandidate)
+	inflight := newInflightTracker()
 
 	// Production runs in its own goroutine so the channel can be returned
 	// immediately: the caller (ScanOnce) starts draining results while
@@ -485,7 +537,7 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 						}
 					}
 				case <-logTicker.C:
-					e.logScrapeProgress(evalStartedAt, totalCandidates, int(processed.Load()))
+					e.logScrapeProgress(evalStartedAt, totalCandidates, int(processed.Load()), inflight)
 				}
 			}
 		}()
@@ -517,6 +569,8 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 				defer wg.Done()
 				defer func() { <-sem }()
 				defer processed.Add(1)
+				inflight.start(item.InfoHash, item.Title)
+				defer inflight.end(item.InfoHash)
 
 				safely(e.logger, "evaluating "+item.Title, func() {
 					c, ok := e.evaluateOneCandidate(ctx, item, now, minAge, stats)
@@ -588,18 +642,30 @@ func (e *Engine) saveNetworkStats(snapshot netstats.Snapshot) {
 // the assumption that the rest of the catalog behaves like what's been
 // seen already; it's meant to give a rough sense of progress, not a
 // precise countdown.
-func (e *Engine) logScrapeProgress(evalStartedAt time.Time, totalCandidates, processedCandidates int) {
+//
+// inflight names the candidates currently being evaluated, longest-stalled
+// first. A torrent that takes far longer than its peers to fetch metadata
+// or scrape trackers shows up here, which is what lets an operator identify
+// a pathological torrent instead of just seeing an unexplained slowdown.
+func (e *Engine) logScrapeProgress(evalStartedAt time.Time, totalCandidates, processedCandidates int, inflight *inflightTracker) {
 	elapsed := time.Since(evalStartedAt)
 
+	// Name every in-flight candidate. Titles can contain characters that
+	// don't play nicely as log keys, so they're carried as a single value.
+	var stuck []string
+	for _, c := range inflight.snapshot() {
+		stuck = append(stuck, fmt.Sprintf("%q (%s)", c.title, humanDuration(c.elapsed)))
+	}
+
 	if totalCandidates <= 0 || processedCandidates <= 0 {
-		e.logger.Info("scrape in progress", "processed", processedCandidates, "total", totalCandidates, "elapsed", humanDuration(elapsed))
+		e.logger.Info("scrape in progress", "processed", processedCandidates, "total", totalCandidates, "elapsed", humanDuration(elapsed), "currently_scraping", stuck)
 		return
 	}
 
 	percent := float64(processedCandidates) / float64(totalCandidates) * 100
 	remaining := totalCandidates - processedCandidates
 	if remaining <= 0 {
-		e.logger.Info("scrape in progress", "processed", processedCandidates, "total", totalCandidates, "elapsed", humanDuration(elapsed))
+		e.logger.Info("scrape in progress", "processed", processedCandidates, "total", totalCandidates, "elapsed", humanDuration(elapsed), "currently_scraping", stuck)
 		return
 	}
 
@@ -611,7 +677,8 @@ func (e *Engine) logScrapeProgress(evalStartedAt time.Time, totalCandidates, pro
 		"total", totalCandidates,
 		"percent", fmt.Sprintf("%.0f%%", percent),
 		"elapsed", humanDuration(elapsed),
-		"eta", humanDuration(eta))
+		"eta", humanDuration(eta),
+		"currently_scraping", stuck)
 }
 
 // rankEvaluated converts evaluated candidates into selector.Candidate and
