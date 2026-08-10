@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/anacrolix/torrent/metainfo"
@@ -121,9 +122,69 @@ func TestCountPendingCandidatesExcludesHeldAndBlocked(t *testing.T) {
 	)
 	heldHashes := map[string]bool{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": true}
 
-	got := countPendingCandidates(catalog, heldHashes, blocked)
+	got := countPendingCandidates(catalog, heldHashes, blocked, 0)
 	if got != 1 {
 		t.Fatalf("expected exactly 1 pending candidate, got %d", got)
+	}
+}
+
+func TestCountPendingCandidatesExcludesTooBig(t *testing.T) {
+	catalog := catalogOf(
+		catalogItem("Small", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		catalogItem("Fits", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		catalogItem("Too Big", "cccccccccccccccccccccccccccccccccccccccc"),
+	)
+	catalog.Items[0].SizeBytes = 1 << 20
+	catalog.Items[1].SizeBytes = 8 << 20
+	catalog.Items[2].SizeBytes = 1 << 30
+
+	// maxFittable of 512MiB disqualifies the 1GiB candidate only.
+	got := countPendingCandidates(catalog, nil, stubBlocklist{}, 512<<20)
+	if got != 2 {
+		t.Fatalf("expected 2 pending candidates (oversized excluded), got %d", got)
+	}
+}
+
+// TestShuffleCatalogItemsIsAPermutation verifies shuffleCatalogItems changes
+// the evaluation order without dropping, duplicating, or otherwise losing any
+// candidate. The catalog order matters because Academic Torrents' database.xml
+// clusters giant datasets (see shuffleCatalogItems' comment), and the scan
+// otherwise reaches them with every concurrent worker at once.
+func TestShuffleCatalogItemsIsAPermutation(t *testing.T) {
+	items := make([]atcatalog.Item, 500)
+	for i := range items {
+		// 40 hex chars from a counter: unique infohashes, stable order.
+		items[i] = catalogItem(fmt.Sprintf("item-%03d", i), fmt.Sprintf("%040d", i))
+	}
+	original := make([]atcatalog.Item, len(items))
+	copy(original, items)
+
+	shuffleCatalogItems(items)
+
+	if len(items) != len(original) {
+		t.Fatalf("shuffle changed catalog size: got %d want %d", len(items), len(original))
+	}
+
+	seen := make(map[metainfo.Hash]bool, len(items))
+	orderChanged := false
+	for i, it := range items {
+		if seen[it.InfoHash] {
+			t.Fatalf("shuffle duplicated candidate %s", it.InfoHash.HexString())
+		}
+		seen[it.InfoHash] = true
+		if it.InfoHash != original[i].InfoHash {
+			orderChanged = true
+		}
+	}
+	for _, it := range original {
+		if !seen[it.InfoHash] {
+			t.Fatalf("shuffle dropped candidate %s", it.InfoHash.HexString())
+		}
+	}
+	// 500 items: the chance of the shuffle leaving the order untouched is
+	// 1/500!, so this is effectively deterministic.
+	if !orderChanged {
+		t.Fatal("shuffle left catalog in the original order")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -18,12 +19,58 @@ import (
 // resumeHeldTorrents re-adds every torrent keep-at's state says it holds back
 // into the BitTorrent client on startup, so it resumes seeding immediately
 // rather than waiting for the next scan.
+//
+// Re-adding a torrent is cheap in torrent count but expensive in data: the
+// client walks every stored piece to determine completion state, so the time
+// scales with how much data keep-at holds (verified: a node holding 1.6TB
+// took ~17 minutes to resume, while 30 small torrents resume in well under a
+// second). On a node holding a lot, startup would otherwise be a silent wait
+// before "keep-at started" - so this logs an immediate "resuming held
+// torrents" line and then one progress line per progressLogInterval (5
+// minutes) naming what it's currently working on and how far through it is.
 func (e *Engine) resumeHeldTorrents() error {
-	for _, held := range e.state.All() {
+	heldTorrents := e.state.All()
+	total := len(heldTorrents)
+	startedAt := time.Now()
+
+	var processed atomic.Int64
+	var currentTitle atomic.Value
+	stopProgress := make(chan struct{})
+	progressStopped := make(chan struct{})
+	go func() {
+		defer close(progressStopped)
+		ticker := time.NewTicker(progressLogInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopProgress:
+				return
+			case <-ticker.C:
+				p := int(processed.Load())
+				title, _ := currentTitle.Load().(string)
+				e.logger.Info("resume in progress",
+					"processed", p,
+					"remaining", total-p,
+					"total", total,
+					"current", title,
+					"elapsed", humanDuration(time.Since(startedAt)))
+			}
+		}
+	}()
+	defer func() {
+		close(stopProgress)
+		<-progressStopped
+	}()
+
+	e.logger.Info("resuming held torrents", "total", total)
+
+	for _, held := range heldTorrents {
+		currentTitle.Store(held.Title)
 		store, ok := e.stores[held.StorageLocation]
 		if !ok {
 			e.logger.Warn("skipping resume: storage location no longer configured",
 				"infohash", held.InfoHash.HexString(), "location", held.StorageLocation)
+			processed.Add(1)
 			continue
 		}
 
@@ -31,14 +78,17 @@ func (e *Engine) resumeHeldTorrents() error {
 		if err != nil {
 			e.logger.Warn("skipping resume: could not load cached .torrent file",
 				"infohash", held.InfoHash.HexString(), "err", err)
+			processed.Add(1)
 			continue
 		}
 
 		if _, err := e.addTorrentSpec(mi, store); err != nil {
 			e.logger.Warn("skipping resume: could not add torrent to client",
 				"infohash", held.InfoHash.HexString(), "err", err)
+			processed.Add(1)
 			continue
 		}
+		processed.Add(1)
 	}
 	return nil
 }

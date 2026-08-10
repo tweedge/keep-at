@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -112,6 +113,7 @@ type scanStats struct {
 	// Candidates skipped entirely, by reason.
 	skippedHeld      atomic.Int64
 	skippedBlocked   atomic.Int64
+	skippedTooBig    atomic.Int64
 	skippedAge       atomic.Int64
 	skippedFetchErr  atomic.Int64
 	skippedScrapeErr atomic.Int64
@@ -161,6 +163,19 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	}
 	e.logger.Info("catalog loaded", "items", len(catalog.Items))
 
+	// The catalog is ordered by upload (roughly oldest-last, with related
+	// datasets adjacent), so giant torrents cluster: Academic Torrents holds
+	// 238 datasets over 100GB, and contiguous runs of them - including the
+	// whole noaa-ncei block - appear one after another. Walking the catalog
+	// in that order means evaluateCandidates' 16 concurrent workers all
+	// fetch and parse multi-megabyte .torrent files (tens of thousands of
+	// piece hashes each) at the same time, spiking CPU and RAM together and
+	// stalling the scrape on exactly those segments - measured on a live
+	// node: 228 of 2816 candidates in 47 minutes, stuck at the noaa-ncei
+	// cluster. Shuffling the walk order spreads the giants across the whole
+	// scan so at most a few are in flight at once, smoothing the load.
+	shuffleCatalogItems(catalog.Items)
+
 	catalogHashes := make(map[string]bool, len(catalog.Items))
 	for _, item := range catalog.Items {
 		catalogHashes[item.InfoHash.HexString()] = true
@@ -176,8 +191,32 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	e.refreshHeldSeederCounts(ctx, held, catalogHashes)
 	e.evictStalledTorrents(catalogHashes)
 
-	totalCandidates := countPendingCandidates(catalog, heldHashes, e.blocklist)
+	// "Will it fit" pre-pass: a torrent bigger than every storage location's
+	// total capacity can never be stored here, so there's no point fetching
+	// its metadata, scraping it, or probing its swarm - for the giant NOAA
+	// datasets (up to 17TB on a host with a 10GB cap) that was megabytes of
+	// .torrent parsing and a long scrape walk for a candidate that could
+	// never be acted on. Count them now so the scrape-start line reports the
+	// disqualification, and carry the bound into evaluation so they're never
+	// even fetched.
+	maxFittable := e.maxFittableSize()
+	tooBig := 0
+	for _, item := range catalog.Items {
+		if heldHashes[item.InfoHash.HexString()] {
+			continue
+		}
+		if maxFittable > 0 && item.SizeBytes > maxFittable {
+			tooBig++
+		}
+	}
+	totalCandidates := countPendingCandidates(catalog, heldHashes, e.blocklist, maxFittable)
 	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt, TotalCandidates: totalCandidates, SeederFloor: seederFloor})
+	if tooBig > 0 {
+		e.logger.Info("disqualified oversized candidates before scrape",
+			"count", tooBig,
+			"max_fittable_bytes", maxFittable,
+			"note", "torrents larger than any storage location's total capacity can never be stored, so they are not fetched, scraped, or probed")
+	}
 	e.logger.Info("starting scrape: fetching torrent metadata and tracker data for every pending catalog candidate to work out what needs seeding most - this can take a while on a large catalog, and downloads start gradually as the highest-priority candidates are found rather than waiting for the whole scrape to finish",
 		"total", totalCandidates)
 
@@ -188,7 +227,7 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 
 	tracker := netstats.NewTracker()
 	scrapeStartedAt := time.Now()
-	candChan := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates, stats, seederFloor)
+	candChan := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates, stats, seederFloor, maxFittable)
 
 	// Incremental acting: evaluate candidates stream in, and we act on the
 	// highest-priority ones as soon as they're known, rather than waiting
@@ -269,6 +308,7 @@ drainLoop:
 		"scrape_cached", stats.scrapeCached.Load(),
 		"skipped_held", stats.skippedHeld.Load(),
 		"skipped_blocked", stats.skippedBlocked.Load(),
+		"skipped_too_big", stats.skippedTooBig.Load(),
 		"skipped_age", stats.skippedAge.Load(),
 		"skipped_fetch_err", stats.skippedFetchErr.Load(),
 		"skipped_scrape_err", stats.skippedScrapeErr.Load(),
@@ -291,6 +331,22 @@ drainLoop:
 	// to) can assert on what a scan actually did after the fact - e.g. that
 	// scrapes were issued per candidate rather than dropped.
 	e.lastScanStats = stats
+
+	// A full-catalog scan parses gigabytes of .torrent metadata over its
+	// lifetime, and the probe client accumulates a torrent's worth of
+	// piece-level bookkeeping per candidate probed (see resetProbeClient).
+	// Go's GC reclaims that heap, but the runtime only returns freed memory
+	// to the OS lazily - RSS can stay at the scan's peak long after the
+	// work that allocated it finished, which on a RAM-limited host looks
+	// like a leak (observed: 7GB resident on a host whose held torrents
+	// account for ~1-2GB). Force a full GC and return the reclaimed memory
+	// to the OS now that the scan is done, and drop the accumulated probe
+	// client so its per-piece bookkeeping is released rather than carried
+	// into the idle period (the next scan rebuilds it anyway).
+	if err := e.resetProbeClient(); err != nil {
+		e.logger.Warn("failed to reset probe client after scan", "err", err)
+	}
+	debug.FreeOSMemory()
 
 	return nil
 }
@@ -339,12 +395,13 @@ func (e *Engine) actOnWindowed(ctx context.Context, evaluated []evaluatedCandida
 }
 
 // countPendingCandidates counts catalog items ScanOnce will actually walk
-// through this pass - excluding what's already held or keyword-blocked,
-// both of which are free to check without any network calls - so progress
-// reporting has a meaningful denominator before any fetching starts.
+// through this pass - excluding what's already held, keyword-blocked, or too
+// large to ever fit in any storage location (all free to check without any
+// network calls) - so progress reporting has a meaningful denominator before
+// any fetching starts.
 func countPendingCandidates(catalog atcatalog.Catalog, heldHashes map[string]bool, blocklist interface {
 	Blocks(title, description string) (bool, string)
-}) int {
+}, maxFittable int64) int {
 	count := 0
 	for _, item := range catalog.Items {
 		if heldHashes[item.InfoHash.HexString()] {
@@ -353,9 +410,44 @@ func countPendingCandidates(catalog atcatalog.Catalog, heldHashes map[string]boo
 		if blocked, _ := blocklist.Blocks(item.Title, item.Description); blocked {
 			continue
 		}
+		if maxFittable > 0 && item.SizeBytes > maxFittable {
+			continue
+		}
 		count++
 	}
 	return count
+}
+
+// maxFittableSize returns the largest nominal byte size any single torrent
+// could possibly fit in, across all configured storage locations - the
+// biggest location's total capacity. A torrent larger than this can never be
+// stored on this host, no matter what keep-at displaces or how well the data
+// compresses, so it's disqualified up front (see ScanOnce) rather than
+// fetched, scraped, probed, and only then rejected.
+func (e *Engine) maxFittableSize() int64 {
+	var max int64
+	for _, loc := range e.cfg.Storage.Locations {
+		if int64(loc.Limit) > max {
+			max = int64(loc.Limit)
+		}
+	}
+	return max
+}
+
+// shuffleCatalogItems randomizes the order of the catalog's items in place.
+// Academic Torrents publishes database.xml grouped by upload/series, so the
+// heaviest torrents cluster into contiguous runs (hundreds of datasets over
+// 100GB, e.g. the whole noaa-ncei block). Without shuffling, a scan reaches
+// those clusters with every concurrent evaluation worker fetching and
+// parsing a giant .torrent file at once, which spikes CPU and RAM together
+// and stalls the scrape on exactly those segments (observed on a live node:
+// 228 of 2816 candidates in 47 minutes, stuck at the noaa-ncei cluster).
+// Shuffling spreads the giants across the whole scan so few are in flight
+// at once. It's a pure permutation: every candidate is still evaluated.
+func shuffleCatalogItems(items []atcatalog.Item) {
+	rand.Shuffle(len(items), func(i, j int) {
+		items[i], items[j] = items[j], items[i]
+	})
 }
 
 func (e *Engine) removeDeletedTorrents(held []state.Torrent, catalogHashes map[string]bool) {
@@ -527,7 +619,7 @@ func (t *inflightTracker) snapshot() []inflightCandidate {
 // as they complete, so ScanOnce can start acting on the highest-priority ones
 // before the whole catalog is evaluated. The channel is closed when the walk
 // and all in-flight evaluations finish.
-func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, scanStartedAt time.Time, totalCandidates int, stats *scanStats, seederFloor int) <-chan evaluatedCandidate {
+func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, scanStartedAt time.Time, totalCandidates int, stats *scanStats, seederFloor int, maxFittable int64) <-chan evaluatedCandidate {
 	now := time.Now().UTC()
 	minAge := e.cfg.Scan.ModerationDelay.AsDuration()
 
@@ -585,6 +677,12 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 						if err := e.resetProbeClient(); err != nil {
 							e.logger.Warn("failed to reset probe client mid-scan", "err", err)
 						}
+						// The reset dropped every probed torrent's
+						// piece-level bookkeeping; return that memory to the
+						// OS instead of letting RSS climb with the catalog
+						// size over a multi-hour scan (see ScanOnce's
+						// completion-time FreeOSMemory for the same reasoning).
+						debug.FreeOSMemory()
 					}
 				case <-logTicker.C:
 					e.logScrapeProgress(evalStartedAt, totalCandidates, int(processed.Load()), inflight)
@@ -604,6 +702,13 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 			if blocked, kw := e.blocklist.Blocks(item.Title, item.Description); blocked {
 				stats.skippedBlocked.Add(1)
 				e.logger.Debug("skipping blocked candidate", "title", item.Title, "keyword", kw)
+				continue
+			}
+			if maxFittable > 0 && item.SizeBytes > maxFittable {
+				// Can never fit in any storage location (see
+				// ScanOnce's "will it fit" pre-pass): skip without
+				// fetching metadata, scraping, or probing.
+				stats.skippedTooBig.Add(1)
 				continue
 			}
 
