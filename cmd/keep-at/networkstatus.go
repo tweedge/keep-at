@@ -42,5 +42,6 @@ func cmdNetworkStatus(args []string) error {
 	fmt.Printf("keep-at nodes observed: %d\n", snapshot.NodeCount)
 	fmt.Printf("data being seeded by keep-at nodes: %s\n", netstats.HumanBytes(snapshot.SeedingBytes))
 	fmt.Printf("data being downloaded by keep-at nodes: %s\n", netstats.HumanBytes(snapshot.LeechingBytes))
+	fmt.Printf("p10 seeder floor (anchor for the seed-scarcity gate): %d\n", snapshot.SeederFloor)
 	return nil
 }

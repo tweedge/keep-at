@@ -25,6 +25,17 @@ type Snapshot struct {
 	NodeCount     int   `json:"node_count"`
 	SeedingBytes  int64 `json:"seeding_bytes"`
 	LeechingBytes int64 `json:"leeching_bytes"`
+
+	// SeederFloor is the p10 (10th percentile) number of seeders across
+	// the catalog torrents the completed scan observed with at least one
+	// seeder. It anchors the seed-scarcity gate for the NEXT scan: with a
+	// floor of x, a candidate with seeders <= x passes with full confidence,
+	// and confidence decays as its seeder count rises above the floor. Zero
+	// means no scan has completed yet (or the catalog had nothing seeded),
+	// in which case the selector falls back to the original
+	// aggressiveness^(seeders-1) behavior. Computed at scan completion -
+	// see engine/scan.go and selector.SeederFloor.
+	SeederFloor int `json:"seeder_floor"`
 }
 
 // InProgress reports whether the scan this snapshot describes was still

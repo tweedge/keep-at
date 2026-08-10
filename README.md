@@ -104,7 +104,7 @@ storage:
 scan:
     interval: 168h0m0s
     rate_limit_per_second: 0.5
-    min_seed_margin: 3
+    min_seed_margin: 2
     moderation_delay: 168h0m0s
 aggressiveness: 0.6
 keyword_blocklist: []

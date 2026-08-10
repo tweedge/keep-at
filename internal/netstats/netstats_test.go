@@ -76,6 +76,7 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 		NodeCount:           3,
 		SeedingBytes:        123456,
 		LeechingBytes:       7890,
+		SeederFloor:         2,
 	}
 	if err := Save(path, want); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -87,7 +88,8 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 	}
 	if !got.ScanStartedAt.Equal(want.ScanStartedAt) || got.TotalCandidates != want.TotalCandidates ||
 		got.ProcessedCandidates != want.ProcessedCandidates || got.NodeCount != want.NodeCount ||
-		got.SeedingBytes != want.SeedingBytes || got.LeechingBytes != want.LeechingBytes {
+		got.SeedingBytes != want.SeedingBytes || got.LeechingBytes != want.LeechingBytes ||
+		got.SeederFloor != want.SeederFloor {
 		t.Fatalf("round trip mismatch: got %+v, want %+v", got, want)
 	}
 }

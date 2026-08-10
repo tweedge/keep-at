@@ -129,7 +129,22 @@ type scanStats struct {
 // `keep-at network-status` can report on a scan that's still running.
 func (e *Engine) ScanOnce(ctx context.Context) error {
 	scanStartedAt := time.Now().UTC()
-	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt})
+
+	// The seed-scarcity gate is anchored to the p10 seeder floor measured by
+	// the most recent COMPLETED scan (see selector.SeederFloor). Load that
+	// now so every candidate acted on during this scan is judged against the
+	// catalog's known health. Zero - no completed scan yet, or nothing was
+	// seeded - means the selector falls back to the conservative
+	// aggressiveness^(seeders-1) behavior for this whole scan. It's carried
+	// through every snapshot written during the scan, so a scan that dies
+	// mid-way doesn't lose the anchor, and is replaced by the freshly
+	// recomputed floor when this scan completes.
+	seederFloor := 0
+	if snap, err := netstats.Load(e.networkStatsPath()); err == nil {
+		seederFloor = snap.SeederFloor
+	}
+
+	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt, SeederFloor: seederFloor})
 
 	// Fresh probe client per scan - see resetProbeClient for why this
 	// matters for stability, not just tidiness.
@@ -162,7 +177,7 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 	e.evictStalledTorrents(catalogHashes)
 
 	totalCandidates := countPendingCandidates(catalog, heldHashes, e.blocklist)
-	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt, TotalCandidates: totalCandidates})
+	e.saveNetworkStats(netstats.Snapshot{ScanStartedAt: scanStartedAt, TotalCandidates: totalCandidates, SeederFloor: seederFloor})
 	e.logger.Info("starting scrape: fetching torrent metadata and tracker data for every pending catalog candidate to work out what needs seeding most - this can take a while on a large catalog, and downloads start gradually as the highest-priority candidates are found rather than waiting for the whole scrape to finish",
 		"total", totalCandidates)
 
@@ -173,7 +188,7 @@ func (e *Engine) ScanOnce(ctx context.Context) error {
 
 	tracker := netstats.NewTracker()
 	scrapeStartedAt := time.Now()
-	candChan := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates, stats)
+	candChan := e.evaluateCandidates(ctx, catalog, heldHashes, tracker, scanStartedAt, totalCandidates, stats, seederFloor)
 
 	// Incremental acting: evaluate candidates stream in, and we act on the
 	// highest-priority ones as soon as they're known, rather than waiting
@@ -216,7 +231,7 @@ drainLoop:
 			evaluated = append(evaluated, c)
 			if processed%actEvery == 0 {
 				ramBound = heldCount >= e.maxTorrents
-				e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker)
+				e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker, seederFloor)
 			}
 		}
 	}
@@ -225,7 +240,7 @@ drainLoop:
 		// interrupted; acting on it while shutting down would just start
 		// downloads we're about to abandon.
 		ramBound = heldCount >= e.maxTorrents
-		e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker)
+		e.actOnWindowed(ctx, evaluated, acted, &heldCount, ramBound, tracker, seederFloor)
 	}
 
 	// A scan that was cut short - ctrl+c, a shutdown signal, or any other
@@ -258,6 +273,7 @@ drainLoop:
 		"skipped_fetch_err", stats.skippedFetchErr.Load(),
 		"skipped_scrape_err", stats.skippedScrapeErr.Load(),
 		"eligible", stats.eligible.Load(),
+		"seeder_floor", selector.SeederFloor(evaluatedSeederCounts(evaluated)),
 	)
 
 	e.saveNetworkStats(netstats.Snapshot{
@@ -268,6 +284,7 @@ drainLoop:
 		NodeCount:           tracker.NodeCount(),
 		SeedingBytes:        tracker.SeedingBytes(),
 		LeechingBytes:       tracker.LeechingBytes(),
+		SeederFloor:         selector.SeederFloor(evaluatedSeederCounts(evaluated)),
 	})
 
 	// Keep the stats around so a smoke test (and the CLI, if it ever wants
@@ -278,13 +295,26 @@ drainLoop:
 	return nil
 }
 
+// evaluatedSeederCounts collects the seeder count of every evaluated
+// candidate, including zero-seeder ones (SeederFloor itself filters those
+// out). It's the population the p10 seeder floor is computed over: the
+// candidates keep-at actually considered this scan, which is the set whose
+// health determines whether the catalog is improving.
+func evaluatedSeederCounts(evaluated []evaluatedCandidate) []int {
+	counts := make([]int, len(evaluated))
+	for i, c := range evaluated {
+		counts[i] = c.swarm.Seeders
+	}
+	return counts
+}
+
 // actOnWindowed ranks the already-evaluated candidates and acts on the ones
 // in the current top window that haven't been acted on yet. The window is the
 // smaller of e.maxTorrents (the most torrents keep-at can hold) and the
 // number evaluated so far, which guarantees we only ever seed candidates
 // that are genuinely among the best - and that the best ones start seeding
 // as soon as they're evaluated, without waiting for the full catalog.
-func (e *Engine) actOnWindowed(ctx context.Context, evaluated []evaluatedCandidate, acted map[string]bool, heldCount *int, ramBound bool, tracker *netstats.Tracker) {
+func (e *Engine) actOnWindowed(ctx context.Context, evaluated []evaluatedCandidate, acted map[string]bool, heldCount *int, ramBound bool, tracker *netstats.Tracker, seederFloor int) {
 	ranked := rankEvaluated(evaluated, ramBound)
 	// Only act on the top of the running ranking. The window is the smaller
 	// of how many torrents keep-at can hold and how many candidates we've
@@ -303,7 +333,7 @@ func (e *Engine) actOnWindowed(ctx context.Context, evaluated []evaluatedCandida
 		}
 		acted[key] = true
 		safely(e.logger, "acting on "+c.title, func() {
-			e.actOnCandidate(ctx, c, heldCount, tracker)
+			e.actOnCandidate(ctx, c, heldCount, tracker, seederFloor)
 		})
 	}
 }
@@ -497,7 +527,7 @@ func (t *inflightTracker) snapshot() []inflightCandidate {
 // as they complete, so ScanOnce can start acting on the highest-priority ones
 // before the whole catalog is evaluated. The channel is closed when the walk
 // and all in-flight evaluations finish.
-func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, scanStartedAt time.Time, totalCandidates int, stats *scanStats) <-chan evaluatedCandidate {
+func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catalog, heldHashes map[string]bool, tracker *netstats.Tracker, scanStartedAt time.Time, totalCandidates int, stats *scanStats, seederFloor int) <-chan evaluatedCandidate {
 	now := time.Now().UTC()
 	minAge := e.cfg.Scan.ModerationDelay.AsDuration()
 
@@ -529,6 +559,7 @@ func (e *Engine) evaluateCandidates(ctx context.Context, catalog atcatalog.Catal
 				NodeCount:           tracker.NodeCount(),
 				SeedingBytes:        tracker.SeedingBytes(),
 				LeechingBytes:       tracker.LeechingBytes(),
+				SeederFloor:         seederFloor,
 			}
 		}
 
@@ -737,7 +768,7 @@ func rankEvaluated(candidates []evaluatedCandidate, ramBound bool) []evaluatedCa
 // The RAM-driven torrent-count cap (e.maxTorrents) is enforced here: once
 // keep-at is holding the maximum number of torrents its RAM budget allows, it
 // stops adding new ones and only swaps (which keeps or lowers the count).
-func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldCount *int, tracker *netstats.Tracker) {
+func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldCount *int, tracker *netstats.Tracker, seederFloor int) {
 	// Re-read the full metadata from keep-at's on-disk torrent cache now
 	// that we're actually about to act on this candidate. It was fetched (and
 	// cached) during evaluation but deliberately not kept in memory - the
@@ -788,7 +819,7 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 	if heldCount == nil || *heldCount < e.maxTorrents {
 		if location, err := chooseLocation(e.cfg.Storage.Locations, freeByPath, sizeByPath, rand.Float64()); err == nil {
 			var d selector.SwapDecision
-			added, d = e.tryAdd(c, md, sizeBytes, location, nil, heldCount, keepAtPeers)
+			added, d = e.tryAdd(c, md, sizeBytes, location, nil, heldCount, keepAtPeers, seederFloor)
 			decision = d
 			if added {
 				e.logEvaluatedCandidate(c, decision, keepAtPeers)
@@ -800,7 +831,15 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 			"title", c.title, "held", *heldCount, "max_torrents", e.maxTorrents)
 	}
 
-	if swapped, d := e.trySwap(c, md, sizeBytes, heldCount, keepAtPeers); swapped {
+	if swapped, d := e.trySwap(c, md, sizeBytes, heldCount, keepAtPeers, seederFloor); swapped {
+		decision = d
+	} else if !decision.SeedScarcityBlocked() && d.Reason != "" {
+		// trySwap failed, but it returns the most informative decision it
+		// made (e.g. a seed-scarcity roll failure when the fill path was
+		// skipped at the RAM cap). Adopt it unless the fill path already
+		// settled the outcome with its own seed-scarcity rejection - that
+		// rejection is the final answer for the candidate, and it's
+		// deliberately not logged (see logEvaluatedCandidate).
 		decision = d
 	}
 	e.logEvaluatedCandidate(c, decision, keepAtPeers)
@@ -811,7 +850,17 @@ func (e *Engine) actOnCandidate(ctx context.Context, c evaluatedCandidate, heldC
 // per candidate, even though the fill and swap paths each run their own
 // selection roll: the operator wants to see what happened to the candidate,
 // not duplicate noise from the internal fill-then-swap attempt sequence.
+//
+// A candidate rejected by the seed-scarcity roll is deliberately NOT logged:
+// that's the routine outcome for any well-seeded candidate (the expected
+// case, not an error), and at catalog scale there are hundreds of them per
+// scan, so logging each one drowns out the lines that actually matter. See
+// selector.ReasonSeedScarcityRollFailed. Every other outcome - added,
+// swapped, margin failure, RAM cap, etc. - is still logged.
 func (e *Engine) logEvaluatedCandidate(c evaluatedCandidate, decision selector.SwapDecision, keepAtPeers int) {
+	if decision.SeedScarcityBlocked() {
+		return
+	}
 	e.logger.Info("evaluated candidate",
 		"title", c.title,
 		"seeders", c.swarm.Seeders,
@@ -832,7 +881,7 @@ func (e *Engine) logEvaluatedCandidate(c evaluatedCandidate, decision selector.S
 // can bump it (a swap passes a non-nil displaced and keeps the count
 // constant). A plain fill past the RAM-driven torrent cap is rejected
 // outright: RAM scales per-torrent, so the count cap is the real memory bound.
-func (e *Engine) tryAdd(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, location string, displaced []selector.Held, heldCount *int, keepAtPeers int) (bool, selector.SwapDecision) {
+func (e *Engine) tryAdd(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, location string, displaced []selector.Held, heldCount *int, keepAtPeers int, seederFloor int) (bool, selector.SwapDecision) {
 	if heldCount != nil && displaced == nil && *heldCount >= e.maxTorrents {
 		e.logger.Debug("rejected candidate: would exceed RAM-driven torrent cap",
 			"title", c.title, "held", *heldCount, "max_torrents", e.maxTorrents)
@@ -846,6 +895,7 @@ func (e *Engine) tryAdd(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes 
 		Seeders:     c.swarm.Seeders,
 		Leechers:    c.swarm.Leechers,
 		KeepAtPeers: keepAtPeers,
+		SeederFloor: seederFloor,
 	}
 
 	decision := selector.EvaluateSwap(candidate, displaced, e.cfg.Scan.MinSeedMargin, e.cfg.Aggressiveness, rand.Float64())
@@ -879,7 +929,7 @@ func (e *Engine) tryAdd(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes 
 // torrents when RAM is the binding constraint" behavior. keepAtPeers is the
 // on-demand swarm-probe count from the caller, fed into the swap decision.
 // It returns whether a swap happened, and the swap decision that was made.
-func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, heldCount *int, keepAtPeers int) (bool, selector.SwapDecision) {
+func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes int64, heldCount *int, keepAtPeers int, seederFloor int) (bool, selector.SwapDecision) {
 	ramBound := heldCount != nil && *heldCount >= e.maxTorrents
 	held := e.state.All()
 
@@ -888,6 +938,11 @@ func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes
 		byLocation[h.StorageLocation] = append(byLocation[h.StorageLocation], h)
 	}
 
+	// The last decision made is what gets reported if no location ends up
+	// accommodating the swap, so actOnCandidate's single "evaluated
+	// candidate" line shows the real reason (including a seed-scarcity roll
+	// failure, which the engine suppresses) rather than a generic empty one.
+	lastDecision := selector.SwapDecision{ShouldSwap: false, Reason: "no held torrent clears the seed margin against this candidate"}
 	for location, inLocation := range byLocation {
 		// Both the candidate's needed space and the freed space from
 		// displacing held torrents are measured post-compression (actual
@@ -905,16 +960,18 @@ func (e *Engine) trySwap(c evaluatedCandidate, md *attorrent.Metadata, sizeBytes
 			selHeld[i] = selector.Held{InfoHash: h.InfoHash, Title: h.Title, SizeBytes: h.SizeBytes, Seeders: h.LastKnownSeeders}
 		}
 
-		if ok, decision := e.tryAdd(c, md, sizeBytes, location, selHeld, heldCount, keepAtPeers); ok {
+		if ok, decision := e.tryAdd(c, md, sizeBytes, location, selHeld, heldCount, keepAtPeers, seederFloor); ok {
 			for _, h := range displaced {
 				if err := e.RemoveTorrent(h.InfoHash, h.StorageLocation); err != nil {
 					e.logger.Error("failed to remove displaced torrent", "title", h.Title, "err", err)
 				}
 			}
 			return true, decision
+		} else {
+			lastDecision = decision
 		}
 	}
-	return false, selector.SwapDecision{}
+	return false, lastDecision
 }
 
 // heldOnDiskBytes returns a held torrent's actual on-disk (post-compression)

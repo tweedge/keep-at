@@ -6,17 +6,24 @@ This is the authoritative explanation of *why* keep-at behaves the way it does: 
 
 Every scan, keep-at pulls Academic Torrents' catalog (`database.xml`), filters out anything keyword-blocked or too young (see "Age, precisely" below), and checks the remaining candidates' tracker scrape data. A torrent needs at least one live seed to be considered "available" - keep-at won't start a download that can never finish.
 
-Among available candidates, fewer seeds means higher priority. If keep-at has free space, it fills it with the highest-priority candidate it can. If space is full, it'll displace currently-held torrents for a new candidate, but only if the candidate has at least `min_seed_margin` (default 3) fewer seeds than everything it would replace.
+Among available candidates, fewer seeds means higher priority. If keep-at has free space, it fills it with the highest-priority candidate it can. If space is full, it'll displace currently-held torrents for a new candidate, but only if the candidate has at least `min_seed_margin` (default 2) fewer seeds than everything it would replace.
 
 ## Seeding minimally-seeded torrents
 
-keep-at's purpose is to seed the torrents that need seeding - not to put a keep-at copy on everything. A torrent with one live seed is exactly what keep-at is for; a torrent with a dozen seeders is already healthy on its own and doesn't need keep-at's help. So before committing to a download, keep-at gates on how many seeders the torrent already has. The chance keep-at proceeds is:
+keep-at's purpose is to seed the torrents that need seeding - not to put a keep-at copy on everything. A torrent with one live seed is exactly what keep-at is for; a torrent with a dozen seeders is already healthy on its own and doesn't need keep-at's help. So before committing to a download, keep-at gates on how many seeders the torrent already has, **relative to how healthy the catalog as a whole is**. The chance keep-at proceeds is:
 
 ```
-n = aggressiveness ^ (seeders - 1)
+n = aggressiveness ^ max(0, seeders - x)
 ```
 
-With a single seeder, n is 1: go ahead confidently - that's the primary target. As a torrent gains more seeders, n shrinks toward zero (aggressiveness defaults to 0.6, and is always between 0 and 1), so a torrent with many seeders is effectively never selected. keep-at rolls a random float and proceeds only if the roll is below n.
+where x is the **p10 seeder floor**: the 10th percentile of seeder counts across all catalog torrents the last completed scan saw with at least one seeder, stored in the network-status snapshot (see "Network-wide stats" below).
+
+With a single seeder and no prior data, x is effectively 1, so n is 1: go ahead confidently - that's the primary target. As a torrent gains more seeders, n shrinks toward zero (aggressiveness defaults to 0.6, and is always between 0 and 1), so a torrent with many seeders is effectively never selected. keep-at rolls a random float and proceeds only if the roll is below n.
+
+The floor is what makes this respond to the catalog's overall health rather than a fixed baseline of one:
+
+- **Before any scan has completed** - no network data exists yet - keep-at has never measured the catalog, so x is treated as 1 and the gate reduces to the original `aggressiveness ^ (seeders - 1)`: conservative from the start, and a single-seeder torrent passes confidently.
+- **After a scan completes**, x is recomputed from what that scan observed and stored in the network-status snapshot. If overall AcademicTorrents health has improved - the p10 floor is now, say, 2 or 3 - then torrents at or below the new floor are treated as primary targets too (n = 1), and a node with space available keeps finding content to store as its slots fill: it isn't holding back just because the catalog got healthier. Conversely, the floor only rises when health genuinely improves. If it doesn't improve above the measured floor, keep-at stays just as effective at smaller scale - it never assumes the whole network is healthier than it actually is.
 
 This gate runs whether keep-at is filling free space or displacing something, so it applies even when there's plenty of empty disk - a well-seeded torrent isn't worth a slot that could go to one that actually needs it.
 
@@ -45,6 +52,8 @@ Academic Torrents' `database.xml` doesn't include an upload date, and neither do
 ## Network-wide stats
 
 While scanning, keep-at briefly joins the swarm of every candidate anyone at all is seeding or leeching, and records, per keep-at peer found: its (best-effort) node identity, and whether it has the whole torrent (seeding) or not (leeching). `keep-at network-status` reports the totals. This keep-at peer count is metadata only - it does not gate which torrents keep-at selects (see "Seeding minimally-seeded torrents" above).
+
+The network-status snapshot also stores the **p10 seeder floor** (x from the seed-scarcity gate, see "Seeding minimally-seeded torrents" above), recomputed from every completed scan's catalog observations so the next scan anchors its selection to the catalog's measured health.
 
 This is necessarily an estimate, not a census:
 

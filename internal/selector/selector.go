@@ -26,6 +26,14 @@ type Candidate struct {
 	// gate below is keyed on total Seeders, not on how many keep-at nodes
 	// happen to be present.
 	KeepAtPeers int
+	// SeederFloor is the p10 (10th percentile) number of seeders across all
+	// torrents in the catalog with at least one seeder, as measured by the
+	// most recently completed scan. It anchors SelectionChance: a torrent is
+	// judged against how the rest of the catalog is doing, not against a
+	// fixed baseline of one. Before any scan has completed it's 0, which
+	// makes SelectionChance fall back to the original
+	// aggressiveness^(seeders-1) behavior. See SelectionChance.
+	SeederFloor int
 }
 
 // Available reports whether a candidate meets the availability bar: at
@@ -79,26 +87,74 @@ func RankCandidates(candidates []Candidate, ramBound bool) []Candidate {
 }
 
 // SelectionChance is n: the probability keep-at proceeds with a candidate
-// given how many seeders it already has. See DESIGN.md for the full
-// rationale.
+// given how many seeders it already has, relative to how the rest of the
+// catalog is doing. See DESIGN.md for the full rationale.
 //
 // keep-at's purpose is to seed minimally-seeded torrents - not to put a
-// keep-at copy on everything. A torrent with one live seed is exactly what
-// keep-at is for, so n is 1 there (go ahead confidently). As a torrent
-// gains more seeders it's increasingly healthy on its own, and n shrinks
-// toward zero (aggressiveness is strictly between 0 and 1), so well-seeded
-// torrents are effectively never selected. This is the direction that
-// matters: keep-at should spend its slots on the torrents that need them,
-// not pile copies onto ones that are already fine.
+// keep-at copy on everything. The exponent is the candidate's seeder count
+// minus the catalog's p10 seeder floor (seederFloor), floored at zero:
+//
+//	n = aggressiveness ^ max(0, seeders - seederFloor)
+//
+// With seederFloor 1 (no completed scan yet, or a catalog where a tenth of
+// seeded torrents have just one seeder), this reduces to the original
+// n = aggressiveness ^ (seeders - 1): a single-seeder torrent is the
+// primary target and passes confidently, and n shrinks toward zero as
+// seeders accumulate. As the catalog's overall health improves - the p10
+// floor rises - so does the seeder count a candidate must beat to be
+// confidently selected. That's deliberate: keep-at's job scales with how
+// under-seeded the catalog is, and anchoring to a moving floor means it
+// keeps finding genuinely under-seeded content as overall health improves,
+// while never assuming health has risen above the measured floor before it
+// actually has. A torrent at or below the floor is always selected with
+// full confidence.
 //
 // Note this is deliberately keyed on TOTAL seeders, not on how many other
 // keep-at nodes are in the swarm. The keep-at peer count is network-status
 // metadata (see Candidate.KeepAtPeers); it doesn't gate selection.
-func SelectionChance(aggressiveness float64, seeders int) float64 {
+func SelectionChance(aggressiveness float64, seeders int, seederFloor int) float64 {
 	if seeders < 1 {
 		seeders = 1
 	}
-	return math.Pow(aggressiveness, float64(seeders-1))
+	if seederFloor < 1 {
+		seederFloor = 1
+	}
+	exponent := seeders - seederFloor
+	if exponent < 0 {
+		exponent = 0
+	}
+	return math.Pow(aggressiveness, float64(exponent))
+}
+
+// SeederFloor computes the p10 (10th percentile) number of seeders across
+// the given torrents' seeder counts, considering only torrents with at
+// least one seeder. It's the anchor x for SelectionChance: a candidate at
+// or below the floor passes with full confidence, and confidence decays as
+// its seeder count rises above the floor.
+//
+// The nearest-rank method is used: for n positive counts, the floor is the
+// value at rank ceil(0.10 * n) when sorted ascending (i.e. the smallest
+// value such that at least 10% of seeded torrents have that many or fewer
+// seeders). With no positive counts at all - a catalog where nothing is
+// seeded - it returns 0, meaning "no health signal", which SelectionChance
+// treats as the conservative single-seeder baseline.
+func SeederFloor(seedCounts []int) int {
+	var seeded []int
+	for _, s := range seedCounts {
+		if s > 0 {
+			seeded = append(seeded, s)
+		}
+	}
+	if len(seeded) == 0 {
+		return 0
+	}
+	sort.Ints(seeded)
+	rank := (len(seeded) + 9) / 10 // ceil(n/10), nearest-rank p10
+	idx := rank - 1
+	if idx < 0 {
+		idx = 0
+	}
+	return seeded[idx]
 }
 
 // MeetsSeedMargin reports whether candidateSeeders is at least minSeedMargin
@@ -128,6 +184,20 @@ type SwapDecision struct {
 	Reason     string
 }
 
+// ReasonSeedScarcityRollFailed is the Reason on a SwapDecision when the
+// seed-scarcity roll did not pass: the candidate already has enough seeders
+// relative to the catalog's floor, so keep-at backs off. This is the routine
+// outcome for well-seeded candidates - the expected case, not an error - and
+// the engine deliberately does not log it (see logEvaluatedCandidate).
+const ReasonSeedScarcityRollFailed = "seed-scarcity roll failed; candidate already has enough seeders"
+
+// SeedScarcityBlocked reports whether this decision failed specifically
+// because the seed-scarcity roll didn't pass, as opposed to some other
+// reason (unavailable candidate, seed margin not met, RAM cap, etc.).
+func (d SwapDecision) SeedScarcityBlocked() bool {
+	return d.Reason == ReasonSeedScarcityRollFailed
+}
+
 // EvaluateSwap decides whether to start downloading candidate, optionally
 // displacing the torrents in displaced to make room. It swaps when roll <
 // n: see DESIGN.md for why that comparison direction is what actually
@@ -150,12 +220,12 @@ func EvaluateSwap(candidate Candidate, displaced []Held, minSeedMargin int, aggr
 		return SwapDecision{ShouldSwap: false, Reason: "candidate does not beat displaced torrents by the required margin"}
 	}
 
-	chance := SelectionChance(aggressiveness, candidate.Seeders)
+	chance := SelectionChance(aggressiveness, candidate.Seeders, candidate.SeederFloor)
 	shouldSwap := roll < chance
 
 	reason := "seed-scarcity roll succeeded"
 	if !shouldSwap {
-		reason = "seed-scarcity roll failed; candidate already has enough seeders"
+		reason = ReasonSeedScarcityRollFailed
 	}
 
 	return SwapDecision{ShouldSwap: shouldSwap, Chance: chance, Roll: roll, Reason: reason}

@@ -65,7 +65,7 @@ Defaults to the same OS-appropriate base directory as `--storage` (see above), u
 
 ### `scan.min_seed_margin` / `--min-seed-margin`
 
-*Default: `3`.* How many fewer seeds a candidate torrent needs, relative to a held torrent (or torrents), before keep-at will displace it to make room. Higher values make keep-at more conservative about swapping; `0` means any strictly-lower seed count qualifies.
+*Default: `2`.* How many fewer seeds a candidate torrent needs, relative to a held torrent (or torrents), before keep-at will displace it to make room. Higher values make keep-at more conservative about swapping; `0` means any strictly-lower seed count qualifies. This is the swap-specific guard on top of the global seed-scarcity gate - see DESIGN.md's "Seeding minimally-seeded torrents" section for how the two interact.
 
 ### `scan.moderation_delay` / `--moderation-delay`
 
@@ -77,7 +77,7 @@ Defaults to the same OS-appropriate base directory as `--storage` (see above), u
 
 ### `aggressiveness` / `--aggressiveness`
 
-*Default: `0.6`.* Must be strictly between 0 and 1. Base of the seed-scarcity probability `aggressiveness ^ (seeders - 1)` - keep-at's purpose is to seed minimally-seeded torrents, so this is the chance it proceeds with a candidate given how many seeders it already has. A torrent with one seed passes with probability 1; a torrent with many seeds is effectively never selected. Lower values make keep-at even more selective. See DESIGN.md for the full explanation and the math.
+*Default: `0.6`.* Must be strictly between 0 and 1. Base of the seed-scarcity probability `aggressiveness ^ max(0, seeders - x)` - keep-at's purpose is to seed minimally-seeded torrents, so this is the chance it proceeds with a candidate given how many seeders it already has relative to the catalog's p10 seeder floor x (measured by the last completed scan; effectively 1 before any scan has run). A torrent at or below the floor passes with probability 1; a torrent with many seeds above it is effectively never selected. Lower values make keep-at even more selective. See DESIGN.md for the full explanation and the math.
 
 ## Filtering
 

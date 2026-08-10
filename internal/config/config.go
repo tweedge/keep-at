@@ -33,8 +33,12 @@ const DefaultAggressiveness = 0.6
 
 // DefaultMinSeedMargin is how many fewer seeds a candidate torrent needs
 // relative to what it would displace before keep-at considers swapping at
-// all.
-const DefaultMinSeedMargin = 3
+// all. Two rather than three: with the p10-anchored seed-scarcity gate
+// (see DESIGN.md), the margin is the swap-specific guard on top of that
+// global gate, and 2 keeps keep-at willing to replace a held torrent when
+// the gap is real but doesn't demand an increasingly rare margin as the
+// catalog's overall health improves.
+const DefaultMinSeedMargin = 2
 
 // DefaultScanInterval and DefaultModerationDelay both default to one week:
 // how often keep-at rescans the catalog, and how long a torrent must have
