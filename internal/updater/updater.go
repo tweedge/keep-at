@@ -15,14 +15,22 @@ import (
 	"runtime"
 )
 
-// ReleasesURL is GitHub's API endpoint for the latest keep-at release.
-// Release assets are expected to be named
+// ReleasesURL is GitHub's API endpoint for the latest stable (non-prerelease)
+// keep-at release. Release assets are expected to be named
 // keep-at_<GOOS>_<GOARCH>.tar.gz, each containing a single "keep-at"
-// binary - see the build scripts.
-const ReleasesURL = "https://api.github.com/repos/tweedge/keep-at/releases/latest"
+// binary - see the build scripts. It's a var (not const) so tests can point
+// it at an httptest server.
+var ReleasesURL = "https://api.github.com/repos/tweedge/keep-at/releases/latest"
+
+// ReleasesListURL lists all releases, newest first, including prereleases.
+// Used when the user opts into beta versions: the first non-draft release
+// in the list may be a prerelease, which is exactly what a beta update wants.
+// A var for the same testability reason as ReleasesURL.
+var ReleasesListURL = "https://api.github.com/repos/tweedge/keep-at/releases"
 
 type release struct {
 	TagName string  `json:"tag_name"`
+	Draft   bool    `json:"draft"`
 	Assets  []asset `json:"assets"`
 }
 
@@ -32,8 +40,9 @@ type asset struct {
 }
 
 // LatestVersion returns the tag name of the latest GitHub release.
-func LatestVersion(client *http.Client, userAgent string) (string, error) {
-	rel, err := fetchLatestRelease(client, userAgent, ReleasesURL)
+// includeBeta selects whether prerelease (beta) releases are eligible.
+func LatestVersion(client *http.Client, userAgent string, includeBeta bool) (string, error) {
+	rel, err := fetchLatestRelease(client, userAgent, includeBeta)
 	if err != nil {
 		return "", err
 	}
@@ -42,17 +51,13 @@ func LatestVersion(client *http.Client, userAgent string) (string, error) {
 
 // Apply downloads the release asset matching the current platform and
 // replaces the binary at currentExecPath with it, preserving its file
-// mode. It downloads to a temp file first and only swaps the executable in
+// mode. includeBeta selects whether prerelease (beta) releases are
+// eligible; the default (false) only considers stable releases. It
+// downloads to a temp file first and only swaps the executable in
 // afterward, so a failed or interrupted update leaves the existing binary
 // untouched.
-func Apply(client *http.Client, userAgent, currentExecPath string) (newVersion string, err error) {
-	return applyFromURL(client, userAgent, currentExecPath, ReleasesURL)
-}
-
-// applyFromURL is Apply with the releases endpoint overridable, so tests
-// can point it at an httptest server instead of the real GitHub API.
-func applyFromURL(client *http.Client, userAgent, currentExecPath, releasesURL string) (newVersion string, err error) {
-	rel, err := fetchLatestRelease(client, userAgent, releasesURL)
+func Apply(client *http.Client, userAgent, currentExecPath string, includeBeta bool) (newVersion string, err error) {
+	rel, err := fetchLatestRelease(client, userAgent, includeBeta)
 	if err != nil {
 		return "", err
 	}
@@ -81,7 +86,47 @@ func applyFromURL(client *http.Client, userAgent, currentExecPath, releasesURL s
 	return rel.TagName, nil
 }
 
-func fetchLatestRelease(client *http.Client, userAgent, releasesURL string) (*release, error) {
+// fetchLatestRelease returns the release keep-at should update to. With
+// includeBeta false it uses GitHub's /releases/latest endpoint, which
+// already excludes prereleases. With includeBeta true it lists all releases
+// and takes the newest non-draft one, which may be a prerelease.
+func fetchLatestRelease(client *http.Client, userAgent string, includeBeta bool) (*release, error) {
+	if !includeBeta {
+		return fetchReleaseFromURL(client, userAgent, ReleasesURL)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, ReleasesListURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("updater: building request: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("updater: fetching releases: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("updater: fetching releases returned %s", resp.Status)
+	}
+
+	var releases []release
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, fmt.Errorf("updater: parsing release metadata: %w", err)
+	}
+	for i := range releases {
+		if releases[i].Draft {
+			continue
+		}
+		return &releases[i], nil
+	}
+	return nil, fmt.Errorf("updater: no releases found")
+}
+
+// fetchReleaseFromURL fetches a single release object from releasesURL.
+func fetchReleaseFromURL(client *http.Client, userAgent, releasesURL string) (*release, error) {
 	req, err := http.NewRequest(http.MethodGet, releasesURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("updater: building request: %w", err)

@@ -63,7 +63,7 @@ Usage:
   keep-at service uninstall                remove the systemd service (Linux, root)
   keep-at network-status [--config PATH]   report on other keep-at nodes seen while scanning
   keep-at hosted-torrents [--config PATH]  list torrents this host holds and seeds
-  keep-at self-update                      update to the latest release
+  keep-at self-update [--beta]              update to the latest release (use --beta to allow prerelease/beta builds)
   keep-at version                          print the version and exit
 
 Run/start take every config setting as a flag (run --help for the full

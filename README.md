@@ -76,6 +76,12 @@ And to update to the latest release:
 keep-at self-update
 ```
 
+By default this only considers stable releases. To opt into prerelease/beta builds, add `--beta`:
+
+```
+keep-at self-update --beta
+```
+
 ### Advanced Configuration Settings
 
 A config file is only worth reaching for once you want more than one storage location, or don't want to repeat flags every time (`service install` writes one for you automatically - see above). Point `--config` at a path that doesn't exist yet and keep-at will write a starter one there and tell you to edit it:

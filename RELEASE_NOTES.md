@@ -1,5 +1,33 @@
 # keep-at release notes
 
+## v0.7.1-beta - fix the crashes and give self-update a beta channel
+
+This is a beta release, published from the same commits the next stable release will come from. It exists so the crash fixes below can be validated in the field before the stable cut.
+
+### Two process-killing bugs fixed (via the anacrolix/torrent fork)
+
+keep-at now builds against `github.com/tweedge/anacrolix-torrent` at tag `v1.61.0-patch1` - upstream v1.61.0 plus two backported crash fixes:
+
+- **Webseed desync panic** (anacrolix/torrent #1036): `updateWebseedRequests` used to panic on a client/torrent request-view desync, from a background timer goroutine nothing can recover from. It's now a warning that skips the update cycle.
+- **Tracker-announce dispatcher crash** (`sync: Unlock of unlocked RWMutex`): the announce path released the client lock around the network call, so a panic in that window unwound with the lock released and the caller's deferred `unlock()` hit an already-unlocked mutex - a runtime fatal error, not a recoverable panic. The fork now always re-acquires the lock on exit (including on panic), guards against a missing tracker client, recovers panics on the announce and timer goroutines, and demotes the dispatcher's churn-induced desync assertions to warnings (per the upstream guidance in vintikzzz/torrent 2cc55b5).
+
+The earlier download rate-limiter fix (stale `ReserveN` timestamps letting sustained throughput exceed the configured rate) is carried in the same fork. See docs/DESIGN.md for the full story.
+
+### Interrupted scans don't defer the next one
+
+A scan cut short by ctrl+c or a shutdown signal is no longer persisted as complete. Previously that set `ScanCompletedAt`, so the next start waited out the remainder of the scan interval before scanning again; now an aborted scan stays "in progress" and a restart scans immediately.
+
+### `self-update --beta`
+
+`keep-at self-update` now takes an optional `--beta` flag:
+
+```
+keep-at self-update          # stable releases only (default)
+keep-at self-update --beta   # allow prerelease/beta builds
+```
+
+The default only considers non-prerelease releases, so this beta can't be pulled in accidentally.
+
 ## v0.7.0 - make every byte count, and don't hold a slot for a torrent that can never finish
 
 ### Post-compression space accounting
