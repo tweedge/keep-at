@@ -74,5 +74,11 @@ func cmdStatus(args []string) error {
 	fmt.Printf("  avg upload since boot: %s\n", netstats.HumanBitsPerSec(runtimeStats.UploadBitsPerSec()))
 	fmt.Printf("  avg download since boot: %s\n", netstats.HumanBitsPerSec(runtimeStats.DownloadBitsPerSec()))
 	fmt.Printf("  active peers: %d\n", runtimeStats.ActivePeers)
+	if runtimeStats.ProcessRSSBytes > 0 {
+		fmt.Printf("  memory: %s RSS, %s Go heap, %d goroutines\n",
+			netstats.HumanBytes(runtimeStats.ProcessRSSBytes),
+			netstats.HumanBytes(runtimeStats.HeapAllocBytes),
+			runtimeStats.Goroutines)
+	}
 	return nil
 }

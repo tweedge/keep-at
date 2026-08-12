@@ -140,6 +140,15 @@ type Config struct {
 	// so `keep-at status` can display it. Zero disables the periodic log
 	// (one summary is still written at startup).
 	StatsInterval Duration `yaml:"stats_interval"`
+
+	// Debug enables verbose diagnostics for triaging long-running issues on
+	// hosts the operator can't easily attach to: debug-level logging, and a
+	// periodic collection (memory snapshots plus pprof heap/goroutine
+	// profiles) written under <data_dir>/debug/ so a remote operator can run
+	// keep-at with debug on, wait out the hours it takes the problem to
+	// recur, and hand the directory back for analysis. See the engine's
+	// debug collection for what exactly is written and how often.
+	Debug bool `yaml:"debug"`
 }
 
 // StorageLocation is one folder keep-at is allowed to fill, up to Limit.

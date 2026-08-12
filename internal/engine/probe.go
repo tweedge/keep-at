@@ -54,6 +54,7 @@ func (e *Engine) probeSwarm(ctx context.Context, mi *metainfo.MetaInfo, timeout 
 	if err != nil {
 		return nil, err
 	}
+	e.probesSinceReset.Add(1)
 
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(probePollInterval)

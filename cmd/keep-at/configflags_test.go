@@ -79,6 +79,24 @@ func TestResolveWithStallEvictionTimeoutFlag(t *testing.T) {
 	}
 }
 
+func TestResolveWithDebugFlag(t *testing.T) {
+	withServiceConfigPath(t, filepath.Join(t.TempDir(), "nonexistent.yaml"))
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	cf := addConfigFlags(fs)
+	if err := fs.Parse([]string{"--storage-limit", "500G", "--debug"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	cfg, err := cf.resolve(fs)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !cfg.Debug {
+		t.Fatal("expected Debug=true with --debug")
+	}
+}
+
 func TestResolveErrorsWithNoFlagsAndNoServiceConfig(t *testing.T) {
 	withServiceConfigPath(t, filepath.Join(t.TempDir(), "nonexistent.yaml"))
 

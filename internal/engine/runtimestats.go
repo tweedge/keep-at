@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"runtime"
 	"time"
 
 	"github.com/tweedge/keep-at/internal/config"
@@ -53,18 +54,25 @@ func (e *Engine) collectRuntimeStats() netstats.RuntimeStats {
 	// overhead, handshakes, and duplicate/wasted chunks from the swarm. The
 	// gap between the two is the cost of swarming, and it's why a naive
 	// "downloaded" figure can far exceed what actually ended up on disk.
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
 	return netstats.RuntimeStats{
-		CollectedAt:         time.Now().UTC(),
-		UptimeSeconds:       int64(time.Since(e.startedAt).Seconds()),
-		HeldTorrents:        len(held),
-		SeedingTorrents:     seeding,
-		DiskUsedBytes:       diskUsed,
-		DiskLimitBytes:      diskLimit,
-		UsefulBytesUploaded: stats.PeerConns.BytesWrittenData.Int64(),
+		CollectedAt:           time.Now().UTC(),
+		UptimeSeconds:         int64(time.Since(e.startedAt).Seconds()),
+		HeldTorrents:          len(held),
+		SeedingTorrents:       seeding,
+		DiskUsedBytes:         diskUsed,
+		DiskLimitBytes:        diskLimit,
+		UsefulBytesUploaded:   stats.PeerConns.BytesWrittenData.Int64(),
 		UsefulBytesDownloaded: stats.PeerConns.BytesReadUsefulData.Int64(),
-		TotalBytesUploaded:  stats.PeerConns.BytesWritten.Int64(),
-		TotalBytesDownloaded: stats.PeerConns.BytesRead.Int64(),
-		ActivePeers:         stats.TotalPeers,
+		TotalBytesUploaded:    stats.PeerConns.BytesWritten.Int64(),
+		TotalBytesDownloaded:  stats.PeerConns.BytesRead.Int64(),
+		ActivePeers:           stats.TotalPeers,
+		ProcessRSSBytes:       readProcessRSS(),
+		HeapAllocBytes:        int64(ms.HeapAlloc),
+		Goroutines:            runtime.NumGoroutine(),
 	}
 }
 
@@ -85,6 +93,9 @@ func (e *Engine) logAndSaveRuntimeStats(kind string) {
 		"held", s.HeldTorrents,
 		"seeding", seeding,
 		"downloading", downloading,
+		"rss", humanBytes(s.ProcessRSSBytes),
+		"heap_alloc", humanBytes(s.HeapAllocBytes),
+		"goroutines", s.Goroutines,
 		"disk_used", humanBytes(s.DiskUsedBytes),
 		"disk_limit", humanBytes(s.DiskLimitBytes),
 		"disk_used_pct", s.DiskUsedPct(),

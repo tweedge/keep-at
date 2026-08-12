@@ -23,6 +23,12 @@ import (
 func (e *Engine) Run(ctx context.Context) error {
 	e.logAndSaveRuntimeStats("startup")
 
+	// Debug collection (memory snapshots, pprof heap/goroutine profiles,
+	// short CPU traces under <data_dir>/debug/) when cfg.Debug is set; no-op
+	// otherwise. Started first so even a short-lived run captures data.
+	stopDebug := e.startDebugCollection(ctx)
+	defer stopDebug()
+
 	stopStats := e.startRuntimeStatsLoop(ctx)
 	defer stopStats()
 

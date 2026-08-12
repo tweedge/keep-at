@@ -38,7 +38,11 @@ func runForeground(cfg config.Config) error {
 		return fmt.Errorf("creating data dir %s: %w", cfg.DataDir, err)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	level := slog.LevelInfo
+	if cfg.Debug {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
 	startedAt := time.Now()
 	e, err := engine.New(cfg, engine.Options{Logger: logger})

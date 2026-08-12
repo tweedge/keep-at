@@ -103,8 +103,8 @@ type RuntimeStats struct {
 	// boot" framing of the transfer counters.
 	UptimeSeconds int64 `json:"uptime_seconds"`
 
-	HeldTorrents      int `json:"held_torrents"`
-	SeedingTorrents   int `json:"seeding_torrents"`
+	HeldTorrents        int `json:"held_torrents"`
+	SeedingTorrents     int `json:"seeding_torrents"`
 	DownloadingTorrents int `json:"downloading_torrents"`
 
 	// DiskUsedBytes and DiskLimitBytes are sums across every configured
@@ -129,6 +129,15 @@ type RuntimeStats struct {
 	// ActivePeers is the number of peer connections keep-at has open right
 	// now across all held torrents.
 	ActivePeers int `json:"active_peers"`
+
+	// Memory figures, for the "is this host big enough" triage question.
+	// ProcessRSSBytes is the resident set size from the OS; HeapAllocBytes
+	// and Goroutines are the Go runtime's own live-heap and goroutine
+	// counts. RSS is the number that actually matters for OOM, so it's the
+	// headline; the heap figure shows how much of that is Go-managed.
+	ProcessRSSBytes int64 `json:"process_rss_bytes"`
+	HeapAllocBytes  int64 `json:"heap_alloc_bytes"`
+	Goroutines      int   `json:"goroutines"`
 }
 
 // Uptime returns how long keep-at has been running.

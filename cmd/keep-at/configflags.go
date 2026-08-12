@@ -35,6 +35,7 @@ type configFlagSet struct {
 	uploadRateLimit         *string
 	downloadRateLimit       *string
 	statsInterval           *time.Duration
+	debug                   *bool
 }
 
 func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
@@ -58,6 +59,7 @@ func addConfigFlags(fs *flag.FlagSet) *configFlagSet {
 		uploadRateLimit:         fs.String("upload-rate-limit", "", "max upload speed across all torrents, e.g. 50M = 50 MiB/s (default: unlimited)"),
 		downloadRateLimit:       fs.String("download-rate-limit", "", "max download speed across all torrents, e.g. 20M = 20 MiB/s (default: unlimited)"),
 		statsInterval:           fs.Duration("stats-interval", def.StatsInterval.AsDuration(), "how often to log a summary of what keep-at is doing; 0 disables periodic summaries"),
+		debug:                   fs.Bool("debug", def.Debug, "enable verbose diagnostics: debug-level logging plus periodic memory snapshots and pprof heap/goroutine profiles written under <data_dir>/debug/ for triaging remote hosts"),
 	}
 }
 
@@ -149,6 +151,8 @@ func (cf *configFlagSet) resolve(fs *flag.FlagSet) (config.Config, error) {
 			cfg.DownloadRateLimit = limit
 		case "stats-interval":
 			cfg.StatsInterval = config.Duration(*cf.statsInterval)
+		case "debug":
+			cfg.Debug = *cf.debug
 		}
 	}
 

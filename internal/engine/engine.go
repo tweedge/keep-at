@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	analog "github.com/anacrolix/log"
@@ -36,10 +38,10 @@ import (
 // values directly set how much RAM each held torrent costs - which is exactly
 // what the RAM budget (see ram.go) uses to decide how many torrents fit.
 const (
-	establishedConnsPerTorrent   = 12
-	halfOpenConnsPerTorrent      = 6
-	maxAllocPeerRequestData      = 256 << 10 // 256 KiB
-	totalHalfOpenConns           = 40
+	establishedConnsPerTorrent = 12
+	halfOpenConnsPerTorrent    = 6
+	maxAllocPeerRequestData    = 256 << 10 // 256 KiB
+	totalHalfOpenConns         = 40
 )
 
 // Engine owns the BitTorrent client, per-location storage backends, and
@@ -62,7 +64,7 @@ type Engine struct {
 	stores     map[string]*piecestore.Client // keyed by storage location path
 	probeStore *piecestore.Client            // scratch storage for swarm-probing candidates, see probe.go
 	state      *state.State
-	swarmCache *swarmCache                   // persisted per-torrent scrape counts, reused across scans
+	swarmCache *swarmCache // persisted per-torrent scrape counts, reused across scans
 
 	// userAnnounceURL (and its ipv6 variant) is the per-user Academic
 	// Torrents announce URL resolved from cfg.APIKey at startup. When set,
@@ -94,6 +96,15 @@ type Engine struct {
 	udpScraper     *attorrent.UDPScraper
 	blocklist      filter.KeywordBlocklist
 	probeTimeout   time.Duration
+
+	// probesSinceReset counts how many torrents have been probed (added to
+	// the probe client) since the last resetProbeClient, so the mid-scan
+	// reset can be driven by the thing that actually consumes probe-client
+	// memory - probed torrents - rather than the number of candidates
+	// processed (see evaluateCandidates). Atomic because probes run from the
+	// drain loop's actOnCandidate while the reset check runs from the
+	// progress-save goroutine.
+	probesSinceReset atomic.Int64
 }
 
 // Options carries constructor inputs that aren't part of the user-facing
@@ -199,13 +210,13 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 	}
 
 	e := &Engine{
-		cfg:        cfg,
-		logger:     logger,
-		stores:     stores,
-		probeStore: probeStore,
-		state:      st,
-		swarmCache: swarmCache,
-		startedAt:  time.Now(),
+		cfg:                 cfg,
+		logger:              logger,
+		stores:              stores,
+		probeStore:          probeStore,
+		state:               st,
+		swarmCache:          swarmCache,
+		startedAt:           time.Now(),
 		userAnnounceURL:     userAnnounceURL,
 		userAnnounceIPv6URL: userAnnounceIPv6URL,
 		catalogFetcher: &atcatalog.Fetcher{
@@ -265,6 +276,26 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		"budget", humanBytes(budget),
 		"per_torrent_footprint", humanBytes(perTorrent),
 		"max_torrents", maxTorrents)
+
+	// Tie the Go runtime's memory limit to the same RAM budget keep-at just
+	// computed, so the GC keeps the heap (not just the torrent count) within
+	// it. Without this, Go's default GC lets the heap grow to ~2x the live
+	// set (GOGC=100) and, more importantly, keeps freed pages resident, so
+	// RSS tracks the scan's allocation peak rather than what keep-at is
+	// actually holding - on a RAM-limited host that's the difference between
+	// staying under the OOM-killer's threshold and being killed every few
+	// hours (see DESIGN.md's memory section and the debug collector).
+	//
+	// This is a soft limit: the runtime can exceed it under live-heap
+	// pressure, but it makes the GC much more aggressive about collecting
+	// and returning memory to the OS as the heap approaches the budget, and
+	// bounds worst-case RSS to roughly the budget plus overhead. When system
+	// RAM can't be measured there's no budget, so no limit is set and Go's
+	// defaults apply.
+	if budget > 0 {
+		debug.SetMemoryLimit(budget)
+		e.logger.Debug("set Go runtime memory limit to the RAM budget", "budget", humanBytes(budget))
+	}
 
 	torrentClient, err := e.newTorrentClient(cfg.Port, false, false)
 	if err != nil {

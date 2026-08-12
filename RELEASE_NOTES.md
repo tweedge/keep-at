@@ -1,5 +1,30 @@
 # keep-at release notes
 
+## v0.7.6-beta - memory diagnostics built in, and far less RAM per torrent
+
+This is a beta release for field validation of the memory changes below; the next stable cut will be identical apart from the version tag.
+
+### `debug: true` gives you the tools to triage a remote host
+
+A keep-at node on a small host that can't be attached to interactively (8GB RAM, 4GB swap, OOM-killed every few hours) is nearly impossible to diagnose from the outside - until now. Set `debug: true` in the config file (or `--debug` on the command line) and keep-at turns on debug-level logging plus a collection loop that writes under `<data_dir>/debug/`:
+
+- `memory.jsonl` - one line per minute with process RSS, Go heap, goroutine count, GC pauses, and held/seeding torrent counts, so a few hours of running becomes a memory-over-time curve;
+- `heap-<timestamp>.pprof` every 15 minutes - the definitive "what is holding this RAM" answer (`go tool pprof heap-*.pprof`);
+- `goroutines-<timestamp>.txt` every 15 minutes - full stack dump for stuck loops and leaked goroutines;
+- `trace-<timestamp>.out` every 15 minutes - a short CPU trace for busy scans.
+
+Each artifact type is rotated to keep the newest 20, so a debug run left on for weeks doesn't fill the disk. The regular `runtime stats` log line and `keep-at status` also now report process RSS, Go heap, and goroutine count without debug mode - so the memory question is answerable on every host, all the time.
+
+### The Go runtime is told the RAM budget
+
+keep-at computes a RAM budget (80% of system RAM by default, `--max-ram` to cap it) and caps its torrent count from that number - but never told the Go runtime about it, so the GC kept ~2x the live heap resident and let RSS wander well past the budget between scans. `Engine.New` now calls `debug.SetMemoryLimit(budget)`, so the GC actively works to keep the heap inside the same budget keep-at plans around. This is the single biggest fix for hosts that get OOM-killed every few hours: RSS is now bounded by the budget, not by the scan's allocation peak.
+
+### Far less memory per torrent
+
+A long-horizon debug run (130 minutes against the live catalog) found the dominant scan-time RAM cost was the swarm probe: every candidate with any seeders was probed - adding it to a probe client whose per-piece bookkeeping accumulates until the client is reset - *before* the seed-scarcity roll rejected most of them. The roll now runs first and the swarm is probed only for candidates keep-at actually adds or swaps to (374 probes for 1370 eligible candidates in the test run, instead of one per candidate). The keep-at peer count was already documented as network-status metadata that doesn't gate selection, so this doesn't change what keep-at chooses. The mid-scan probe-client reset is now keyed on probes performed rather than candidates processed.
+
+The result, measured on a 32GB host holding 395 torrents over 2+ hours: RSS was stable at ~1.3GB total - about 3MB per held torrent, versus ~19.6MB per torrent on the previous build, and no growth after storage filled. Holding a few dozen torrents now costs a few hundred MB instead of multiple GB, which is the difference between fitting comfortably on a 1GB Raspberry Pi and not fitting on an 8GB box at all.
+
 ## v0.7.5-beta - smooth and speed up scans for RAM-limited hosts
 
 This is a beta release for field validation of the scan changes below; the next stable cut will be identical apart from the version tag.
