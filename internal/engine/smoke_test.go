@@ -98,7 +98,6 @@ func TestSmokeRealAcademicTorrents(t *testing.T) {
 
 	e, err := New(cfg, Options{
 		CatalogURL:   catalogServer.URL + "/database.xml",
-		ProbeTimeout: 5 * time.Second,
 		// AcademicTorrentsBaseURL left at its default: this test fetches
 		// real .torrent files and scrapes the real tracker.
 	})
@@ -307,7 +306,6 @@ func TestSmokeRealCatalogSubset(t *testing.T) {
 
 	e, err := New(cfg, Options{
 		CatalogURL:   catalogServer.URL + "/database.xml",
-		ProbeTimeout: 3 * time.Second,
 		// AcademicTorrentsBaseURL left at its default: real .torrent files and
 		// real tracker scrapes against live Academic Torrents.
 	})
@@ -367,7 +365,7 @@ func TestSmokeRealCatalogSubset(t *testing.T) {
 	// directly add a couple of the hand-picked, verified-downloadable
 	// candidates - whose metadata ScanOnce already fetched and cached - and
 	// require one to finish a real download with data on disk. This proves
-	// fetch -> scrape -> probe -> download -> store works end to end against
+	// fetch -> scrape -> download -> store works end to end against
 	// live infrastructure.
 	added := 0
 	for _, it := range smokeTestItems {

@@ -161,7 +161,7 @@ func TestEvaluateSwapEnforcesSeedMargin(t *testing.T) {
 }
 
 func TestEvaluateSwapAllowsSwapWhenMarginMetAndRollSucceeds(t *testing.T) {
-	candidate := Candidate{Seeders: 1, KeepAtPeers: 0} // chance = 1.0 with one seeder
+	candidate := Candidate{Seeders: 1} // chance = 1.0 with one seeder
 	displaced := []Held{{Seeders: 10}, {Seeders: 8}}   // min displaced = 8, margin 3 -> need <= 5
 
 	decision := EvaluateSwap(candidate, displaced, 3, 0.6, 0.999)
@@ -177,7 +177,7 @@ func TestEvaluateSwapBacksOffWhenManySeedersPresent(t *testing.T) {
 	// keep-at's purpose is to seed minimally-seeded torrents. A candidate
 	// with many seeders is already healthy on its own and should effectively
 	// never be selected, regardless of the keep-at peer count.
-	candidate := Candidate{Seeders: 12, KeepAtPeers: 0}
+	candidate := Candidate{Seeders: 12}
 	// chance = 0.6^11 ~= 0.0036; a roll of 0.5 should fail to swap.
 	decision := EvaluateSwap(candidate, nil, 3, 0.6, 0.5)
 	if decision.ShouldSwap {
@@ -190,7 +190,7 @@ func TestEvaluateSwapWithNoDisplacementSkipsMarginCheckButStillGatesOnSeeders(t 
 	// so the margin check passes. But the seed-scarcity gate still applies:
 	// a torrent with many seeders shouldn't be filled just because space is
 	// free.
-	candidate := Candidate{Seeders: 100, KeepAtPeers: 0}
+	candidate := Candidate{Seeders: 100}
 	decision := EvaluateSwap(candidate, nil, 3, 0.6, 0.5)
 	if decision.ShouldSwap {
 		t.Fatalf("expected well-seeded torrent to be rejected even with free space, got %+v", decision)

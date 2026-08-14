@@ -19,13 +19,6 @@ type Candidate struct {
 	SizeBytes int64
 	Seeders   int
 	Leechers  int
-	// KeepAtPeers is how many other keep-at nodes were observed in the
-	// swarm, gathered by probing. It feeds network-status reporting and is
-	// logged as metadata; it deliberately does NOT drive the selection
-	// decision - keep-at exists to seed minimally-seeded torrents, so the
-	// gate below is keyed on total Seeders, not on how many keep-at nodes
-	// happen to be present.
-	KeepAtPeers int
 	// SeederFloor is the p10 (10th percentile) number of seeders across all
 	// torrents in the catalog with at least one seeder, as measured by the
 	// most recently completed scan. It anchors SelectionChance: a torrent is
@@ -110,8 +103,8 @@ func RankCandidates(candidates []Candidate, ramBound bool) []Candidate {
 // full confidence.
 //
 // Note this is deliberately keyed on TOTAL seeders, not on how many other
-// keep-at nodes are in the swarm. The keep-at peer count is network-status
-// metadata (see Candidate.KeepAtPeers); it doesn't gate selection.
+// keep-at nodes are in the swarm (a figure keep-at only gathers via the
+// explicit `keep-at network-status` census, never during scans).
 func SelectionChance(aggressiveness float64, seeders int, seederFloor int) float64 {
 	if seeders < 1 {
 		seeders = 1
@@ -206,8 +199,9 @@ func (d SwapDecision) SeedScarcityBlocked() bool {
 // The gate (n) is keyed on the candidate's TOTAL seeders: a torrent with
 // one seed is keep-at's primary target and passes confidently, while a
 // torrent with many seeds - already healthy on its own - is effectively
-// never selected. The keep-at peer count (Candidate.KeepAtPeers) does not
-// gate selection; it's network-status metadata only.
+// never selected. keep-at only ever learns how many other keep-at nodes are
+// in a swarm via the explicit network-status census, which doesn't feed
+// selection at all.
 //
 // roll must be a fresh uniform [0, 1) draw per call; it's a parameter
 // rather than generated internally so this stays deterministic to test.

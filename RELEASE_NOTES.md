@@ -1,5 +1,31 @@
 # keep-at release notes
 
+## v0.7.7-beta - trust the tracker, and stop the CPU pegging
+
+This is a beta release for field validation of the changes below; the next stable cut will be identical apart from the version tag.
+
+### The node now trusts the tracker - no more swarm probing during scans
+
+keep-at's selection logic was already keyed entirely on the tracker's total seeder counts; the swarm probe that counted other keep-at nodes fed only network-status reporting and never gated a decision. But it ran during every scan anyway, joining candidate swarms and holding a probe client full of per-torrent piece bookkeeping - the dominant scan-time RAM cost measured in 0.7.6. The probe is now **gone from the node entirely**. Scans fetch metadata and scrape the tracker, and nothing else; the probe client, its scratch storage, the mid-scan reset machinery, and the `probesSinceReset`/`KeepAtPeers` plumbing are all deleted. This makes scans leaner, faster, and simpler, with no change to what keep-at chooses to seed.
+
+### `keep-at network-status` is now a separate, on-demand census
+
+The keep-at network picture is still available - it just isn't something the node does. `keep-at network-status` is now a synchronous, explicitly RAM- and time-heavy command (it prints a warning to that effect) that walks the whole catalog: per torrent it fetches the metadata, scrapes AT's tracker, and briefly joins the swarm to count other keep-at nodes, printing a status line every 25 torrents and a summary at the end (nodes observed, data seeding/leeching, p10 seeder floor, duration). Because probes are strictly synchronous there, the probe client is created fresh per torrent and torn down immediately - peak probe memory is one torrent's bookkeeping instead of hundreds, which also retires the old "reset the probe client every 250 candidates" machinery. Run it when you want the network picture; the node never pays for it.
+
+### A seeding node's CPU is no longer pegged
+
+A host holding 827 torrents reported CPU at 100% while transferring only a few MB per 30 minutes. The debug collector's CPU profiles identified the cause: with ~400 held torrents, roughly 22% of CPU was the library's tracker-announce dispatcher, ~20% the uTP packet reader, and ~16% peer-connection setup - machinery, not data. Fixed with three changes:
+
+- **Held torrents now announce only to Academic Torrents' own tracker.** The library re-announces to every tracker in a torrent's spec on its own schedule, and AT catalog entries list up to a dozen mostly-dead third-party trackers each - so every held torrent was cycling announce timeouts against dead public trackers all day. keep-at is an AT seeder; AT's tracker and DHT are its peer discovery.
+- **uTP is disabled.** The UDP transport's packet-reader goroutine was ~20% of CPU for a seeder whose peers are overwhelmingly plain TCP.
+- **Peer pools are smaller** (100 high-water / 20 low-water vs the library's 500/50), so under-seeded torrents - keep-at's entire purpose - stop churning dial attempts against addresses that don't exist.
+
+Measured on a 254-torrent node: **5-8% of one core while idle-seeding, down from 107-124%**, with goroutines down from ~14,800 to ~7,900. The connection-buffer values were investigated as the suspected cause and are *not* the problem - they're the RAM lever, and raising them would multiply per-torrent memory, which is the opposite of what a RAM-limited host needs.
+
+### Debug collection gains CPU profiles
+
+The debug collector (`--debug`) now also writes a `cpu-<timestamp>.pprof` every 15 minutes alongside the existing heap profiles, goroutine dumps, and traces - sampled, so it reads directly with `go tool pprof` and answers "why is this host's CPU pegged" the same way the heap profile answers "what's holding this RAM."
+
 ## v0.7.6-beta - memory diagnostics built in, and far less RAM per torrent
 
 This is a beta release for field validation of the memory changes below; the next stable cut will be identical apart from the version tag.

@@ -9,8 +9,14 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
+	"sync"
 	"time"
 )
+
+// cpuProfileMu serializes CPU profile captures: pprof.StartCPUProfile fails
+// if one is already running, and the profile ticker can in principle fire
+// while a capture is still in flight if a capture runs long.
+var cpuProfileMu sync.Mutex
 
 // debugCollectInterval is how often the debug collector writes a memory
 // snapshot (MemStats + process RSS) to <data_dir>/debug/memory.jsonl. A
@@ -195,10 +201,12 @@ func (e *Engine) writeMemorySnapshot(dir string) {
 		"peers", snap.ActivePeers)
 }
 
-// captureDebugProfiles writes a heap profile, a goroutine dump, and a short
-// CPU trace into dir, pruning old artifacts to debugArtifactsKept each.
-// The heap profile is the definitive answer to "what is holding this RAM";
-// the goroutine dump catches stuck loops and leaks; the trace catches
+// captureDebugProfiles writes a heap profile, a goroutine dump, a CPU
+// profile, and a short CPU trace into dir, pruning old artifacts to
+// debugArtifactsKept each. The heap profile is the definitive answer to
+// "what is holding this RAM"; the CPU profile to "what is burning this
+// CPU" (the two questions that dominate triage on remote hosts); the
+// goroutine dump catches stuck loops and leaks; the trace catches
 // CPU-bound work.
 func (e *Engine) captureDebugProfiles(dir string) {
 	now := time.Now().UTC()
@@ -209,6 +217,15 @@ func (e *Engine) captureDebugProfiles(dir string) {
 	// from "memory that should have been freed".
 	if err := writePprofProfile(dir, "heap-"+stamp+".pprof", "heap"); err != nil {
 		e.logger.Warn("debug: heap profile failed", "err", err)
+	}
+
+	// CPU profile: a short sampling profile of where the process is
+	// actually spending time. Sampled (not traced) so it can be read with
+	// `go tool pprof` the same way as the heap profile - the default
+	// `go tool pprof cpu-*.pprof` view is exactly the "why is CPU pegged"
+	// answer for a host that's burning cycles without moving data.
+	if err := writeCPUProfile(dir, "cpu-"+stamp+".pprof", debugTraceDuration); err != nil {
+		e.logger.Warn("debug: cpu profile failed", "err", err)
 	}
 
 	// Full goroutine dump, for stuck/leaked goroutines.
@@ -224,8 +241,30 @@ func (e *Engine) captureDebugProfiles(dir string) {
 	}
 
 	pruneArtifacts(dir, "heap-*.pprof", debugArtifactsKept)
+	pruneArtifacts(dir, "cpu-*.pprof", debugArtifactsKept)
 	pruneArtifacts(dir, "goroutines-*.txt", debugArtifactsKept)
 	pruneArtifacts(dir, "trace-*.out", debugArtifactsKept)
+}
+
+// writeCPUProfile samples the process's CPU for duration and writes a pprof
+// CPU profile to dir/name. CPU profiling must not overlap itself, so it's
+// serialized through a mutex (a capture that overlaps a previous one would
+// fail; this just skips the new capture instead).
+func writeCPUProfile(dir, name string, duration time.Duration) error {
+	cpuProfileMu.Lock()
+	defer cpuProfileMu.Unlock()
+
+	f, err := os.Create(filepath.Join(dir, name))
+	if err != nil {
+		return err
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		f.Close()
+		return err
+	}
+	time.Sleep(duration)
+	pprof.StopCPUProfile()
+	return f.Close()
 }
 
 func writePprofProfile(dir, name, profileName string) error {

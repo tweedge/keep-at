@@ -69,8 +69,8 @@ func TestAtAnnounceURLHostRestriction(t *testing.T) {
 		{"https://evilacademictorrents.com/announce.php", ""},
 		{"https://academictorrents.com.evil.example/announce.php", ""},
 		{"https://academictorrents.com.evil.example/announce.php", ""},
-		{"https://udp.example.com/announce", ""},       // third-party
-		{"udp://academictorrents.com:1337", ""},        // not https
+		{"https://udp.example.com/announce", ""}, // third-party
+		{"udp://academictorrents.com:1337", ""},  // not https
 		{"https://tracker.opentrackr.org:1337/announce", ""},
 		{"not a url", ""},
 	}

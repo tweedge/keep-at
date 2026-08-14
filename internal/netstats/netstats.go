@@ -22,10 +22,6 @@ type Snapshot struct {
 	TotalCandidates     int `json:"total_candidates"`
 	ProcessedCandidates int `json:"processed_candidates"`
 
-	NodeCount     int   `json:"node_count"`
-	SeedingBytes  int64 `json:"seeding_bytes"`
-	LeechingBytes int64 `json:"leeching_bytes"`
-
 	// SeederFloor is the p10 (10th percentile) number of seeders across
 	// the catalog torrents the completed scan observed with at least one
 	// seeder. It anchors the seed-scarcity gate for the NEXT scan: with a

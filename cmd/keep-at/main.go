@@ -61,7 +61,7 @@ Usage:
   keep-at status [--config PATH]           report whether keep-at is running
   keep-at service install [flags]          install a systemd service (Linux, root)
   keep-at service uninstall                remove the systemd service (Linux, root)
-  keep-at network-status [--config PATH]   report on other keep-at nodes seen while scanning
+  keep-at network-status [--config PATH]   census the keep-at network (RAM/time-heavy, on demand)
   keep-at hosted-torrents [--config PATH]  list torrents this host holds and seeds
   keep-at self-update [--beta]              update to the latest release (use --beta to allow prerelease/beta builds)
   keep-at version                          print the version and exit

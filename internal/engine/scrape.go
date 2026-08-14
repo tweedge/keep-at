@@ -70,7 +70,7 @@ func isAcademicTorrentsHost(trackerURL string) bool {
 	return strings.Contains(u.Host, "academictorrents.com")
 }
 
-// rateLimitedTrackerDialer wraps a plain net.Dialer with e's Academic
+// rateLimitedTrackerDialer wraps a plain net.Dialer with an Academic
 // Torrents rate limiter, gated on the destination address rather than a
 // URL. anacrolix/torrent's own client re-announces to every tracker in a
 // torrent's spec on its own schedule, entirely outside scrapeSwarm and
@@ -78,12 +78,20 @@ func isAcademicTorrentsHost(trackerURL string) bool {
 // academictorrents.com's tracker uncontrolled, which in real testing
 // against the full catalog got keep-at rate-limited (HTTP 429) by AT
 // itself. Passed to ClientConfig.TrackerDialContext on every torrent
-// client keep-at creates (see newTorrentClient) so every path to AT's
-// tracker - our own scrapes and the library's automatic announces alike -
-// shares one budget.
+// client keep-at creates (see newTorrentClient, and the network-status
+// census's probe client) so every path to AT's tracker - our own scrapes
+// and the library's automatic announces alike - shares one budget.
 func (e *Engine) rateLimitedTrackerDialer(ctx context.Context, network, addr string) (net.Conn, error) {
-	if isAcademicTorrentsAddr(addr) && e.torrentFetcher.Limiter != nil {
-		if err := e.torrentFetcher.Limiter.Wait(ctx); err != nil {
+	return rateLimitedTrackerDialer(e.torrentFetcher.Limiter, ctx, network, addr)
+}
+
+// rateLimitedTrackerDialer is the dialer behind the Engine method of the
+// same name, parameterized on the limiter so the network-status census
+// (which builds its own probe client and limiter) can share the exact same
+// behavior without an Engine.
+func rateLimitedTrackerDialer(limiter attorrent.Limiter, ctx context.Context, network, addr string) (net.Conn, error) {
+	if isAcademicTorrentsAddr(addr) && limiter != nil {
+		if err := limiter.Wait(ctx); err != nil {
 			return nil, err
 		}
 	}

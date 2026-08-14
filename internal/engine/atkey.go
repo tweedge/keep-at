@@ -23,7 +23,7 @@ var userAnnounceEndpoint = "https://academictorrents.com/apiv2/userannounce"
 // trackers listed in .torrent files, other AT hosts, http:// (non-https)
 // variants - must never see it.
 var atTrackerHosts = map[string]bool{
-	"academictorrents.com":     true,
+	"academictorrents.com":      true,
 	"ipv6.academictorrents.com": true,
 }
 
@@ -115,6 +115,53 @@ func keyedTrackers(trackers [][]string, userAnnounce, userAnnounceIPv6 string) [
 			}
 		}
 		out = append(out, newTier)
+	}
+	return out
+}
+
+// atTrackersOnly filters a tiered tracker list down to Academic Torrents'
+// own trackers (swapped for the operator's per-user announce URL when one
+// is configured), dropping every third-party tracker. Held torrents get
+// this treatment (see addTorrentSpec): the underlying client re-announces
+// to every tracker in a torrent's spec on its own schedule, and AT catalog
+// entries list up to a dozen mostly-dead third-party trackers each - so
+// keeping them meant a node holding hundreds of torrents burned CPU
+// cycling announce timeouts against dead public trackers. keep-at is an AT
+// seeder; AT's tracker and DHT are its peer discovery. The network-status
+// census's probe client uses the same filtering.
+//
+// When the list contains no AT tracker at all (a non-AT catalog entry, a
+// hand-built torrent, a test stub), it's returned unchanged - filtering to
+// zero trackers would leave the torrent with no tracker-based peer
+// discovery whatsoever, which is worse than keeping the third-party list.
+func atTrackersOnly(trackers [][]string, userAnnounce, userAnnounceIPv6 string) [][]string {
+	foundAT := false
+	for _, tier := range trackers {
+		for _, announce := range tier {
+			if atAnnounceURL(announce, userAnnounce, userAnnounceIPv6) != "" {
+				foundAT = true
+				break
+			}
+		}
+		if foundAT {
+			break
+		}
+	}
+	if !foundAT {
+		return trackers
+	}
+
+	out := make([][]string, 0, len(trackers))
+	for _, tier := range trackers {
+		newTier := make([]string, 0, len(tier))
+		for _, announce := range tier {
+			if keyed := atAnnounceURL(announce, userAnnounce, userAnnounceIPv6); keyed != "" {
+				newTier = append(newTier, keyed)
+			}
+		}
+		if len(newTier) > 0 {
+			out = append(out, newTier)
+		}
 	}
 	return out
 }

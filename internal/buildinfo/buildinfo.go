@@ -22,13 +22,13 @@ var Commit = "unknown"
 // deliberately.
 const ClientName = "keep-at"
 
-// Role names appended to keep-at's advertised client identity. keep-at runs
-// two torrent clients with different roles: the main client actually seeds
-// held torrents, while the probe client (see engine.resetProbeClient) only
-// joins swarms briefly to count other keep-at nodes and never uploads or
-// downloads. Distinguishing them in the client string means a node that's
-// merely probing a swarm doesn't get counted as a keep-at seeder by other
-// keep-at nodes' anti-cascade logic or by network-status.
+// Role names appended to keep-at's advertised client identity. The main
+// client actually seeds held torrents, while the network-status census's
+// probe client (see engine's RunCensus) only joins swarms briefly to count
+// other keep-at nodes and never uploads or downloads. Distinguishing them
+// in the client string means a node that's merely probing a swarm doesn't
+// get counted as a keep-at seeder by other keep-at nodes' anti-cascade
+// logic or by network-status.
 const (
 	RoleSeeder  = "seeder"
 	RoleScraper = "scraper"

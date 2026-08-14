@@ -9,8 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	analog "github.com/anacrolix/log"
@@ -53,25 +51,16 @@ type Engine struct {
 
 	torrentClient *torrent.Client
 
-	// probeTorrentClient is used only for swarm probing (see probe.go) and
-	// is recreated wholesale at the start of every scan (resetProbeClient)
-	// rather than having individual torrents dropped from it - see that
-	// method's comment for why. probeClientMu guards reassignment against
-	// the concurrent probes that read it during evaluateCandidates.
-	probeClientMu      sync.RWMutex
-	probeTorrentClient *torrent.Client
-
 	stores     map[string]*piecestore.Client // keyed by storage location path
-	probeStore *piecestore.Client            // scratch storage for swarm-probing candidates, see probe.go
 	state      *state.State
 	swarmCache *swarmCache // persisted per-torrent scrape counts, reused across scans
 
 	// userAnnounceURL (and its ipv6 variant) is the per-user Academic
 	// Torrents announce URL resolved from cfg.APIKey at startup. When set,
-	// addTorrentSpec/probeSwarm swap AT tracker URLs for it, so AT attributes
-	// kept torrents to the operator's account. Empty when no API key is
-	// configured or resolution failed. The URL contains the account's
-	// passkey and must never be logged or written to disk.
+	// addTorrentSpec swaps AT tracker URLs for the per-user announce URL, so
+	// AT attributes kept torrents to the operator's account. Empty when no
+	// API key is configured or resolution failed. The URL contains the
+	// account's passkey and must never be logged or written to disk.
 	userAnnounceURL     string
 	userAnnounceIPv6URL string
 
@@ -95,22 +84,11 @@ type Engine struct {
 	httpClient     *http.Client
 	udpScraper     *attorrent.UDPScraper
 	blocklist      filter.KeywordBlocklist
-	probeTimeout   time.Duration
-
-	// probesSinceReset counts how many torrents have been probed (added to
-	// the probe client) since the last resetProbeClient, so the mid-scan
-	// reset can be driven by the thing that actually consumes probe-client
-	// memory - probed torrents - rather than the number of candidates
-	// processed (see evaluateCandidates). Atomic because probes run from the
-	// drain loop's actOnCandidate while the reset check runs from the
-	// progress-save goroutine.
-	probesSinceReset atomic.Int64
 }
 
 // Options carries constructor inputs that aren't part of the user-facing
 // YAML config - mainly test seams like overriding the catalog or Academic
-// Torrents base URL, or shortening the swarm-probe timeout so tests don't
-// have to wait out the production default.
+// Torrents base URL.
 //
 // CatalogURL and AcademicTorrentsBaseURL are independent: a mirror could
 // serve its own copy of the catalog while .torrent files still come from
@@ -121,7 +99,6 @@ type Options struct {
 	CatalogURL              string
 	AcademicTorrentsBaseURL string
 	Logger                  *slog.Logger
-	ProbeTimeout            time.Duration
 }
 
 // New builds an Engine from cfg. It opens (creating if necessary) a piece
@@ -169,11 +146,6 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		logger.Warn("could not load swarm cache, starting fresh", "err", err)
 	}
 
-	probeStore, err := piecestore.New(cfg.DataDir + "/probe-scratch")
-	if err != nil {
-		return nil, fmt.Errorf("engine: opening probe scratch storage: %w", err)
-	}
-
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 
 	catalogURL := opts.CatalogURL
@@ -213,7 +185,6 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		cfg:                 cfg,
 		logger:              logger,
 		stores:              stores,
-		probeStore:          probeStore,
 		state:               st,
 		swarmCache:          swarmCache,
 		startedAt:           time.Now(),
@@ -231,13 +202,9 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 			UserAgent:  buildinfo.UserAgent(),
 			Limiter:    limiter,
 		},
-		httpClient:   httpClient,
-		udpScraper:   attorrent.NewUDPScraper(),
-		blocklist:    filter.NewKeywordBlocklist(cfg.KeywordBlocklist),
-		probeTimeout: defaultProbeTimeout,
-	}
-	if opts.ProbeTimeout > 0 {
-		e.probeTimeout = opts.ProbeTimeout
+		httpClient: httpClient,
+		udpScraper: attorrent.NewUDPScraper(),
+		blocklist:  filter.NewKeywordBlocklist(cfg.KeywordBlocklist),
 	}
 
 	// Work out keep-at's RAM budget before spinning up the torrent client,
@@ -297,18 +264,11 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 		e.logger.Debug("set Go runtime memory limit to the RAM budget", "budget", humanBytes(budget))
 	}
 
-	torrentClient, err := e.newTorrentClient(cfg.Port, false, false)
+	torrentClient, err := e.newTorrentClient(cfg.Port, false)
 	if err != nil {
 		return nil, err
 	}
 	e.torrentClient = torrentClient
-
-	// A second, DHT-disabled client used only for swarm probing - see
-	// resetProbeClient for why it's DHT-disabled and recreated wholesale
-	// rather than having individual torrents dropped from it.
-	if err := e.resetProbeClient(); err != nil {
-		return nil, fmt.Errorf("engine: starting probe torrent client: %w", err)
-	}
 
 	if err := e.resumeHeldTorrents(); err != nil {
 		return nil, fmt.Errorf("engine: resuming held torrents: %w", err)
@@ -317,25 +277,27 @@ func New(cfg config.Config, opts Options) (*Engine, error) {
 	return e, nil
 }
 
-func (e *Engine) newTorrentClient(listenPort int, noDHT bool, scraper bool) (*torrent.Client, error) {
+func (e *Engine) newTorrentClient(listenPort int, noDHT bool) (*torrent.Client, error) {
 	tcfg := torrent.NewDefaultClientConfig()
 	tcfg.ListenPort = listenPort
 	tcfg.Seed = true
 	tcfg.DataDir = e.cfg.DataDir
 	// The extended handshake "v" string is what other keep-at nodes read
-	// (see keepAtPeers) and the HTTP User-Agent is what AT's tracker records
-	// on announces and shows on its Technical pages. Both carry keep-at plus
-	// the version, and a role suffix so the probe (scraper) client is
-	// distinguishable from the main (seeder) client - see buildinfo.
-	if scraper {
-		tcfg.ExtendedHandshakeClientVersion = buildinfo.ScraperExtendedHandshakeVersion()
-		tcfg.HTTPUserAgent = buildinfo.ScraperUserAgent()
-	} else {
-		tcfg.ExtendedHandshakeClientVersion = buildinfo.ExtendedHandshakeVersion()
-		tcfg.HTTPUserAgent = buildinfo.SeederUserAgent()
-	}
+	// (see the network-status census's keepAtPeers) and the HTTP User-Agent
+	// is what AT's tracker records on announces and shows on its Technical
+	// pages. Both carry keep-at plus the version.
+	tcfg.ExtendedHandshakeClientVersion = buildinfo.ExtendedHandshakeVersion()
+	tcfg.HTTPUserAgent = buildinfo.SeederUserAgent()
 	tcfg.Bep20 = buildinfo.PeerIDPrefix
 	tcfg.NoDHT = noDHT
+
+	// uTP (UDP-based peer transport) is disabled: it costs a persistent UDP
+	// socket and a packet-reader goroutine per client - measured at ~20% of
+	// a seeding node's CPU on a host holding ~400 torrents, where the
+	// overwhelming majority of peer connections are plain TCP anyway - and
+	// gives nothing back to a seed-first daemon. AT's tracker and peers are
+	// reachable over TCP; see DESIGN.md.
+	tcfg.DisableUTP = true
 
 	// Optional upload/download throttling. Zero means unlimited, which is
 	// what the library defaults to, so a limiter is only wired in when the
@@ -357,15 +319,29 @@ func (e *Engine) newTorrentClient(listenPort int, noDHT bool, scraper bool) (*to
 	// keep-at is a seed-first daemon, so it never needs a huge per-torrent
 	// peer fanout; a smaller cap keeps peer connection memory bounded and
 	// spreads it predictably across held torrents instead of scaling with
-	// the whole catalog. These are applied to the probe client too, where
-	// they don't hurt swarm-probing accuracy but prevent the second client
-	// from doubling the connection footprint. The values are the named
-	// constants declared above so the RAM budget (ram.go) can compute the
-	// per-torrent footprint from exactly the same numbers.
+	// the whole catalog. The values are the named constants declared above
+	// so the RAM budget (ram.go) can compute the per-torrent footprint from
+	// exactly the same numbers.
 	tcfg.EstablishedConnsPerTorrent = establishedConnsPerTorrent
 	tcfg.HalfOpenConnsPerTorrent = halfOpenConnsPerTorrent
 	tcfg.MaxAllocPeerRequestDataPerConn = maxAllocPeerRequestData
 	tcfg.TotalHalfOpenConns = totalHalfOpenConns
+
+	// Peer-pool tuning. The library defaults let each torrent hoard up to
+	// TorrentPeersHighWater (500) peer addresses and demand more once it
+	// has fewer than TorrentPeersLowWater (50) cached. For a node holding
+	// hundreds of torrents that are inherently under-seeded (keep-at's
+	// whole purpose), those defaults meant constant churn: every torrent
+	// with a thin peer pool kept re-announcing and dialing addresses that
+	// don't exist, burning CPU on handshake attempts against dead peers
+	// (measured: peer-connection setup and handshaking was ~48% of a
+	// 260-torrent node's CPU while idle-seeding, after the tracker/uTP
+	// fixes). Smaller pools bound that churn without hurting real
+	// connectivity: a pool of 100 addresses is still far larger than any
+	// real swarm keep-at joins, and 20 cached peers is plenty before a
+	// torrent asks for more.
+	tcfg.TorrentPeersHighWater = 100
+	tcfg.TorrentPeersLowWater = 20
 
 	// The torrent library re-announces to every tracker in a torrent's
 	// spec on its own schedule, independent of scrapeSwarm/attorrent's
@@ -410,60 +386,6 @@ func (e *Engine) newTorrentClient(listenPort int, noDHT bool, scraper bool) (*to
 	return torrent.NewClient(tcfg)
 }
 
-// resetProbeClient closes any existing probe torrent client and starts a
-// fresh one. Called once at Engine startup and again at the start of
-// every scan (see ScanOnce).
-//
-// Probing works by adding a torrent to this client just long enough to
-// see who's in its swarm, then - in earlier versions of this code -
-// dropping it again immediately. anacrolix/torrent v1.61.0 has more than
-// one internal race between a torrent's background per-torrent goroutines
-// (DHT announcing, regular tracker announcing) and that same torrent
-// being dropped or re-added in quick succession; both surfaced as a fatal,
-// unrecoverable "sync: Unlock of unlocked RWMutex" that killed the whole
-// process, not just the affected torrent, during a real full-catalog scan.
-//
-// Rather than drop torrents individually (and keep finding new variations
-// of this race), probed torrents are simply never dropped - they
-// accumulate in this client for the rest of the current scan, which is
-// harmless since they hold no real data and never attempt one. The whole
-// client is discarded and replaced at the start of the next scan, which
-// releases everything at once through a code path that doesn't share the
-// per-torrent add/drop race. See DESIGN.md.
-//
-// DHT stays disabled specifically on this client (unlike the main one)
-// because DHT's own per-torrent announce goroutine was one of the two
-// concrete triggers found for this bug, and DHT isn't needed to answer
-// "who else is in this swarm right now" - regular trackers are enough for
-// that, and this client's torrents are never kept around long enough for
-// DHT's slower discovery to matter anyway.
-func (e *Engine) resetProbeClient() error {
-	e.probeClientMu.Lock()
-	defer e.probeClientMu.Unlock()
-
-	old := e.probeTorrentClient
-	newClient, err := e.newTorrentClient(0, true, true)
-	if err != nil {
-		return err
-	}
-	e.probeTorrentClient = newClient
-
-	if old != nil {
-		// Safe to close synchronously: this is only ever called once the
-		// previous scan's evaluateCandidates has fully returned (all of
-		// its probes finished), or at Engine startup when there's no old
-		// client at all.
-		old.Close()
-	}
-	return nil
-}
-
-func (e *Engine) currentProbeClient() *torrent.Client {
-	e.probeClientMu.RLock()
-	defer e.probeClientMu.RUnlock()
-	return e.probeTorrentClient
-}
-
 // networkStatsPath is where the current scan's network-wide stats are
 // persisted, so a separate `keep-at network-status` invocation can read
 // them without talking to this process directly.
@@ -477,17 +399,12 @@ func NetworkStatsPath(cfg config.Config) string {
 	return cfg.DataDir + "/network-stats.json"
 }
 
-// Close shuts down both BitTorrent clients and the cached UDP tracker
+// Close shuts down the BitTorrent client and the cached UDP tracker
 // connections. It does not delete any data.
 func (e *Engine) Close() error {
 	var errs []error
 	if e.torrentClient != nil {
 		for _, err := range e.torrentClient.Close() {
-			errs = append(errs, err)
-		}
-	}
-	if probeClient := e.currentProbeClient(); probeClient != nil {
-		for _, err := range probeClient.Close() {
 			errs = append(errs, err)
 		}
 	}

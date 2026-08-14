@@ -166,7 +166,6 @@ func TestScanOnceAddsAvailableCandidate(t *testing.T) {
 	e, err := New(cfg, Options{
 		CatalogURL:              stub.server.URL + "/database.xml",
 		AcademicTorrentsBaseURL: stub.server.URL,
-		ProbeTimeout:            2 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -209,7 +208,6 @@ func TestScanOnceSkipsUnavailableCandidate(t *testing.T) {
 	e, err := New(cfg, Options{
 		CatalogURL:              stub.server.URL + "/database.xml",
 		AcademicTorrentsBaseURL: stub.server.URL,
-		ProbeTimeout:            time.Second,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -249,7 +247,6 @@ func TestScanOnceInterruptedIsNotMarkedComplete(t *testing.T) {
 	e, err := New(cfg, Options{
 		CatalogURL:              stub.server.URL + "/database.xml",
 		AcademicTorrentsBaseURL: stub.server.URL,
-		ProbeTimeout:            time.Second,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

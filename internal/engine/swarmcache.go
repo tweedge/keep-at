@@ -22,9 +22,8 @@ import (
 // count instead of losing the candidate entirely.
 //
 // The cache is the thing that makes repeat scans cheap: once every torrent's
-// scrape is cached once, subsequent scans only hit the network for
-// candidates keep-at is actually about to act on (the on-demand swarm probe,
-// see probeSwarm) - not for re-scraping the whole catalog.
+// scrape is cached, subsequent scans only hit the network for the candidates
+// whose cached count has gone stale - not for re-scraping the whole catalog.
 type swarmCache struct {
 	mu       sync.Mutex
 	path     string

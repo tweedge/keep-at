@@ -107,10 +107,19 @@ func (e *Engine) addTorrentSpec(mi *metainfo.MetaInfo, store *piecestore.Client)
 		return nil, fmt.Errorf("engine: building torrent spec: %w", err)
 	}
 	spec.Storage = store
-	// If an AT API key is configured, swap AT tracker URLs for the
-	// operator's per-user announce URL so Academic Torrents attributes this
-	// torrent to their account. Third-party trackers are never touched.
-	spec.Trackers = keyedTrackers(spec.Trackers, e.userAnnounceURL, e.userAnnounceIPv6URL)
+	// Restrict held torrents to Academic Torrents' own trackers (swapped
+	// for the operator's per-user announce URL when a key is configured).
+	// The anacrolix client re-announces to every tracker in a torrent's
+	// spec on its own schedule, and AT's catalog entries list up to a
+	// dozen mostly-dead third-party trackers each - so keeping them all
+	// meant a node holding hundreds of torrents spent a huge fraction of
+	// its CPU cycling announce timeouts against dead public trackers
+	// (measured: the tracker-announce dispatcher alone was ~22% of a
+	// 400-torrent node's CPU while idle-seeding). keep-at is an AT seeder:
+	// AT's tracker and DHT are its peer discovery, and third-party
+	// trackers get nothing back from this. The scrape path (scrapeSwarm)
+	// was already AT-first; this makes the automatic announces AT-only too.
+	spec.Trackers = atTrackersOnly(spec.Trackers, e.userAnnounceURL, e.userAnnounceIPv6URL)
 
 	t, _, err := e.torrentClient.AddTorrentSpec(spec)
 	if err != nil {
