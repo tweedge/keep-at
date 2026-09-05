@@ -56,6 +56,7 @@ async fn cmd_run(cfg: Config) -> Result<()> {
         let tx = shutdown_tx.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("received SIGINT, shutting down");
             let _ = tx.send(true);
         });
     }
@@ -66,6 +67,7 @@ async fn cmd_run(cfg: Config) -> Result<()> {
             use tokio::signal::unix::{signal, SignalKind};
             if let Ok(mut sig) = signal(SignalKind::terminate()) {
                 sig.recv().await;
+                tracing::info!("received SIGTERM, shutting down");
                 let _ = tx.send(true);
             }
         });
@@ -79,8 +81,11 @@ async fn cmd_run(cfg: Config) -> Result<()> {
         cfg.data_dir.display(),
         started.elapsed()
     );
+    // Bounded teardown: stop the rqbit session (15s max), then exit
+    // regardless. State on disk is already consistent (atomic writes), so a
+    // wedged teardown must not hold shutdown hostage (TimeoutStopSec=30).
     let r = engine.run(shutdown_rx).await;
-    engine.close().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), engine.close()).await;
     tracing::info!("keep-at stopped");
     r
 }

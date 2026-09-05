@@ -486,7 +486,7 @@ impl Engine {
         let mut scan_interval =
             tokio::time::interval(self.cfg.scan.interval.max(Duration::from_secs(60)));
 
-        self.run_scan_logged("initial").await;
+        self.run_scan_logged("initial", shutdown.clone()).await;
         self.log_and_save_runtime("post-initial-scan");
 
         // Dedicated periodic stats timer. NOTE: while a scan runs, this task
@@ -503,7 +503,7 @@ impl Engine {
             tokio::select! {
                 _ = shutdown.changed() => break,
                 _ = scan_interval.tick() => {
-                    self.run_scan_logged("periodic").await;
+                    self.run_scan_logged("periodic", shutdown.clone()).await;
                     self.log_and_save_runtime("post-scan");
                 }
                 _ = stats_tick.tick(), if stats_interval > Duration::ZERO => { self.log_and_save_runtime("periodic"); }
@@ -512,10 +512,10 @@ impl Engine {
         Ok(())
     }
 
-    async fn run_scan_logged(&mut self, kind: &str) {
+    async fn run_scan_logged(&mut self, kind: &str, shutdown: tokio::sync::watch::Receiver<bool>) {
         tracing::info!("scan starting (kind={kind})");
         let start = std::time::Instant::now();
-        match self.scan_once().await {
+        match self.scan_once_shutdown(shutdown).await {
             Ok(()) => tracing::info!(
                 "scan completed (kind={kind}, duration={:?})",
                 start.elapsed()
@@ -548,6 +548,16 @@ impl Engine {
     // ---- one scan ----
 
     pub async fn scan_once(&mut self) -> Result<()> {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        self.scan_once_shutdown(rx).await
+    }
+
+    /// scan_once with an explicit shutdown signal. Long phases (held refresh,
+    /// evaluation, acting) check it and abort promptly on SIGTERM/SIGINT.
+    pub async fn scan_once_shutdown(
+        &mut self,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         let scan_started_at = Utc::now();
         let seeder_floor = netstats::load_snapshot(&self.network_stats_path())
             .map(|s| s.seeder_floor)
@@ -575,7 +585,10 @@ impl Engine {
         let held_hashes: HashSet<String> = held.iter().map(|h| h.info_hash.clone()).collect();
 
         self.remove_deleted_torrents(&held, &catalog_hashes).await;
-        self.refresh_held_seeder_counts().await;
+        self.refresh_held_seeder_counts(&shutdown).await;
+        if *shutdown.borrow() {
+            anyhow::bail!("scan interrupted by shutdown");
+        }
         self.evict_stalled_torrents(&catalog_hashes).await;
 
         let max_fittable = self.max_fittable_size();
@@ -625,6 +638,7 @@ impl Engine {
         let mut processed = 0u64;
         let evaluated_all = self
             .evaluate_candidates(
+                &shutdown,
                 &items,
                 &held_hashes,
                 scan_started_at,
@@ -633,10 +647,16 @@ impl Engine {
                 max_fittable,
             )
             .await;
+        if *shutdown.borrow() {
+            anyhow::bail!("scan interrupted by shutdown");
+        }
         // NOTE: evaluate_candidates currently buffers the whole walk before
         // returning (streaming is a TODO); act incrementally over its output
         // in arrival-sized batches to preserve the windowing behavior.
         for ev in evaluated_all {
+            if *shutdown.borrow() {
+                anyhow::bail!("scan interrupted by shutdown");
+            }
             batch.push(ev);
             processed += 1;
             if batch.len() % EVALUATE_CONCURRENCY == 0 {
@@ -715,8 +735,10 @@ impl Engine {
     // ---- evaluation ----
 
     /// Evaluate every pending candidate concurrently; returns lightweight results.
+    #[allow(clippy::too_many_arguments)]
     async fn evaluate_candidates(
         &self,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
         items: &[atcatalog::Item],
         held_hashes: &HashSet<String>,
         scan_started_at: DateTime<Utc>,
@@ -782,6 +804,9 @@ impl Engine {
 
         let mut pending: Vec<atcatalog::Item> = Vec::new();
         for item in items {
+            if *shutdown.borrow() {
+                break;
+            }
             let hex = hex::encode(item.info_hash);
             if held_hashes.contains(&hex) {
                 stats.skipped_held.fetch_add(1, Ordering::Relaxed);
@@ -816,6 +841,9 @@ impl Engine {
         let tx2 = tx.clone();
         let mut handles = Vec::new();
         for chunk in pending.chunks(EVALUATE_CONCURRENCY * 4) {
+            if *shutdown.borrow() {
+                break;
+            }
             let chunk = chunk.to_vec();
             let sem = sem.clone();
             let tx = tx2.clone();
@@ -1242,9 +1270,14 @@ impl Engine {
         }
     }
 
-    async fn refresh_held_seeder_counts(&mut self) {
+    async fn refresh_held_seeder_counts(&mut self, shutdown: &tokio::sync::watch::Receiver<bool>) {
         let held = self.state.all();
-        for h in held {
+        let total = held.len();
+        for (done, h) in held.into_iter().enumerate() {
+            if *shutdown.borrow() {
+                tracing::info!("held refresh interrupted by shutdown ({done}/{total})");
+                break;
+            }
             let hex = h.info_hash.clone();
             let md = match self.fetch_metadata(&hex).await {
                 Ok(md) => md,
