@@ -240,11 +240,27 @@ async fn eval_scrape_swarm(
                 }
                 return Ok(c);
             }
-            Ok(Err(e)) => last_err = Some(e),
+            Ok(Err(e)) => {
+                if is_rate_limited(&e) {
+                    // AT is throttling us: back off hard and fail fast so the
+                    // scan stops burning the shared budget. Nothing is cached;
+                    // the next scan retries these candidates.
+                    tracing::warn!("tracker rate-limited, backing off: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return Err(anyhow::anyhow!("tracker rate-limited"));
+                }
+                last_err = Some(e)
+            }
             Err(_) => last_err = Some(anyhow::anyhow!("scrape timed out")),
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no tracker returned scrape data")))
+}
+
+/// True when an error looks like HTTP 429 / rate limiting from a tracker.
+fn is_rate_limited(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}");
+    s.contains("429") || s.to_lowercase().contains("too many requests")
 }
 
 async fn evaluate_one_item(
