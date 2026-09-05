@@ -164,6 +164,7 @@ struct EvalCtx {
     torrent_base_url: String,
     user_agent: String,
     rate: Arc<tokio::sync::Mutex<RateLimiter>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 fn eval_torrent_cache_path(data_dir: &Path, info_hash_hex: &str) -> PathBuf {
@@ -242,11 +243,17 @@ async fn eval_scrape_swarm(
             }
             Ok(Err(e)) => {
                 if is_rate_limited(&e) {
-                    // AT is throttling us: back off hard and fail fast so the
-                    // scan stops burning the shared budget. Nothing is cached;
-                    // the next scan retries these candidates.
+                    // AT is throttling us: back off (shutdown-aware) and fail
+                    // fast so the scan stops burning the shared budget.
+                    // Nothing is cached; the next scan retries these.
                     tracing::warn!("tracker rate-limited, backing off: {e:#}");
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let mut sd = ctx.shutdown.clone();
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                        _ = sd.changed() => {
+                            anyhow::bail!("scan interrupted by shutdown");
+                        }
+                    }
                     return Err(anyhow::anyhow!("tracker rate-limited"));
                 }
                 last_err = Some(e)
@@ -837,6 +844,7 @@ impl Engine {
             torrent_base_url: self.torrent_fetcher.base_url.clone(),
             user_agent: buildinfo::user_agent(),
             rate: self.rate.clone(),
+            shutdown: shutdown.clone(),
         });
         let tx2 = tx.clone();
         let mut handles = Vec::new();
@@ -891,8 +899,19 @@ impl Engine {
         }
 
         let mut out = Vec::new();
-        while let Some(ev) = rx.recv().await {
-            out.push(ev);
+        // Drain whatever arrived. recv() ends when all senders drop; on a
+        // shutdown-abandoned dispatch some senders may linger in wedged
+        // tasks, so bound the drain rather than waiting forever.
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(ev)) => out.push(ev),
+                _ => break,
+            }
         }
         // Remember seeder counts for the floor computation.
         *self.evaluated_counts.lock().await = out.iter().map(|e| e.seeders).collect();
@@ -925,6 +944,7 @@ impl Engine {
     /// shared rate limiter.
     async fn scrape_swarm(
         &self,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
         trackers: &[String],
         info_hash: &[u8; 20],
         stats: &ScanStats,
@@ -962,7 +982,22 @@ impl Engine {
                     }
                     return Ok(c);
                 }
-                Ok(Err(e)) => last_err = Some(e),
+                Ok(Err(e)) => {
+                    if is_rate_limited(&e) {
+                        tracing::warn!(
+                            "tracker rate-limited during held refresh, backing off: {e:#}"
+                        );
+                        let mut sd = shutdown.clone();
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                            _ = sd.changed() => {
+                                anyhow::bail!("scan interrupted by shutdown");
+                            }
+                        }
+                        return Err(anyhow::anyhow!("tracker rate-limited"));
+                    }
+                    last_err = Some(e)
+                }
                 Err(_) => last_err = Some(anyhow::anyhow!("scrape timed out")),
             }
         }
@@ -1288,7 +1323,10 @@ impl Engine {
             };
             let dummy = ScanStats::default();
             let hash = decode_hash(&hex).unwrap_or([0u8; 20]);
-            match self.scrape_swarm(&md.trackers, &hash, &dummy).await {
+            match self
+                .scrape_swarm(shutdown, &md.trackers, &hash, &dummy)
+                .await
+            {
                 Ok(sw) => {
                     // Progress = verified bytes on disk; grows iff new data lands.
                     let progress = self.held_progress_bytes(&h);

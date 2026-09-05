@@ -81,11 +81,24 @@ async fn cmd_run(cfg: Config) -> Result<()> {
         cfg.data_dir.display(),
         started.elapsed()
     );
-    // Bounded teardown: stop the rqbit session (15s max), then exit
-    // regardless. State on disk is already consistent (atomic writes), so a
-    // wedged teardown must not hold shutdown hostage (TimeoutStopSec=30).
-    let r = engine.run(shutdown_rx).await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), engine.close()).await;
+    // Bounded total runtime after a signal: run the engine with a shutdown
+    // deadline (mirrors TimeoutStopSec=30). The engine checks the watch
+    // channel between phases, but spawned workers can wedge (60s backoff,
+    // hung fetch); the deadline guarantees the process exits regardless.
+    // State on disk is already consistent (atomic writes).
+    let mut shutdown_rx2 = shutdown_tx.subscribe();
+    let r = tokio::select! {
+        r = engine.run(shutdown_rx) => r,
+        _ = async {
+            // Wait for any signal, then give the engine 20s to wind down.
+            let _ = shutdown_rx2.wait_for(|v| *v).await;
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        } => {
+            tracing::warn!("shutdown deadline exceeded, exiting");
+            Ok(())
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine.close()).await;
     tracing::info!("keep-at stopped");
     r
 }
