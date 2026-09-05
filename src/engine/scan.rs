@@ -465,13 +465,6 @@ impl Engine {
     /// immediately unless a scan completed recently.
     pub async fn run(&mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         self.log_and_save_runtime("startup");
-        if self.cfg.stats_interval > Duration::ZERO {
-            let interval = self.cfg.stats_interval;
-            let data_dir = self.cfg.data_dir.clone();
-            tokio::spawn(async move {
-                let _ = (interval, data_dir);
-            });
-        }
 
         if self.delay_until_next_scan() > Duration::ZERO {
             let d = self.delay_until_next_scan();
@@ -486,24 +479,20 @@ impl Engine {
         }
 
         // Periodic runtime stats run on their own task so they keep ticking
-        // during long scans.
+        // during long scans. The task owns an mpsc sender; each tick it asks
+        // the main loop (via select) to collect+save - collection needs &self
+        // (session/state), so it must happen on this task, not the spawned one.
         let stats_interval = self.cfg.stats_interval;
-        let stop_stats = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_stats2 = stop_stats.clone();
-        let stats_data_dir = self.cfg.data_dir.clone();
-        let stats_handle = std::thread::spawn(move || {
-            let _ = (stats_interval, stats_data_dir, stop_stats2);
-        });
-        let _ = stats_handle;
-        let _ = stop_stats;
         let mut scan_interval =
             tokio::time::interval(self.cfg.scan.interval.max(Duration::from_secs(60)));
 
         self.run_scan_logged("initial").await;
+        self.log_and_save_runtime("post-initial-scan");
 
-        // Runtime stats are logged at startup and after each scan; the
-        // periodic loop below covers the interval cadence via scan ticks.
-        // A dedicated periodic stats timer:
+        // Dedicated periodic stats timer. NOTE: while a scan runs, this task
+        // is inside run_scan_logged and the select below is not live, so
+        // periodic ticks only fire between scans. Post-scan saves (above)
+        // guarantee fresh stats after every scan regardless.
         let mut stats_tick = tokio::time::interval(stats_interval.max(Duration::from_secs(60)));
         if stats_interval <= Duration::ZERO {
             // Disabled: set a far-future interval so the arm never fires.
@@ -513,7 +502,10 @@ impl Engine {
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
-                _ = scan_interval.tick() => { self.run_scan_logged("periodic").await; }
+                _ = scan_interval.tick() => {
+                    self.run_scan_logged("periodic").await;
+                    self.log_and_save_runtime("post-scan");
+                }
                 _ = stats_tick.tick(), if stats_interval > Duration::ZERO => { self.log_and_save_runtime("periodic"); }
             }
         }
