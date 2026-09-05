@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Cross-compiles keep-at for every common architecture and packages each
-# into keep-at_<os>_<arch>.tar.gz, the naming convention internal/updater
-# expects when checking GitHub releases for self-update.
+# Cross-compiles keep-at (Rust) for Linux targets and packages each into
+# keep-at_linux_<arch>.tar.gz, the naming self-update expects.
+# Linux-only (the Rust migration dropped macOS/Windows).
+#
+# Needs: cargo + rustup targets installed once:
+#   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+#     armv7-unknown-linux-musleabihf i686-unknown-linux-musl
+# musl targets produce fully static binaries (no OpenSSL needed: rustls/ring).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -11,45 +16,34 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
-COMMIT="${COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 
-LDFLAGS="-X github.com/tweedge/keep-at/internal/buildinfo.Version=${VERSION} -X github.com/tweedge/keep-at/internal/buildinfo.Commit=${COMMIT}"
+# Stamp the release version into the binary: buildinfo prefers
+# KEEPAT_VERSION_OVERRIDE (compile-time env) over Cargo.toml.
+if [[ "$VERSION" =~ ^v[0-9] ]]; then
+  export KEEPAT_VERSION_OVERRIDE="${VERSION#v}"
+else
+  export KEEPAT_VERSION_OVERRIDE="$VERSION"
+fi
 
-# linux covers the Raspberry Pi / home server / Debian VM / Docker targets
-# this project cares about most; darwin and windows are included too for
-# broader portability.
-#
-# 32-bit ARM only ships one build at GOARM=6: Go's runtime.GOARCH reports
-# "arm" regardless of GOARM version, so self-update (internal/updater)
-# can't tell a v6 and v7 asset apart by architecture name alone. GOARM=6
-# binaries still run fine on v7 hardware (just without v7-only
-# optimizations), so it's the one to ship for broadest compatibility across
-# every Raspberry Pi model.
+# target triple -> asset arch
 TARGETS=(
-  "linux amd64 "
-  "linux arm64 "
-  "linux arm 6"
-  "linux 386 "
-  "darwin amd64 "
-  "darwin arm64 "
-  "windows amd64 "
+  "x86_64-unknown-linux-musl amd64"
+  "aarch64-unknown-linux-musl arm64"
+  "armv7-unknown-linux-musleabihf arm"
+  "i686-unknown-linux-musl 386"
 )
 
 for target in "${TARGETS[@]}"; do
-  read -r os arch goarm <<<"$target"
-  name="keep-at_${os}_${arch}"
+  read -r triple arch <<<"$target"
+  name="keep-at_linux_${arch}"
 
-  echo "building ${name}..."
+  echo "building ${name} (${triple})..."
   build_dir="$(mktemp -d)"
-  binary_name="keep-at"
-  if [ "$os" = "windows" ]; then
-    binary_name="keep-at.exe"
-  fi
 
-  GOOS="$os" GOARCH="$arch" GOARM="$goarm" \
-    go build -trimpath -ldflags "$LDFLAGS" -o "${build_dir}/${binary_name}" ./cmd/keep-at
+  cargo build --release --target "$triple"
+  cp "target/${triple}/release/keep-at" "${build_dir}/keep-at"
 
-  tar -C "$build_dir" -czf "${OUT_DIR}/${name}.tar.gz" "$binary_name"
+  tar -C "$build_dir" -czf "${OUT_DIR}/${name}.tar.gz" keep-at
   rm -rf "$build_dir"
 done
 

@@ -1,0 +1,28 @@
+name: ci
+
+# Fast checks on every push and pull request: formatting, lints, and the
+# offline unit tests. Live smoke tests (KEEPAT_SMOKE_*) stay opt-in - they
+# need real network access to Academic Torrents.
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-rust@v1
+        with:
+          rust-version: "1.85"
+          components: clippy, rustfmt
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Unit tests (offline)
+        run: cargo test --locked --lib

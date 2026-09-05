@@ -17,3 +17,6 @@ VOICE_FINDER_LOG.md
 
 # Kilo local session/state directory
 /.kilo/
+
+# Rust
+/target/

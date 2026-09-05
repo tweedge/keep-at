@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs the latest (or a specific) keep-at release for Linux or macOS.
+# Installs the latest (or a specific) keep-at release for Linux.
 #
 #   curl -fsSL https://raw.githubusercontent.com/tweedge/keep-at/main/scripts/install.sh | sh
 #
@@ -27,8 +27,7 @@ need tar
 os="$(uname -s)"
 case "$os" in
   Linux) os=linux ;;
-  Darwin) os=darwin ;;
-  *) die "unsupported OS '$os' - this script only supports Linux and macOS. Download a release manually from https://github.com/${REPO}/releases" ;;
+  *) die "unsupported OS '$os' - this script only supports Linux. Download a release manually from https://github.com/${REPO}/releases" ;;
 esac
 
 arch="$(uname -m)"

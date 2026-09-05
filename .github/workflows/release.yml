@@ -1,6 +1,6 @@
 name: release
 
-# Builds cross-platform binaries and publishes them as a GitHub release
+# Builds Linux binaries (musl-static) and publishes them as a GitHub release
 # whenever a version tag is pushed, e.g.:
 #
 #   git tag v1.2.3 && git push origin v1.2.3
@@ -22,9 +22,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-rust@v1
         with:
-          go-version: "1.26"
+          rust-version: "1.85"
+
+      - name: Install musl targets
+        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf i686-unknown-linux-musl
+
+      - name: Run tests
+        run: cargo test --locked
 
       - name: Build release artifacts
         env:
