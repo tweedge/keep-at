@@ -10,6 +10,10 @@ pub struct Candidate {
     pub info_hash: [u8; 20],
     pub title: String,
     pub size_bytes: u64,
+    /// Piece count: the RAM-cost axis (rqbit bookkeeping scales ~32 B/piece).
+    /// Defaults to 0 (unknown) when the caller has no metainfo handy; a
+    /// 0-piece candidate prices like a 1-piece one (never free).
+    pub piece_count: u32,
     pub seeders: u32,
     pub leechers: u32,
     /// p10 seeder floor from the last completed scan. 0 (no completed scan)
@@ -30,17 +34,32 @@ pub struct Held {
     pub info_hash: [u8; 20],
     pub title: String,
     pub size_bytes: u64,
+    /// Piece count (0 = unknown, e.g. state written before this was tracked).
+    pub piece_count: u32,
     pub seeders: u32,
 }
 
 /// Order candidates by seeding urgency: fewest seeds first; unavailable
 /// (zero-seed) candidates excluded. Size tie-break prefers smaller normally
 /// (cheaper to try first), larger when RAM-bound (bytes per RAM slot).
-pub fn rank_candidates(mut candidates: Vec<Candidate>, ram_bound: bool) -> Vec<Candidate> {
+///
+/// When RAM-bound, the tie-break prices bytes per RAM slot properly: a 2 GiB
+/// 100-piece torrent outranks a 2 GiB 100k-piece one, because both fill the
+/// same disk but the latter costs ~6 MiB more RAM. Piece count is the RAM
+/// axis (rqbit bookkeeping scales ~32 B/piece); byte size is the disk axis.
+pub fn rank_candidates(
+    mut candidates: Vec<Candidate>,
+    ram_bound: bool,
+    peer_limit: usize,
+) -> Vec<Candidate> {
     candidates.retain(|c| c.available());
     candidates.sort_by(|a, b| {
         a.seeders.cmp(&b.seeders).then(if ram_bound {
-            b.size_bytes.cmp(&a.size_bytes)
+            // Bytes per RAM byte, descending: compare a.size/a.ram vs
+            // b.size/b.ram via cross-multiplication (no float, no div-zero).
+            let ar = crate::engine::ram::torrent_ram(a.piece_count, peer_limit).max(1) as u128;
+            let br = crate::engine::ram::torrent_ram(b.piece_count, peer_limit).max(1) as u128;
+            (b.size_bytes as u128 * ar).cmp(&(a.size_bytes as u128 * br))
         } else {
             a.size_bytes.cmp(&b.size_bytes)
         })
@@ -176,6 +195,7 @@ mod tests {
             info_hash: [0u8; 20],
             title: String::new(),
             size_bytes: size,
+            piece_count: 0,
             seeders,
             leechers: 0,
             seeder_floor: 0,
@@ -187,6 +207,7 @@ mod tests {
         let v = rank_candidates(
             vec![cand(5, 10), cand(1, 100), cand(0, 1), cand(1, 5)],
             false,
+            8,
         );
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].size_bytes, 5);
@@ -196,8 +217,23 @@ mod tests {
 
     #[test]
     fn rank_ram_bound_prefers_larger() {
-        let v = rank_candidates(vec![cand(1, 5), cand(1, 100)], true);
+        let v = rank_candidates(vec![cand(1, 5), cand(1, 100)], true, 8);
         assert_eq!(v[0].size_bytes, 100);
+    }
+
+    #[test]
+    fn rank_ram_bound_prices_pieces_not_bytes() {
+        // Same 2 GiB size, different piece counts: fewer pieces wins when
+        // RAM-bound (same disk, less RAM).
+        let mut a = cand(1, 2 << 30);
+        a.piece_count = 100;
+        let mut b = cand(1, 2 << 30);
+        b.piece_count = 100_000;
+        let v = rank_candidates(vec![b.clone(), a.clone()], true, 8);
+        assert_eq!(v[0].piece_count, 100);
+        // Not RAM-bound: tie on size keeps both, pieces ignored.
+        let v = rank_candidates(vec![b, a], false, 8);
+        assert_eq!(v.len(), 2);
     }
 
     #[test]
@@ -238,6 +274,7 @@ mod tests {
             info_hash: [1u8; 20],
             title: String::new(),
             size_bytes: 5,
+            piece_count: 0,
             seeders: 4,
         }];
         let d = evaluate_swap(&cand(3, 10), &held, 2, 0.6, 0.0);

@@ -10,15 +10,22 @@ use librqbit::{AddTorrent, AddTorrentOptions, Session};
 
 pub type ManagedTorrentHandle = Arc<librqbit::ManagedTorrent>;
 
-/// Add a torrent from raw .torrent bytes into `output_dir` (the assigned
-/// storage location). AT-only tracker filtering + keyed announce URLs are
-/// applied before adding. Returns the info-hash hex.
+/// Add a torrent into `output_dir` (the assigned storage location).
+/// AT-only tracker filtering + keyed announce URLs are applied before adding.
+/// Raw bytes are read from the torrent-cache file at add time and dropped
+/// right after, so callers never hold bulk metainfo in memory.
+/// Returns the info-hash hex.
 pub async fn add_torrent_bytes(
     session: &Arc<Session>,
-    raw: &[u8],
+    info_hash_hex: &str,
+    md: &crate::attorrent::TorrentMeta,
     output_dir: &Path,
     trackers: Vec<Vec<String>>,
+    cache_path: &Path,
 ) -> Result<String> {
+    let raw = std::fs::read(cache_path)
+        .with_context(|| format!("loading cached .torrent for {info_hash_hex}"))?;
+    let _ = md;
     let opts = AddTorrentOptions {
         output_folder: Some(output_dir.to_string_lossy().into_owned()),
         overwrite: true,

@@ -24,8 +24,9 @@ pub const ALL_LIMIT_FRACTION: f64 = 0.975;
 /// Share of system RAM keep-at will ever plan around, regardless of --max-ram.
 pub const SYSTEM_RAM_FRACTION_HARD_CAP: f64 = 0.8;
 
-/// Fixed per-torrent RAM overhead estimate used to derive the torrent-count
-/// cap from the RAM budget (conservative upper bound for planning).
+/// Legacy flat per-torrent estimate. Superseded by the measured model in
+/// engine::ram (BASE + per-piece + per-peer at the budget's peer limit);
+/// kept so the hard-cap log line and external callers still compile.
 pub const PER_TORRENT_RAM_BASE: u64 = 1 << 20; // 1 MiB
 
 fn default_scan_interval() -> Duration {

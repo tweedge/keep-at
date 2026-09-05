@@ -15,9 +15,13 @@ use crate::buildinfo;
 use crate::config::Config;
 
 /// Build the node's main rqbit session: TCP-only listener on cfg.port, DHT
-/// on, small per-torrent peer limit, global up/down rate limits, keep-at
-/// seeder identity for tracker User-Agent and extended handshake.
-pub async fn new_seeder_session(cfg: &Config) -> Result<Arc<Session>> {
+/// on, RAM-scaled per-torrent peer limit, global up/down rate limits,
+/// keep-at seeder identity for tracker User-Agent and extended handshake.
+///
+/// The peer limit scales with the RAM budget (see peer_limit_for_budget):
+/// peer buffers are the dominant per-torrent RAM term, so small hosts trade
+/// per-torrent swarm speed for more held torrents.
+pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Session>> {
     let listen = ListenerOptions {
         listen_addr: SocketAddr::from(([0, 0, 0, 0], cfg.port)),
         ..ListenerOptions::default()
@@ -37,7 +41,7 @@ pub async fn new_seeder_session(cfg: &Config) -> Result<Arc<Session>> {
         listen: Some(listen),
         connect: Some(connect),
         ratelimits,
-        peer_limit: Some(20),
+        peer_limit: Some(crate::engine::ram::peer_limit_for_budget(ram_budget)),
         disable_local_service_discovery: true,
         client_name_and_version: Some(buildinfo::seeder_user_agent()),
         peer_id: Some(peer_id_from_prefix()),

@@ -13,18 +13,23 @@ pub struct SwarmCounts {
 
 #[derive(Debug, Clone)]
 pub struct TorrentMeta {
-    /// Raw .torrent bytes (kept so rqbit can add from bytes, and so the
-    /// torrent-cache round-trips byte-identically).
-    pub raw: Vec<u8>,
     pub info_hash: [u8; 20],
     pub trackers: Vec<String>,
     /// Torrent creation time, if present. Zero/non-existent => None (treated
     /// as not yet age-eligible by the caller).
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub total_length: u64,
+    /// Number of pieces. Drives the RAM model: rqbit's per-torrent
+    /// bookkeeping scales ~32 B/piece (measured), so piece count - not byte
+    /// size - is what makes one torrent cost more RAM than another.
+    pub piece_count: u32,
     pub name: String,
 }
 
+/// TorrentMeta carries no bulk data: fetchers write the exact response body
+/// to the torrent-cache file, and the add path re-reads it from disk only at
+/// the moment rqbit needs it. So scans hold ~100 B/candidate in memory, not
+/// the 64 KiB average .torrent file (measured 182 MiB scan peak eliminated).
 pub struct Fetcher {
     pub base_url: String,
     pub user_agent: String,
@@ -32,7 +37,11 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
-    pub async fn fetch_torrent(&self, info_hash_hex: &str) -> Result<TorrentMeta> {
+    pub async fn fetch_torrent(
+        &self,
+        info_hash_hex: &str,
+        cache_path: Option<&std::path::Path>,
+    ) -> Result<(TorrentMeta, Vec<u8>)> {
         let url = format!("{}/download/{info_hash_hex}.torrent", self.base_url);
         let resp = self
             .client
@@ -49,7 +58,19 @@ impl Fetcher {
             .bytes()
             .await
             .with_context(|| format!("reading {url}"))?;
-        parse_torrent_bytes(&body)
+        let md = parse_torrent_bytes(&body)?;
+        if let Some(path) = cache_path {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let mut tmp_os = path.as_os_str().to_owned();
+            tmp_os.push(".tmp");
+            let tmp = std::path::PathBuf::from(tmp_os);
+            if std::fs::write(&tmp, &body).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+        Ok((md, body.to_vec()))
     }
 }
 
@@ -141,6 +162,7 @@ pub fn parse_torrent_bytes(body: &[u8]) -> Result<TorrentMeta> {
         .validate()
         .context("validating torrent info")?;
     let total_length = validated.lengths().total_length();
+    let piece_count = validated.lengths().total_pieces();
     let name: String = validated
         .name()
         .map(|n| n.into_owned())
@@ -148,11 +170,11 @@ pub fn parse_torrent_bytes(body: &[u8]) -> Result<TorrentMeta> {
         .unwrap_or_else(|| hex::encode(info_hash));
 
     Ok(TorrentMeta {
-        raw: body.to_vec(),
         info_hash,
         trackers,
         created_at,
         total_length,
+        piece_count,
         name,
     })
 }

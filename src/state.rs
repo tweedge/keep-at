@@ -16,6 +16,10 @@ pub struct Torrent {
     pub size_bytes: u64,
     pub storage_location: PathBuf,
     pub added_at: DateTime<Utc>,
+    /// Piece count at add time (0 = unknown, written by older versions).
+    /// Feeds the RAM model so swaps price held torrents without re-parsing.
+    #[serde(default)]
+    pub piece_count: u32,
     #[serde(default)]
     pub last_known_seeders: u32,
     #[serde(default)]
@@ -120,6 +124,7 @@ mod tests {
             size_bytes: 10,
             storage_location: PathBuf::from("/x"),
             added_at: Utc::now(),
+            piece_count: 0,
             last_known_seeders: 0,
             completed_pieces: 0,
             last_progress_at: None,

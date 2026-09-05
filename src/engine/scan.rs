@@ -50,6 +50,8 @@ pub struct Engine {
     user_announce: String,
     user_announce_ipv6: String,
     max_torrents: usize,
+    /// RAM budget in bytes (for per-candidate footprint pricing).
+    ram_budget: u64,
     started_at: std::time::Instant,
     rate: Arc<tokio::sync::Mutex<RateLimiter>>,
     evaluated_counts: tokio::sync::Mutex<Vec<u32>>,
@@ -109,6 +111,7 @@ struct Evaluated {
     title: String,
     info_hash: [u8; 20],
     size_bytes: u64,
+    piece_count: u32,
     seeders: u32,
     leechers: u32,
 }
@@ -186,16 +189,9 @@ async fn eval_fetch_metadata(ctx: &EvalCtx, info_hash_hex: &str) -> Result<Torre
         user_agent: ctx.user_agent.clone(),
         client: ctx.http.clone(),
     };
-    let md = fetcher.fetch_torrent(info_hash_hex).await?;
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let mut tmp_os = path.as_os_str().to_owned();
-    tmp_os.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp_os);
-    if std::fs::write(&tmp, &md.raw).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    // fetch_torrent writes the body to the cache file itself; only the
+    // lightweight TorrentMeta (no raw bytes) is returned and kept.
+    let (md, _raw) = fetcher.fetch_torrent(info_hash_hex, Some(&path)).await?;
     Ok(md)
 }
 
@@ -324,6 +320,7 @@ async fn evaluate_one_item(
         title: item.title.clone(),
         info_hash: md.info_hash,
         size_bytes: md.total_length,
+        piece_count: md.piece_count,
         seeders: swarm.seeders,
         leechers: swarm.leechers,
     })
@@ -396,14 +393,15 @@ impl Engine {
             tracing::warn!("could not measure system RAM; the RAM-driven torrent cap is disabled");
         }
         tracing::info!(
-            "RAM budget: system {} hard-cap-80% {} budget {} max-torrents {}",
+            "RAM budget: system {} hard-cap-80% {} budget {} peer-limit {} max-torrents {}",
             crate::humanize::human_bytes(system_total as i64),
             crate::humanize::human_bytes(hard_cap as i64),
             crate::humanize::human_bytes(budget as i64),
+            ram::peer_limit_for_budget(budget),
             max_torrents,
         );
 
-        let session = rqsession::new_seeder_session(&cfg).await?;
+        let session = rqsession::new_seeder_session(&cfg, budget).await?;
         let api = Api::new(session.clone(), None);
 
         let catalog = atcatalog::Fetcher {
@@ -437,6 +435,7 @@ impl Engine {
             user_announce,
             user_announce_ipv6,
             max_torrents,
+            ram_budget: budget,
             started_at: std::time::Instant::now(),
             rate: Arc::new(tokio::sync::Mutex::new(RateLimiter {
                 per_second: 0.5,
@@ -919,6 +918,7 @@ impl Engine {
     }
 
     /// Fetch metadata from torrent-cache, else AT (rate-limited), caching to disk.
+    /// Returns the lightweight TorrentMeta only; raw bytes stay on disk until add.
     async fn fetch_metadata(&self, info_hash_hex: &str) -> Result<TorrentMeta> {
         let path = self.torrent_cache_path(info_hash_hex);
         if let Ok(data) = std::fs::read(&path) {
@@ -927,16 +927,10 @@ impl Engine {
             }
         }
         self.rate.lock().await.wait().await;
-        let md = self.torrent_fetcher.fetch_torrent(info_hash_hex).await?;
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let mut tmp_os = path.as_os_str().to_owned();
-        tmp_os.push(".tmp");
-        let tmp = std::path::PathBuf::from(tmp_os);
-        if std::fs::write(&tmp, &md.raw).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let (md, _raw) = self
+            .torrent_fetcher
+            .fetch_torrent(info_hash_hex, Some(&path))
+            .await?;
         Ok(md)
     }
 
@@ -1046,12 +1040,17 @@ impl Engine {
                     info_hash: e.info_hash,
                     title: e.title.clone(),
                     size_bytes: e.size_bytes,
+                    piece_count: e.piece_count,
                     seeders: e.seeders,
                     leechers: e.leechers,
                     seeder_floor,
                 })
                 .collect();
-            sel = selector::rank_candidates(sel, ram_bound);
+            sel = selector::rank_candidates(
+                sel,
+                ram_bound,
+                ram::peer_limit_for_budget(self.ram_budget),
+            );
             let window = self.max_torrents.min(sel.len());
             for c in sel.into_iter().take(window) {
                 let key = hex::encode(c.info_hash);
@@ -1082,6 +1081,11 @@ impl Engine {
             }
         };
         let size_bytes = md.total_length;
+        // Refresh the candidate's RAM price from authoritative metainfo: the
+        // Evaluated snapshot may predate piece_count tracking (always set for
+        // fresh evaluations, but cheap to re-derive here).
+        let mut c = c.clone();
+        c.piece_count = md.piece_count;
 
         let mut decision = selector::SwapDecision {
             should_swap: false,
@@ -1092,28 +1096,46 @@ impl Engine {
         let mut rng = rand::thread_rng();
 
         if *held_count < self.max_torrents {
-            let free: Vec<u64> = self
-                .cfg
-                .storage
-                .iter()
-                .map(|l| self.free_bytes(l))
-                .collect();
-            let need: Vec<u64> = self
-                .cfg
-                .storage
-                .iter()
-                .map(|_| self.size_needed(size_bytes))
-                .collect();
-            if let Some(idx) = selector::choose_location(&free, &need, selector::roll(&mut rng)) {
-                let loc = self.cfg.storage[idx].path.clone();
-                let (added, d) = self
-                    .try_add(c, &md, size_bytes, &loc, &[], seeder_floor)
-                    .await;
-                decision = d;
-                if added {
-                    *held_count += 1;
-                    self.log_decision(c, &decision);
-                    return;
+            // Free-space fill still checks the RAM price: even below the
+            // torrent-count cap, a candidate must fit the *remaining* RAM
+            // budget, so a many-piece giant can't push RSS past the budget on
+            // a host whose disk dwarfs its RAM (e.g. 512 MiB / 1 TB).
+            let ram_headroom = self.ram_headroom_bytes();
+            let ram_cost =
+                ram::torrent_ram(c.piece_count, ram::peer_limit_for_budget(self.ram_budget));
+            if ram_cost > ram_headroom {
+                tracing::debug!(
+                    "skipping free-space fill: candidate RAM cost {} exceeds headroom {} (title={})",
+                    crate::humanize::human_bytes(ram_cost as i64),
+                    crate::humanize::human_bytes(ram_headroom as i64),
+                    c.title
+                );
+            } else {
+                let free_space: Vec<u64> = self
+                    .cfg
+                    .storage
+                    .iter()
+                    .map(|l| self.free_bytes(l))
+                    .collect();
+                let space_needed: Vec<u64> = self
+                    .cfg
+                    .storage
+                    .iter()
+                    .map(|_| self.size_needed(size_bytes))
+                    .collect();
+                if let Some(idx) =
+                    selector::choose_location(&free_space, &space_needed, selector::roll(&mut rng))
+                {
+                    let loc = self.cfg.storage[idx].path.clone();
+                    let (added, d) = self
+                        .try_add(&c, &md, size_bytes, &loc, &[], seeder_floor)
+                        .await;
+                    decision = d;
+                    if added {
+                        *held_count += 1;
+                        self.log_decision(&c, &decision);
+                        return;
+                    }
                 }
             }
         } else {
@@ -1125,7 +1147,7 @@ impl Engine {
 
         let (swapped, d) = self
             .try_swap(
-                c,
+                &c,
                 &md,
                 size_bytes,
                 *held_count >= self.max_torrents,
@@ -1133,8 +1155,25 @@ impl Engine {
             )
             .await;
         if swapped || (!decision.seed_scarcity_blocked() && !d.reason.is_empty()) {
-            self.log_decision(c, &d);
+            self.log_decision(&c, &d);
         }
+    }
+
+    /// Remaining RAM budget in bytes given the current held set, priced
+    /// with each held torrent's stored piece count (unknown counts price as
+    /// typical). Saturates at 0 rather than going negative.
+    fn ram_headroom_bytes(&self) -> u64 {
+        let peer_limit = ram::peer_limit_for_budget(self.ram_budget);
+        let mut used = 0u64;
+        for h in self.state.all() {
+            let pieces = if h.piece_count > 0 {
+                h.piece_count
+            } else {
+                1024
+            };
+            used = used.saturating_add(ram::torrent_ram(pieces, peer_limit));
+        }
+        self.ram_budget.saturating_sub(used)
     }
 
     fn log_decision(&self, c: &Candidate, d: &selector::SwapDecision) {
@@ -1165,6 +1204,7 @@ impl Engine {
                 info_hash: c.info_hash,
                 title: c.title.clone(),
                 size_bytes,
+                piece_count: md.piece_count,
                 seeders: c.seeders,
                 leechers: c.leechers,
                 seeder_floor,
@@ -1184,8 +1224,16 @@ impl Engine {
         }
         let tiers = tiers_of(&md.trackers);
         let keyed = atkey::at_trackers_only(tiers, &self.user_announce, &self.user_announce_ipv6);
-        if let Err(e) =
-            engtorrents::add_torrent_bytes(&self.session, &md.raw, &out_dir, keyed).await
+        let hex_str = hex::encode(c.info_hash);
+        if let Err(e) = engtorrents::add_torrent_bytes(
+            &self.session,
+            &hex_str,
+            md,
+            &out_dir,
+            keyed,
+            &self.torrent_cache_path(&hex_str),
+        )
+        .await
         {
             tracing::error!("failed to add candidate {}: {e:#}", c.title);
             return (false, decision);
@@ -1196,6 +1244,7 @@ impl Engine {
             size_bytes,
             storage_location: location.to_path_buf(),
             added_at: Utc::now(),
+            piece_count: md.piece_count,
             last_known_seeders: c.seeders,
             completed_pieces: 0,
             last_progress_at: Some(Utc::now()),
@@ -1214,6 +1263,8 @@ impl Engine {
         seeder_floor: u32,
     ) -> (bool, selector::SwapDecision) {
         let held = self.state.all();
+        let peer_limit = ram::peer_limit_for_budget(self.ram_budget);
+        let ram_cost = ram::torrent_ram(md.piece_count, peer_limit);
         let mut by_location: HashMap<PathBuf, Vec<state::Torrent>> = HashMap::new();
         for h in held {
             by_location
@@ -1237,6 +1288,8 @@ impl Engine {
                 in_location,
                 c.seeders,
                 size_needed,
+                ram_cost,
+                peer_limit,
                 self.cfg.scan.min_seed_margin,
                 ram_bound,
             );
@@ -1247,6 +1300,7 @@ impl Engine {
                     info_hash: decode_hash(&h.info_hash).unwrap_or([0u8; 20]),
                     title: h.title.clone(),
                     size_bytes: h.size_bytes,
+                    piece_count: h.piece_count,
                     seeders: h.last_known_seeders,
                 })
                 .collect();
@@ -1396,21 +1450,16 @@ impl Engine {
         tracing::info!("resuming {} held torrents", held.len());
         for h in held {
             let out_dir = engtorrents::torrent_output_dir(&h.storage_location, &h.info_hash);
-            let raw = match std::fs::read(self.torrent_cache_path(&h.info_hash)) {
-                Ok(b) => b,
-                Err(e) => {
+            // Parse-then-drop: raw bytes are freed before the blocking add,
+            // so resume never holds more than one .torrent in memory.
+            let md = match std::fs::read(self.torrent_cache_path(&h.info_hash))
+                .ok()
+                .and_then(|raw| attorrent::parse_torrent_bytes(&raw).ok())
+            {
+                Some(md) => md,
+                None => {
                     tracing::warn!(
-                        "skipping resume {}: could not load cached .torrent: {e:#}",
-                        h.info_hash
-                    );
-                    continue;
-                }
-            };
-            let md = match attorrent::parse_torrent_bytes(&raw) {
-                Ok(md) => md,
-                Err(e) => {
-                    tracing::warn!(
-                        "skipping resume {}: bad cached .torrent: {e:#}",
+                        "skipping resume {}: could not load cached .torrent",
                         h.info_hash
                     );
                     continue;
@@ -1419,8 +1468,15 @@ impl Engine {
             let tiers = tiers_of(&md.trackers);
             let keyed =
                 atkey::at_trackers_only(tiers, &self.user_announce, &self.user_announce_ipv6);
-            if let Err(e) =
-                engtorrents::add_torrent_bytes(&self.session, &raw, &out_dir, keyed).await
+            if let Err(e) = engtorrents::add_torrent_bytes(
+                &self.session,
+                &h.info_hash,
+                &md,
+                &out_dir,
+                keyed,
+                &self.torrent_cache_path(&h.info_hash),
+            )
+            .await
             {
                 tracing::warn!("skipping resume {}: {e:#}", h.info_hash);
             }
@@ -1532,10 +1588,18 @@ fn decode_hash(hex_str: &str) -> Result<[u8; 20]> {
 /// Greedy displaceable-set selection within one location, mirroring Go's
 /// selectDisplaceable. Sizes are nominal bytes here (plain storage: nominal
 /// == on-disk up to the fixed buffer, applied symmetrically on both sides).
+///
+/// The set must free enough disk AND enough RAM: freed RAM is the sum of the
+/// displaced torrents' footprints (stored piece counts, unknown = typical),
+/// and the swap proceeds only when freed RAM covers the candidate's cost.
+/// This keeps a many-piece candidate from evicting one cheap torrent and
+/// pushing RSS past the budget — the displaced set must price out.
 fn select_displaceable(
     in_location: &[state::Torrent],
     candidate_seeders: u32,
     size_needed: u64,
+    ram_cost: u64,
+    peer_limit: usize,
     min_seed_margin: i32,
     ram_bound: bool,
 ) -> Option<Vec<state::Torrent>> {
@@ -1550,16 +1614,23 @@ fn select_displaceable(
         return None;
     }
     if ram_bound {
-        qualifying.sort_by_key(|h| h.size_bytes);
+        // Bytes per RAM byte, descending (same pricing as rank_candidates).
+        qualifying.sort_by(|a, b| {
+            let ar = ram::torrent_ram(a.piece_count.max(1), peer_limit).max(1) as u128;
+            let br = ram::torrent_ram(b.piece_count.max(1), peer_limit).max(1) as u128;
+            (b.size_bytes as u128 * ar).cmp(&(a.size_bytes as u128 * br))
+        });
     } else {
         qualifying.sort_by(|a, b| b.last_known_seeders.cmp(&a.last_known_seeders));
     }
     let mut chosen = Vec::new();
     let mut freed = 0u64;
+    let mut freed_ram = 0u64;
     for h in qualifying {
         freed = freed.saturating_add(h.size_bytes);
+        freed_ram = freed_ram.saturating_add(ram::torrent_ram(h.piece_count.max(1), peer_limit));
         chosen.push(h);
-        if freed >= size_needed {
+        if freed >= size_needed && freed_ram >= ram_cost {
             return Some(chosen);
         }
     }

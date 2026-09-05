@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use librqbit::{AddTorrent, AddTorrentOptions};
 
 use crate::atcatalog;
@@ -120,9 +120,11 @@ pub async fn cmd_network_status(args: &NetworkStatusArgs) -> Result<()> {
         seeder_counts.push(swarm.seeders);
 
         // Probe with a fresh disposable scraper session, torn down right after.
+        // Raw bytes are read from the cache file at probe time (never held
+        // across iterations).
         match probe_swarm(
             &cfg.data_dir,
-            &md.raw,
+            &hex,
             &md.trackers,
             &user_announce,
             &user_announce_ipv6,
@@ -239,16 +241,7 @@ async fn cached_or_fetch(
             return Ok(md);
         }
     }
-    let md = fetcher.fetch_torrent(hex).await?;
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let mut tmp_os = path.as_os_str().to_owned();
-    tmp_os.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp_os);
-    if std::fs::write(&tmp, &md.raw).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let md = fetcher.fetch_torrent(hex, Some(&path)).await?.0;
     Ok(md)
 }
 
@@ -284,7 +277,7 @@ async fn scrape_one(
 /// (node_key, complete) per connected keep-at seeder peer.
 async fn probe_swarm(
     data_dir: &std::path::Path,
-    raw: &[u8],
+    info_hash_hex: &str,
     trackers: &[String],
     user_announce: &str,
     user_announce_ipv6: &str,
@@ -307,11 +300,16 @@ async fn probe_swarm(
         trackers: Some(keyed.into_iter().flatten().collect()),
         ..Default::default()
     };
+    // Raw bytes loaded here and dropped with the response; never held across
+    // probe iterations.
+    let raw = std::fs::read(
+        data_dir
+            .join("torrent-cache")
+            .join(format!("{info_hash_hex}.torrent")),
+    )
+    .with_context(|| format!("loading cached .torrent for {info_hash_hex}"))?;
     let resp = session
-        .add_torrent(
-            AddTorrent::TorrentFileBytes(raw.to_vec().into()),
-            Some(opts),
-        )
+        .add_torrent(AddTorrent::TorrentFileBytes(raw.into()), Some(opts))
         .await?;
     let Some(handle) = resp.into_handle() else {
         anyhow::bail!("probe torrent added list-only");
