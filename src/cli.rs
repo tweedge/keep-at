@@ -125,6 +125,9 @@ pub struct ConfigArgs {
     /// Verbose diagnostics
     #[arg(long)]
     pub debug: Option<bool>,
+    /// Write logs to PATH instead of stdout (for background daemons)
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
 }
 
 fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
@@ -163,9 +166,6 @@ pub struct NetworkStatusArgs {
     /// How long to wait per torrent for peers while probing its swarm
     #[arg(long, value_parser = parse_duration)]
     pub probe_timeout: Option<std::time::Duration>,
-    /// Directory containing keep-at's cached catalog and metadata
-    #[arg(long)]
-    pub data_dir: Option<PathBuf>,
     /// Academic Torrents API key to attribute census announces to your account
     #[arg(long)]
     pub api_key: Option<String>,
@@ -215,6 +215,7 @@ impl ConfigArgs {
             || self.download_rate_limit.is_some()
             || self.stats_interval.is_some()
             || self.debug.is_some()
+            || self.log_file.is_some()
     }
 
     fn apply_to(&self, cfg: &mut Config) -> Result<()> {
@@ -267,6 +268,9 @@ impl ConfigArgs {
         }
         if let Some(v) = self.debug {
             cfg.debug = v;
+        }
+        if let Some(v) = &self.log_file {
+            cfg.log_file = Some(v.clone());
         }
         Ok(())
     }
@@ -392,7 +396,7 @@ pub fn resolve_census(args: &NetworkStatusArgs) -> Result<Config> {
     if let Some(p) = path {
         cfg = Config::load(&p)?;
     }
-    if let Some(d) = &args.data_dir {
+    if let Some(d) = &args.common.data_dir {
         cfg.data_dir = d.clone();
     }
     if let Some(k) = &args.api_key {

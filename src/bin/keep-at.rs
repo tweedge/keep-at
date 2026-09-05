@@ -7,9 +7,28 @@ use keep_at::cli::{self, Cli, Command};
 use keep_at::config::Config;
 
 fn init_logging(debug: bool) {
+    init_logging_to(debug, None);
+}
+
+fn init_logging_to(debug: bool, log_file: Option<&std::path::Path>) {
     let filter = if debug { "debug" } else { "info" };
     let env = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
+    if let Some(path) = log_file {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            tracing_subscriber::fmt()
+                .with_env_filter(env)
+                .with_target(false)
+                .compact()
+                .with_writer(std::sync::Mutex::new(f))
+                .init();
+            return;
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(env)
         .with_target(false)
@@ -23,7 +42,7 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Command::Run(a) => {
             let cfg = cli::resolve(&a.common, &a.cfg)?;
-            init_logging(cfg.debug);
+            init_logging_to(cfg.debug, cfg.log_file.as_deref());
             cmd_run(cfg).await
         }
         Command::Start(a) => {
@@ -109,10 +128,18 @@ async fn cmd_start(cfg: Config, foreground: bool) -> Result<()> {
         return cmd_run(cfg).await;
     }
     // Resolve + validate now so a bad config fails here, not in the daemon.
+    let mut cfg = cfg;
+    if cfg.log_file.is_none() {
+        cfg.log_file = Some(cfg.data_dir.join("keep-at.log"));
+    }
     let data_dir = cfg.data_dir.clone();
     let tmp_path = data_dir.join("config.resolved.yaml");
     cfg.save(&tmp_path)?;
     let exe = std::env::current_exe().context("locating keep-at executable")?;
+    // The daemon runs `run --config <resolved>` exactly: --data-dir must NOT
+    // be passed alongside --config (resolve() rejects storage flags with a
+    // file, and --data-dir would shadow the file's value). status/stop match
+    // the daemon via its --config argv (see find_foreground).
     let pid = keep_at::daemonctl::setsid_spawn(
         &exe,
         &[

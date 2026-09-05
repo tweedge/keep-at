@@ -197,6 +197,10 @@ pub struct Config {
     pub stats_interval: Duration,
     #[serde(default)]
     pub debug: bool,
+    /// Optional log file path. When set, daemon output goes here instead of
+    /// stdout (useful for `start`ed daemons whose stdio is detached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_file: Option<PathBuf>,
 }
 
 fn default_port() -> u16 {
@@ -265,6 +269,7 @@ impl Default for Config {
             download_rate_limit: 0,
             stats_interval: DEFAULT_STATS_INTERVAL,
             debug: false,
+            log_file: None,
         }
     }
 }

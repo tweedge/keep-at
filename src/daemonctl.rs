@@ -31,13 +31,16 @@ pub fn read_pid(data_dir: &Path) -> Option<u32> {
         .ok()
 }
 
-/// Whether pid is a live keep-at process (via /proc cmdline check).
+/// Whether pid is a live keep-at process (via /proc cmdline check: the
+/// executable basename must be keep-at).
 pub fn pid_alive(pid: u32) -> bool {
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
     if cmdline.is_empty() {
         return false;
     }
-    cmdline.split(|&b| b == 0).any(|part| part == b"keep-at")
+    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or_default();
+    let base = argv0.rsplit(|&b| b == b'/').next().unwrap_or(argv0);
+    base == b"keep-at"
 }
 
 /// Daemon status: running PID (PID file, verified live), else not running.
@@ -89,23 +92,40 @@ pub fn find_foreground(data_dir: &Path) -> Option<Option<u32>> {
         if !matches!(parts[1].as_str(), "run" | "start") {
             continue;
         }
-        // Match --data-dir value when present; a bare run/start with the
-        // default dir matches only when data_dir is the default.
+        // Match --data-dir value when present. A daemon started via
+        // `start` runs `run --config <resolved>` (no --data-dir flag), so
+        // also read the resolved config's data_dir and compare. A bare
+        // run/start with the default dir matches only the default.
         let mut dir_arg: Option<String> = None;
+        let mut config_arg: Option<String> = None;
         let mut iter = parts[2..].iter();
         while let Some(a) = iter.next() {
             if a == "--data-dir" {
                 dir_arg = iter.next().cloned();
             } else if let Some(v) = a.strip_prefix("--data-dir=") {
                 dir_arg = Some(v.to_string());
+            } else if a == "--config" {
+                config_arg = iter.next().cloned();
+            } else if let Some(v) = a.strip_prefix("--config=") {
+                config_arg = Some(v.to_string());
             }
         }
-        match dir_arg {
-            Some(d) if d == want => return Some(Some(pid)),
-            None if want == crate::config::default_data_dir().to_string_lossy() => {
-                return Some(Some(pid))
+        if let Some(d) = dir_arg {
+            if d == want {
+                return Some(Some(pid));
             }
-            _ => {}
+            continue;
+        }
+        if let Some(c) = config_arg {
+            if let Ok(cfg) = crate::config::Config::load(std::path::Path::new(&c)) {
+                if cfg.data_dir.to_string_lossy() == want {
+                    return Some(Some(pid));
+                }
+            }
+            continue;
+        }
+        if want == crate::config::default_data_dir().to_string_lossy() {
+            return Some(Some(pid));
         }
     }
     None
@@ -131,7 +151,13 @@ pub fn setsid_spawn(exe: &Path, args: &[String]) -> Result<u32> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
+    // Fully detach: stdin/out/err must not hold the caller's pipes (under a
+    // tool harness the child inheriting stdout can wedge or die with it).
+    // Daemon output goes to the log via --log-file when set; otherwise it is
+    // discarded (status/hosted-torrents read state files, not stdout).
     cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
     // Detach into a new session so the child survives our exit.
     unsafe {
         cmd.pre_exec(|| {
