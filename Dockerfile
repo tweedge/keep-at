@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-lin
     && rm -rf /var/lib/apt/lists/* \
     && case "$TARGETARCH" in \
          amd64) TRIPLE=x86_64-unknown-linux-gnu ;; \
-         arm64) TRIPLE=aarch64-unknown-linux-gnu; export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc ;; \
+         arm64) TRIPLE=aarch64-unknown-linux-gnu; export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc; export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc ;; \
          *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
        esac \
     && rustup target add "$TRIPLE" \

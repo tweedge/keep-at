@@ -47,8 +47,11 @@ for target in "${TARGETS[@]}"; do
   echo "building ${name} (${triple})..."
   build_dir="$(mktemp -d)"
 
-  # Point cc at the cross gcc for this triple (aws-lc-sys honors CC).
-  # Native x86_64 needs nothing; the compiler must exist for the rest.
+  # Point cc at the cross gcc for this triple (aws-lc-sys honors CC), and
+  # use it as the Rust linker too: aws-lc-sys emits an AArch64-only
+  # --fix-cortex-a53-843419 link arg on arm64, which the default cc-linker
+  # (x86_64 rust-lld via collect2) rejects. Linking with the target gcc
+  # keeps C objects and the final link under one consistent toolchain.
   if [ -n "${cross_cc:-}" ]; then
     command -v "$cross_cc" >/dev/null || {
       echo "missing cross compiler $cross_cc for $triple" >&2
@@ -57,6 +60,8 @@ for target in "${TARGETS[@]}"; do
     }
     cc_var="CC_${triple//-/_}"
     export "${cc_var}=${cross_cc}"
+    link_var="CARGO_TARGET_$(echo "$triple" | tr '[:lower:]-' '[:UPPER:]_')_LINKER"
+    export "${link_var}=${cross_cc}"
   fi
 
   cargo build --release --target "$triple"
