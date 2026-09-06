@@ -60,7 +60,7 @@ for target in "${TARGETS[@]}"; do
     }
     cc_var="CC_${triple//-/_}"
     export "${cc_var}=${cross_cc}"
-    link_var="CARGO_TARGET_$(echo "$triple" | tr '[:lower:]-' '[:UPPER:]_')_LINKER"
+    link_var="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')_LINKER"
     export "${link_var}=${cross_cc}"
   fi
 
