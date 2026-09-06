@@ -11,11 +11,15 @@ COPY src ./src
 RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
     && rm -rf /var/lib/apt/lists/* \
     && case "$TARGETARCH" in \
-         amd64) TRIPLE=x86_64-unknown-linux-musl ;; \
-         arm64) TRIPLE=aarch64-unknown-linux-musl ;; \
+         amd64) TRIPLE=x86_64-unknown-linux-musl; MUSL_CC=x86_64-linux-musl-gcc ;; \
+         arm64) TRIPLE=aarch64-unknown-linux-musl; MUSL_CC=aarch64-linux-musl-gcc ;; \
          *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
        esac \
     && rustup target add "$TRIPLE" \
+    && if [ "$TARGETARCH" = "arm64" ]; then \
+         apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu \
+         && ln -s "$(command -v aarch64-linux-gnu-gcc)" /usr/local/bin/aarch64-linux-musl-gcc; \
+       fi \
     && KEEPAT_VERSION_OVERRIDE="$VERSION" \
        cargo build --release --target "$TRIPLE" \
     && cp "target/${TRIPLE}/release/keep-at" /out-keep-at
