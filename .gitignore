@@ -16,3 +16,6 @@ VOICE_FINDER_LOG.md
 
 # Rust
 /target/
+
+# Long-running production test notes (local only, never committed)
+/notes/
