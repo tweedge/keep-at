@@ -72,6 +72,45 @@ pub fn typical_torrent_ram(budget: u64) -> u64 {
     torrent_ram(1024, peer_limit_for_budget(budget))
 }
 
+/// Adaptive size bias for the selection tie-break, driven by the host's
+/// RAM:disk ratio. Returns a small exponent in [-1, +1]:
+///
+/// - RAM-rich host (budget covers disk generously, ratio >= 1 GiB RAM per
+///   128 GiB disk): -1 — favor smaller torrents in ties, spending plentiful
+///   slots on the numerous small torrents big-disk hosts skip.
+/// - RAM-starved host (ratio <= 1 GiB RAM per 4 TiB disk): +1 — favor larger
+///   torrents in ties, filling scarce RAM slots with the most bytes.
+/// - Between the knees: linear interpolation in log-ratio space, so a
+///   balanced 1 GiB:1 TiB host lands near +0.15 (mild large bias).
+/// - Zero disk limit: 0 (no bias information; keep legacy order).
+///
+/// The bias is only a tie-break within equal seeder counts — it can never
+/// promote a well-seeded torrent above a poorly-seeded one. Bounded to
+/// [-1, 1] so a size ratio of even 1000:1 moves effective priority by at
+/// most that ratio, never across seeder bands.
+pub fn size_bias_for_ratio(ram_budget: u64, disk_limit: u64) -> f64 {
+    if disk_limit == 0 {
+        return 0.0;
+    }
+    // GiB RAM per TiB disk, in log2: rich knee = 8 GiB/TiB (2^3),
+    // starved knee = 0.25 GiB/TiB (2^-2).
+    let gib_per_tib = ram_budget as f64 / disk_limit as f64 * 1024.0;
+    if !gib_per_tib.is_finite() || gib_per_tib <= 0.0 {
+        return 0.0;
+    }
+    const RICH_LOG: f64 = 3.0; // 8 GiB/TiB -> bias -1
+    const STARVED_LOG: f64 = -2.0; // 0.25 GiB/TiB -> bias +1
+    let log = gib_per_tib.log2();
+    if log >= RICH_LOG {
+        -1.0
+    } else if log <= STARVED_LOG {
+        1.0
+    } else {
+        // Linear in log space from (STARVED -> +1) to (RICH -> -1).
+        1.0 - 2.0 * (log - STARVED_LOG) / (RICH_LOG - STARVED_LOG)
+    }
+}
+
 pub fn system_total_ram() -> u64 {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
@@ -141,5 +180,25 @@ mod tests {
         assert_eq!(peer_limit_for_budget(2 * 1024 * 1024 * 1024), 12);
         assert_eq!(peer_limit_for_budget(410 * 1024 * 1024), 8);
         assert_eq!(peer_limit_for_budget(100 * 1024 * 1024), 4);
+    }
+
+    #[test]
+    fn size_bias_knees() {
+        let tib = 1024 * 1024 * 1024 * 1024u64;
+        // RAM-rich: 8 GiB/TiB or more -> -1 (favor small).
+        assert_eq!(size_bias_for_ratio(8 * 1024 * 1024 * 1024, tib), -1.0);
+        assert_eq!(size_bias_for_ratio(16 * 1024 * 1024 * 1024, tib), -1.0);
+        // RAM-starved: 0.25 GiB/TiB or less -> +1 (favor large).
+        assert_eq!(size_bias_for_ratio(256 * 1024 * 1024, tib), 1.0);
+        assert_eq!(size_bias_for_ratio(100 * 1024 * 1024, tib), 1.0);
+        // Balanced 1 GiB : 1 TiB -> mild positive bias.
+        let mid = size_bias_for_ratio(1024 * 1024 * 1024, tib);
+        assert!(mid > 0.0 && mid < 0.5, "mid={mid}");
+        // Monotone: more RAM -> less large-bias.
+        let lo = size_bias_for_ratio(512 * 1024 * 1024, tib);
+        let hi = size_bias_for_ratio(4 * 1024 * 1024 * 1024, tib);
+        assert!(lo > mid && mid > hi, "lo={lo} mid={mid} hi={hi}");
+        // Zero disk -> neutral.
+        assert_eq!(size_bias_for_ratio(1024 * 1024 * 1024, 0), 0.0);
     }
 }

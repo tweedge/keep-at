@@ -9,7 +9,10 @@ pub mod stats;
 pub mod storage;
 pub mod torrents;
 
-pub use ram::{max_torrents_for_budget, per_torrent_ram, system_total_ram};
+pub use ram::{
+    max_torrents_for_budget, peer_limit_for_budget, size_bias_for_ratio, system_total_ram,
+    torrent_ram,
+};
 pub use scan::{Engine, LastScanStats, Options as EngineOptions};
 pub use stats::runtime_stats_path;
 pub use storage::{device_free_bytes, device_total_bytes, dir_size_bytes, resolve_all_limits};

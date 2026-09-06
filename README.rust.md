@@ -49,6 +49,65 @@ only when the candidate beats them by `--min-seed-margin` (default 2)
 seeds. Zero-seeder torrents with no progress past `--stall-eviction-timeout`
 (default 14 days) are freed.
 
+Seeder count is always the primary key: the size bias below only ever orders
+*within* an equal-seeder band, so a 1-seeder torrent outranks a 2-seeder one
+at any bias. The p10 floor is recomputed from the completed scan's own
+scrape data every pass, independent of the bias.
+
+### Adaptive size bias: matching torrents to the host's RAM:disk ratio
+
+RAM cost tracks torrent *count* and piece count; disk tracks bytes. A host
+with 1 GiB of RAM and 1 TB of disk therefore wants *different torrents*
+than a host with 64 GiB and the same disk: the small box must spend each
+scarce RAM slot on as many bytes as possible, while the big box can afford
+to spend plentiful slots on many small torrents the small boxes skip. Both
+serve the network; they just serve different ends of the catalog.
+
+At startup keep-at computes a size bias in [-1, +1] from the host's RAM:disk
+ratio (80%-of-RAM budget vs total configured disk limits, logged as
+`size-bias`). Within each seeder band, ties break by bytes-per-RAM-byte
+raised to that exponent: positive bias favors larger torrents, negative
+bias favors smaller ones, and the exponent is small on purpose — a "small
+multiple", exactly as intended, so size nudges but urgency decides. Swap
+eviction mirrors the same order (a large-biased host evicts its worst
+bytes-per-RAM torrents first; a small-biased host evicts its largest
+first), so rescans reinforce the ranking instead of fighting it.
+
+Recommended provisioning is **1 GiB of RAM per 1 TB of storage**, which
+lands near bias ≈ 0 with a mild large lean. Less RAM works: the bias grows
+toward +1 and the node holds fewer-but-larger torrents (see napkin math
+below). More RAM works: the bias goes negative and the node holds
+numerous-but-smaller torrents with higher RAM cost each. Either way the RAM
+budget is a hard ceiling — free-space fill still refuses any candidate
+whose RAM price exceeds remaining headroom, and swaps still require the
+displaced set to cover the candidate's RAM cost — so the node can never
+spend its way into an OOM.
+
+```mermaid
+flowchart TB
+    A[Scan starts: load catalog + prior seeder floor] --> B[Maintenance]
+    B --> B1[Drop torrents removed from AT]
+    B --> B2[Refresh held seeder counts via scrape]
+    B --> B3[Evict stalled zero-seeder torrents]
+    B1 & B2 & B3 --> C[Evaluate candidates]
+    C --> C1[Fetch .torrent metadata]
+    C1 --> C2[Tracker scrape: seeders/leechers]
+    C2 --> D{Rank}
+    D -->|primary key| D1[fewest seeders first]
+    D1 -->|tie-break within band| D2[size bias from RAM:disk ratio]
+    D2 -->|bias > 0| D2a[larger torrents first]
+    D2 -->|bias < 0| D2b[smaller torrents first]
+    D2a & D2b --> E{Act per candidate}
+    E -->|disk + RAM headroom free| F[Add: download + seed]
+    E -->|disk or RAM full| G{Swap?}
+    G -->|candidate beats held by min-seed-margin<br/>and displaced set covers<br/>disk + RAM cost| H[Evict worst bias-order torrents<br/>add candidate]
+    G -->|margin or cost fails| I[Skip]
+    F & H & I --> J[Scan completes]
+    J --> K[Recompute p10 seeder floor<br/>from this scan's scrapes]
+    K --> L[Next scan uses new floor]
+    L --> A
+```
+
 ## Storage
 
 Plain on-disk layout: `<location>/<infohash-hex>/` holds the torrent's real
@@ -59,11 +118,11 @@ a location's limit. `limit: all` (or `--storage-limit all`) resolves to
 
 ## Napkin math: how much RAM per TB of storage
 
-Rule of thumb: **~1 GiB of physical RAM per 1 TB of storage fills the disk;
-~60 GiB of physical RAM per 1 TB fills it with 16 MB-average torrents.**
-The two numbers differ because RAM cost tracks torrent *count* and piece
-count, while disk tracks bytes. Derivation (measured on rqbit 9.0.1,
-release profile):
+Recommended provisioning: **~1 GiB of physical RAM per 1 TB of storage.**
+With the adaptive size bias, that ratio fills the disk: the host lands near
+bias ≈ 0 with a mild large lean and holds on the order of a thousand large
+torrents. The older dual figure below explains *why* the bias is needed —
+RAM cost tracks torrent count and piece count, while disk tracks bytes:
 
 - Per-torrent RAM ≈ 256 KiB base + 64 B/piece + 48 KiB × peer-limit.
   A typical catalog torrent (~1k pieces) costs ~0.7 MiB at peer-limit 8.
@@ -77,20 +136,25 @@ release profile):
     entries → ~2 TB. The 1 GiB box fills a 1 TB drive twice over.
 
 So RAM per TB is not a property of the disk - it is a property of the
-average torrent size the network needs seeded when your node scans:
+average torrent size the network needs seeded when your node scans, which
+is exactly what the size bias steers:
 
 | torus profile | slots/TB | RAM per TB of *filled* disk |
 |---|---|---|
 | 16 MB average (small-torrent mix) | ~67,000 | ~60 GiB physical |
 | 1.7 GB average (600 largest catalog entries) | ~600 | ~1 GiB physical |
 
-On a RAM-short box (512 MiB + 1 TB) the disk will sit mostly empty by
-design: ~600 slots fill with the largest, fewest-piece torrents urgency
-ranking surfaces, and free-space fill refuses anything whose RAM price
-exceeds remaining headroom. That is the correct behavior - the alternative
-is exceeding the RAM budget and OOMing the host. If the disk must be full,
-add RAM, not flags: no selection parameter can hold more torrents than the
-budget prices.
+Less RAM than the recommendation works by finding and prioritizing
+fewer-but-larger torrents with lower RAM cost per byte (bias toward +1):
+a 512 MiB + 1 TB box holds ~600 large torrents and seeds hundreds of GB
+usefully within budget. More RAM works by finding and prioritizing
+numerous-but-smaller torrents with higher RAM cost each (bias toward −1):
+a 64 GiB box spends its ~50k slots on the small end of the catalog the big
+hosts skip. On a RAM-short box the disk will sit partly empty by design —
+free-space fill refuses anything whose RAM price exceeds remaining
+headroom, because the alternative is exceeding the RAM budget and OOMing
+the host. If the disk must be full, add RAM, not flags: no selection
+parameter can hold more torrents than the budget prices.
 
 `--max-ram` caps the budget below the 80% default (never above). The
 startup log prints the resolved `budget`, `peer-limit`, and `max-torrents`

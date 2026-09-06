@@ -52,6 +52,10 @@ pub struct Engine {
     max_torrents: usize,
     /// RAM budget in bytes (for per-candidate footprint pricing).
     ram_budget: u64,
+    /// Adaptive size bias in [-1, +1] from the host's RAM:disk ratio
+    /// (positive favors larger torrents in ties, negative smaller ones).
+    /// Computed once at startup; disk limits are static per install.
+    size_bias: f64,
     started_at: std::time::Instant,
     rate: Arc<tokio::sync::Mutex<RateLimiter>>,
     evaluated_counts: tokio::sync::Mutex<Vec<u32>>,
@@ -393,11 +397,12 @@ impl Engine {
             tracing::warn!("could not measure system RAM; the RAM-driven torrent cap is disabled");
         }
         tracing::info!(
-            "RAM budget: system {} hard-cap-80% {} budget {} peer-limit {} max-torrents {}",
+            "RAM budget: system {} hard-cap-80% {} budget {} peer-limit {} size-bias {:+.2} max-torrents {}",
             crate::humanize::human_bytes(system_total as i64),
             crate::humanize::human_bytes(hard_cap as i64),
             crate::humanize::human_bytes(budget as i64),
             ram::peer_limit_for_budget(budget),
+            ram::size_bias_for_ratio(budget, disk_limit_total(&cfg)),
             max_torrents,
         );
 
@@ -422,6 +427,8 @@ impl Engine {
             client: http.clone(),
         };
 
+        let size_bias = ram::size_bias_for_ratio(budget, disk_limit_total(&cfg));
+
         let mut eng = Engine {
             cfg,
             session,
@@ -436,6 +443,7 @@ impl Engine {
             user_announce_ipv6,
             max_torrents,
             ram_budget: budget,
+            size_bias,
             started_at: std::time::Instant::now(),
             rate: Arc::new(tokio::sync::Mutex::new(RateLimiter {
                 per_second: 0.5,
@@ -1029,7 +1037,7 @@ impl Engine {
         evaluated: &[Evaluated],
         acted: &mut HashSet<String>,
         held_count: &mut usize,
-        ram_bound: bool,
+        _ram_bound: bool,
         seeder_floor: u32,
         stats: &ScanStats,
     ) {
@@ -1048,7 +1056,7 @@ impl Engine {
                 .collect();
             sel = selector::rank_candidates(
                 sel,
-                ram_bound,
+                self.size_bias,
                 ram::peer_limit_for_budget(self.ram_budget),
             );
             let window = self.max_torrents.min(sel.len());
@@ -1259,7 +1267,7 @@ impl Engine {
         c: &Candidate,
         md: &TorrentMeta,
         size_bytes: u64,
-        ram_bound: bool,
+        _ram_bound: bool,
         seeder_floor: u32,
     ) -> (bool, selector::SwapDecision) {
         let held = self.state.all();
@@ -1291,7 +1299,7 @@ impl Engine {
                 ram_cost,
                 peer_limit,
                 self.cfg.scan.min_seed_margin,
-                ram_bound,
+                self.size_bias,
             );
             let Some(displaced) = displaced else { continue };
             let sel_held: Vec<Held> = displaced
@@ -1540,6 +1548,12 @@ impl crate::config::StorageLocation {
     }
 }
 
+/// Sum of resolved disk limits across storage locations. Must be called
+/// after `resolve_all_limits`, so `limit: all` is already concrete bytes.
+fn disk_limit_total(cfg: &Config) -> u64 {
+    cfg.storage.iter().map(|l| l.limit_bytes()).sum()
+}
+
 fn shuffle<T>(v: &mut [T]) {
     use rand::seq::SliceRandom;
     v.shuffle(&mut rand::thread_rng());
@@ -1594,6 +1608,21 @@ fn decode_hash(hex_str: &str) -> Result<[u8; 20]> {
 /// and the swap proceeds only when freed RAM covers the candidate's cost.
 /// This keeps a many-piece candidate from evicting one cheap torrent and
 /// pushing RSS past the budget — the displaced set must price out.
+/// Greedy displaceable-set selection within one location, mirroring Go's
+/// selectDisplaceable. Sizes are nominal bytes here (plain storage: nominal
+/// == on-disk up to the fixed buffer, applied symmetrically on both sides).
+///
+/// The set must free enough disk AND enough RAM: freed RAM is the sum of the
+/// displaced torrents' footprints (stored piece counts, unknown = typical),
+/// and the swap proceeds only when freed RAM covers the candidate's cost.
+/// This keeps a many-piece candidate from evicting one cheap torrent and
+/// pushing RSS past the budget — the displaced set must price out.
+///
+/// Eviction order follows the adaptive size bias: a large-biased host evicts
+/// its smallest bytes-per-RAM torrents first (they contribute the least disk
+/// per RAM slot), a small-biased host evicts its largest first (freeing disk
+/// is easy; the scarce resource is slots, so it keeps the many small
+/// torrents that urgency ranking surfaced).
 fn select_displaceable(
     in_location: &[state::Torrent],
     candidate_seeders: u32,
@@ -1601,7 +1630,7 @@ fn select_displaceable(
     ram_cost: u64,
     peer_limit: usize,
     min_seed_margin: i32,
-    ram_bound: bool,
+    size_bias: f64,
 ) -> Option<Vec<state::Torrent>> {
     let mut qualifying: Vec<state::Torrent> = in_location
         .iter()
@@ -1613,16 +1642,33 @@ fn select_displaceable(
     if qualifying.is_empty() {
         return None;
     }
-    if ram_bound {
-        // Bytes per RAM byte, descending (same pricing as rank_candidates).
-        qualifying.sort_by(|a, b| {
-            let ar = ram::torrent_ram(a.piece_count.max(1), peer_limit).max(1) as u128;
-            let br = ram::torrent_ram(b.piece_count.max(1), peer_limit).max(1) as u128;
-            (b.size_bytes as u128 * ar).cmp(&(a.size_bytes as u128 * br))
-        });
-    } else {
-        qualifying.sort_by(|a, b| b.last_known_seeders.cmp(&a.last_known_seeders));
-    }
+    // Evict worst bytes-per-RAM first when bias favors large (positive),
+    // best bytes-per-RAM first when bias favors small (negative): i.e. sort
+    // ascending by the same adjusted score rank_candidates sorts descending.
+    // Zero bias keeps the legacy order (highest-seeded qualifying first).
+    qualifying.sort_by(|a, b| {
+        let ca = Candidate {
+            info_hash: [0u8; 20],
+            title: String::new(),
+            size_bytes: a.size_bytes,
+            piece_count: a.piece_count,
+            seeders: a.last_known_seeders,
+            leechers: 0,
+            seeder_floor: 0,
+        };
+        let cb = Candidate {
+            info_hash: [0u8; 20],
+            title: String::new(),
+            size_bytes: b.size_bytes,
+            piece_count: b.piece_count,
+            seeders: b.last_known_seeders,
+            leechers: 0,
+            seeder_floor: 0,
+        };
+        crate::selector::eviction_score(&ca, size_bias, peer_limit)
+            .partial_cmp(&crate::selector::eviction_score(&cb, size_bias, peer_limit))
+            .unwrap_or_else(|| a.size_bytes.cmp(&b.size_bytes))
+    });
     let mut chosen = Vec::new();
     let mut freed = 0u64;
     let mut freed_ram = 0u64;

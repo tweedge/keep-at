@@ -40,31 +40,76 @@ pub struct Held {
 }
 
 /// Order candidates by seeding urgency: fewest seeds first; unavailable
-/// (zero-seed) candidates excluded. Size tie-break prefers smaller normally
-/// (cheaper to try first), larger when RAM-bound (bytes per RAM slot).
+/// (zero-seed) candidates excluded. The size-bias step below never compares
+/// across seeder counts — it only orders within the same count.
 ///
-/// When RAM-bound, the tie-break prices bytes per RAM slot properly: a 2 GiB
-/// 100-piece torrent outranks a 2 GiB 100k-piece one, because both fill the
-/// same disk but the latter costs ~6 MiB more RAM. Piece count is the RAM
-/// axis (rqbit bookkeeping scales ~32 B/piece); byte size is the disk axis.
+/// Size tie-break is a bounded adaptive bias driven by the host's RAM:disk
+/// ratio (`size_bias > 0` favors larger torrents, `< 0` favors smaller ones,
+/// `0` keeps prior behavior). The bias is a *tie-break*: a candidate with
+/// fewer seeders always outranks one with more, so poorly-seeded torrents
+/// keep absolute priority.
+///
+/// - RAM-bound hosts (little RAM, big disk) get `size_bias > 0`: ties break
+///   by bytes-per-RAM-byte, filling scarce RAM slots with the most bytes.
+/// - RAM-rich hosts get `size_bias < 0`: ties break smallest-first, spending
+///   plentiful slots on the small torrents big-disk hosts skip.
+///
+/// Piece count stays the RAM axis (rqbit bookkeeping scales ~32 B/piece);
+/// byte size is the disk axis. See `size_bias_for_ratio` for how the ratio
+/// maps to the exponent.
 pub fn rank_candidates(
     mut candidates: Vec<Candidate>,
-    ram_bound: bool,
+    size_bias: f64,
     peer_limit: usize,
 ) -> Vec<Candidate> {
     candidates.retain(|c| c.available());
     candidates.sort_by(|a, b| {
-        a.seeders.cmp(&b.seeders).then(if ram_bound {
-            // Bytes per RAM byte, descending: compare a.size/a.ram vs
-            // b.size/b.ram via cross-multiplication (no float, no div-zero).
-            let ar = crate::engine::ram::torrent_ram(a.piece_count, peer_limit).max(1) as u128;
-            let br = crate::engine::ram::torrent_ram(b.piece_count, peer_limit).max(1) as u128;
-            (b.size_bytes as u128 * ar).cmp(&(a.size_bytes as u128 * br))
-        } else {
-            a.size_bytes.cmp(&b.size_bytes)
-        })
+        // Primary key: fewest seeders first — the bias below can never
+        // promote across seeder bands. Secondary key: size-bias score,
+        // higher first.
+        match a.seeders.cmp(&b.seeders) {
+            std::cmp::Ordering::Equal => size_bias_score(b, size_bias, peer_limit)
+                .partial_cmp(&size_bias_score(a, size_bias, peer_limit))
+                .unwrap_or_else(|| a.size_bytes.cmp(&b.size_bytes)),
+            ord => ord,
+        }
     });
     candidates
+}
+
+/// Adjusted bytes-per-RAM-byte score for the size-bias tie-break.
+/// `size_bias` is small (|bias| <= 1). Higher score = ranked first.
+/// Positive bias rewards raw ratio (larger torrents win ties); zero bias
+/// ranks by plain size, legacy order; negative bias ranks by smallest size
+/// first (small torrents win ties), with the ratio breaking size ties
+/// toward fewer pieces.
+fn size_bias_score(c: &Candidate, size_bias: f64, peer_limit: usize) -> f64 {
+    // Higher score = ranked first. Positive bias rewards the bytes-per-RAM
+    // ratio (larger torrents win ties); zero or negative bias ranks
+    // smallest-first (legacy order), with the ratio breaking exact size
+    // ties toward fewer pieces.
+    let ram = crate::engine::ram::torrent_ram(c.piece_count, peer_limit).max(1) as f64;
+    let ratio = (c.size_bytes.max(1) as f64) / ram;
+    if size_bias > 0.0 {
+        return ratio.powf(size_bias);
+    }
+    -(c.size_bytes as f64) + ratio / (1.0 + c.size_bytes as f64)
+}
+
+/// Eviction-order score for a held torrent: ascending order evicts the
+/// lowest score first. This is the same adjusted ratio as
+/// [`size_bias_score`] (public so the engine's displaceable-set ordering
+/// stays identical to ranking by construction, not by duplication).
+/// Zero bias preserves the legacy order (largest seeders evicted first is
+/// handled by the caller only when bias is zero — see below).
+pub fn eviction_score(c: &Candidate, size_bias: f64, peer_limit: usize) -> f64 {
+    if size_bias == 0.0 {
+        // Legacy swap path evicted highest-seeded qualifying first; with no
+        // bias there is no size signal, so keep that order by returning the
+        // seeder count as the score. Callers pass seeders through.
+        return c.seeders as f64;
+    }
+    size_bias_score(c, size_bias, peer_limit)
 }
 
 /// n: the probability keep-at proceeds with a candidate given its seeder
@@ -204,9 +249,20 @@ mod tests {
 
     #[test]
     fn rank_fewest_seeds_first() {
+        // Seeder count dominates: bias never promotes across bands.
         let v = rank_candidates(
             vec![cand(5, 10), cand(1, 100), cand(0, 1), cand(1, 5)],
-            false,
+            1.0,
+            8,
+        );
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].seeders, 1);
+        assert_eq!(v[1].seeders, 1);
+        assert_eq!(v[2].seeders, 5);
+        // Same bias, balanced order: zero bias keeps legacy size order.
+        let v = rank_candidates(
+            vec![cand(5, 10), cand(1, 100), cand(0, 1), cand(1, 5)],
+            0.0,
             8,
         );
         assert_eq!(v.len(), 3);
@@ -216,24 +272,65 @@ mod tests {
     }
 
     #[test]
-    fn rank_ram_bound_prefers_larger() {
-        let v = rank_candidates(vec![cand(1, 5), cand(1, 100)], true, 8);
+    fn rank_bias_directions() {
+        // Positive bias favors larger within a seeder band...
+        let v = rank_candidates(vec![cand(1, 5), cand(1, 100)], 1.0, 8);
         assert_eq!(v[0].size_bytes, 100);
+        // ...negative bias favors smaller...
+        let v = rank_candidates(vec![cand(1, 5), cand(1, 100)], -1.0, 8);
+        assert_eq!(v[0].size_bytes, 5);
+        // ...and zero bias keeps legacy order (smaller first).
+        let v = rank_candidates(vec![cand(1, 5), cand(1, 100)], 0.0, 8);
+        assert_eq!(v[0].size_bytes, 5);
     }
 
     #[test]
     fn rank_ram_bound_prices_pieces_not_bytes() {
-        // Same 2 GiB size, different piece counts: fewer pieces wins when
-        // RAM-bound (same disk, less RAM).
+        // Same 2 GiB size, different piece counts: fewer pieces wins ties
+        // under positive bias (same disk, less RAM).
         let mut a = cand(1, 2 << 30);
         a.piece_count = 100;
         let mut b = cand(1, 2 << 30);
         b.piece_count = 100_000;
-        let v = rank_candidates(vec![b.clone(), a.clone()], true, 8);
+        let v = rank_candidates(vec![b.clone(), a.clone()], 1.0, 8);
         assert_eq!(v[0].piece_count, 100);
-        // Not RAM-bound: tie on size keeps both, pieces ignored.
-        let v = rank_candidates(vec![b, a], false, 8);
+        // Negative bias is small-first by size; equal sizes keep both.
+        let v = rank_candidates(vec![b, a], -1.0, 8);
         assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn eviction_score_mirrors_rank() {
+        // Ascending eviction order must be the exact reverse of descending
+        // rank order for the same bias, so swaps reinforce ranking.
+        let mut a = cand(1, 100 << 20);
+        a.piece_count = 500;
+        let mut b = cand(1, 900 << 20);
+        b.piece_count = 500;
+        for bias in [1.0, 0.5, -0.5, -1.0] {
+            let ranked = rank_candidates(vec![a.clone(), b.clone()], bias, 8);
+            let first = ranked[0].size_bytes;
+            let sa = eviction_score(&a, bias, 8);
+            let sb = eviction_score(&b, bias, 8);
+            let evict_first = if sa < sb { a.size_bytes } else { b.size_bytes };
+            assert_ne!(
+                first, evict_first,
+                "bias={bias}: rank-first ({first}) must be evicted last ({evict_first})"
+            );
+        }
+    }
+
+    #[test]
+    fn bias_never_crosses_seeder_bands() {
+        // A 10 TiB 1-seeder torrent outranks a 1 KiB 2-seeder one at any bias.
+        let mut big = cand(1, 10 << 40);
+        big.piece_count = 100;
+        let mut small = cand(2, 1 << 10);
+        small.piece_count = 100;
+        for bias in [-1.0, 0.0, 1.0] {
+            let v = rank_candidates(vec![small.clone(), big.clone()], bias, 8);
+            assert_eq!(v[0].seeders, 1, "bias={bias}");
+        }
     }
 
     #[test]
