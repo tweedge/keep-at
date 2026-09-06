@@ -68,10 +68,10 @@ struct libc_statvfs_t {
 }
 
 unsafe extern "C" {
-    fn statvfs(path: *const i8, buf: *mut libc_statvfs_t) -> i32;
+    fn statvfs(path: *const std::ffi::c_char, buf: *mut libc_statvfs_t) -> i32;
 }
 
-fn libc_statvfs_fn(path: *const i8, buf: *mut libc_statvfs_t) -> i32 {
+fn libc_statvfs_fn(path: *const std::ffi::c_char, buf: *mut libc_statvfs_t) -> i32 {
     // SAFETY: delegates to libc statvfs with a valid path pointer and buffer.
     unsafe { statvfs(path, buf) }
 }
