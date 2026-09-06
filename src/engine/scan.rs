@@ -319,6 +319,14 @@ async fn evaluate_one_item(
     };
 
     stats.eligible.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        "eligible candidate (title={} seeders={} leechers={} size={} pieces={})",
+        item.title,
+        swarm.seeders,
+        swarm.leechers,
+        crate::humanize::human_bytes(md.total_length as i64),
+        md.piece_count,
+    );
     Some(Evaluated {
         title: item.title.clone(),
         info_hash: md.info_hash,
@@ -1223,6 +1231,14 @@ impl Engine {
             selector::roll(&mut rng),
         );
         if !decision.should_swap {
+            tracing::debug!(
+                "roll failed (title={} seeders={} chance={:.3} roll={:.3} reason={})",
+                c.title,
+                c.seeders,
+                decision.chance,
+                decision.roll,
+                decision.reason
+            );
             return (false, decision);
         }
         let out_dir = engtorrents::torrent_output_dir(location, &hex::encode(c.info_hash));
@@ -1289,6 +1305,13 @@ impl Engine {
         // Deterministic location order.
         let mut locations: Vec<PathBuf> = by_location.keys().cloned().collect();
         locations.sort();
+        tracing::debug!(
+            "swap considered (title={} seeders={} locations={} held_total={})",
+            c.title,
+            c.seeders,
+            locations.len(),
+            by_location.values().map(|v| v.len()).sum::<usize>(),
+        );
         for location in locations {
             let in_location = &by_location[&location];
             let size_needed = self.size_needed(size_bytes);
