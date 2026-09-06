@@ -1,5 +1,4 @@
 // Package identity: what keep-at calls itself on the wire and in HTTP.
-// Ported from internal/buildinfo (Go).
 //
 // VERSION prefers the KEEPAT_VERSION_OVERRIDE env var at compile time (set by
 // scripts/build-release.sh from the git tag), falling back to Cargo.toml.

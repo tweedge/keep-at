@@ -1,5 +1,5 @@
 //! Self-update: check GitHub releases, download the matching asset,
-//! atomically replace the running binary. Ported from internal/updater (Go).
+//! atomically replace the running binary.
 //! Linux-only asset naming: keep-at_linux_<arch>.tar.gz.
 
 use anyhow::{Context, Result};

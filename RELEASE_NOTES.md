@@ -1,5 +1,21 @@
 # keep-at release notes
 
+## v0.8.0-beta - the Rust build, on rqbit
+
+This is a beta release for field validation of the rewrite below; the next stable cut will be identical apart from the version tag.
+
+### Rewritten in Rust on rqbit
+
+keep-at is now a Rust binary built on [rqbit](https://github.com/ikatson/rqbit) (`librqbit` 9.x, rustls/ring - no OpenSSL) instead of Go on anacrolix/torrent. Every user-facing behavior carries over: one-line install, prebuilt Docker image, optional config file with every setting also a CLI flag, `run`/`start`/`stop`/`status`, systemd `service install`/`uninstall`, `network-status` census with split seeder/scraper client identities, `hosted-torrents`, `self-update`, multiple storage locations, stall eviction, Academic Torrents API-key attribution, and the seed-scarcity selection gate with its p10 seeder floor. State files are new (clean break - the Go build's state is not imported). Two deliberate simplifications: scrapes are HTTPS-only with no UDP/BEP-15 fallback, and there is no webseed support (rqbit has none); the AT tracker answers for AT content either way. Linux only: no macOS/Windows builds.
+
+### Measured RAM model, RAM-scaled peer limits, and adaptive size bias
+
+Per-torrent RAM is now priced from measurement, not a flat estimate: ~256 KiB base + ~64 B/piece + ~48 KiB per live peer, with the session peer limit itself scaled to the RAM budget (20/12/8/4 as the budget shrinks). A 512 MiB node holds ~600 torrents instead of ~100. Selection additionally computes a size bias in [-1, +1] from the host's RAM:disk ratio (logged at startup as `size-bias`): RAM-short hosts break seeder-count ties toward larger torrents, RAM-rich hosts toward smaller ones, so each host fills its budget with the torrents that use it best. Seeder count stays the primary key - the bias only orders within equal-seeder bands - and the p10 floor update is unchanged. Recommended provisioning is **1 GiB of RAM per 1 TB of storage**; see the README's napkin math for the derivation.
+
+### Smaller scan memory, prompt shutdown
+
+Scans no longer hold raw `.torrent` bytes in memory (fetchers write the cache file; the add path re-reads it from disk), evaluated candidates carry only lightweight metadata, and the shutdown path is deadline-bounded with shutdown checks between scan phases - SIGTERM aborts a stuck scan instead of holding it hostage.
+
 ## v0.7.7-beta - trust the tracker, and stop the CPU pegging
 
 This is a beta release for field validation of the changes below; the next stable cut will be identical apart from the version tag.

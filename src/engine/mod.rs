@@ -1,6 +1,5 @@
 //! Engine: scan loop, rqbit session management, storage accounting,
-//! stall eviction. Ported from internal/engine (Go), adapted to rqbit's
-//! session API and plain on-disk storage (no compression backend).
+//! stall eviction, and plain on-disk storage.
 
 pub mod ram;
 pub mod scan;

@@ -1,5 +1,4 @@
 //! Live smoke tests against real Academic Torrents infrastructure.
-//! Ported from internal/engine/smoke_test.go (Go).
 //!
 //! - `KEEPAT_SMOKE_TEST=1`: fast pipeline test. Serves a 2-item catalog of
 //!   hand-picked, verified-seeded torrents locally while fetching real
@@ -23,7 +22,7 @@ struct SmokeItem {
     size: u64,
 }
 
-// Hand-picked, verified-seeded AT entries (same fixtures as the Go test).
+// Hand-picked, verified-seeded AT entries (same fixtures as the original test suite).
 const SMOKE_ITEMS: &[SmokeItem] = &[
     SmokeItem {
         title: "The Relativity of Simultaneity is Wrong.txt",

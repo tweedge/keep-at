@@ -1,5 +1,4 @@
 //! Keyword blocklist matched against title + description.
-//! Ported from internal/filter (Go).
 
 #[derive(Debug, Clone, Default)]
 pub struct KeywordBlocklist {

@@ -1,7 +1,6 @@
 //! `keep-at hosted-torrents`: list held torrents from state + disk.
-//! Ported from cmd/keep-at/hosted.go (Go). Works whether or not keep-at is
-//! running. Plain storage: seeding == fully downloaded (rqbit reports via
-//! state on next scan; here: output dir holds the full nominal size).
+//! Works whether or not keep-at is running. Plain storage: seeding ==
+//! fully downloaded (output dir holds the full nominal size).
 
 use anyhow::Result;
 

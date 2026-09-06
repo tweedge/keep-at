@@ -8,10 +8,6 @@ VOICE_FINDER_LOG.md
 /keep-at
 *.tar.gz
 
-# Go
-*.test
-*.out
-
 # Local runtime state if keep-at is ever run from the repo root during dev
 /keep-at.yaml
 

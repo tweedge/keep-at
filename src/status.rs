@@ -1,5 +1,4 @@
 //! `keep-at status`: running state + runtime summary.
-//! Ported from cmd/keep-at/status.go (Go).
 
 use anyhow::Result;
 

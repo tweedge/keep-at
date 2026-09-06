@@ -1,5 +1,5 @@
 //! The scan: catalog walk, per-candidate evaluation, incremental acting,
-//! stall eviction, deleted-torrent removal. Ported from internal/engine/scan.go.
+//! stall eviction, deleted-torrent removal.
 
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -218,9 +218,9 @@ async fn eval_scrape_swarm(
             ctx.rate.lock().await.wait().await;
         }
         if !tracker.starts_with("http://") && !tracker.starts_with("https://") {
-            // UDP trackers (BEP 15 scrape) are not implemented in the Rust
-            // port - the Go version scraped them as a fallback. Skip
-            // quietly; the AT https tracker answers for AT content.
+            // UDP trackers (BEP 15 scrape) are not implemented - the old Go
+            // build scraped them as a fallback. Skip quietly; the AT https
+            // tracker answers for AT content.
             continue;
         }
         stats.scrape_requests.fetch_add(1, Ordering::Relaxed);
@@ -963,7 +963,7 @@ impl Engine {
                 self.rate.lock().await.wait().await;
             }
             if !tracker.starts_with("http://") && !tracker.starts_with("https://") {
-                // UDP trackers (BEP 15 scrape) not implemented in the Rust port; skip quietly.
+                // UDP trackers (BEP 15 scrape) are not implemented; skip quietly.
                 continue;
             }
             stats.scrape_requests.fetch_add(1, Ordering::Relaxed);

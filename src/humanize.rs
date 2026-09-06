@@ -1,5 +1,4 @@
-//! Human-readable byte / duration formatting. Ported from
-//! internal/engine/humanize.go and internal/netstats helpers (Go).
+//! Human-readable byte / duration formatting.
 
 const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
 

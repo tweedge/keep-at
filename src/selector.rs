@@ -1,6 +1,5 @@
 //! Selection logic: which torrent most urgently needs seeding, and
-//! whether swapping to it risks a cascade. Ported from internal/selector
-//! (Go), preserving the exact formulas.
+//! whether swapping to it risks a cascade.
 
 use rand::Rng;
 

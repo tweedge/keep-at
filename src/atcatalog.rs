@@ -1,5 +1,4 @@
 //! Academic Torrents catalog client: fetch + parse database.xml.
-//! Ported from internal/atcatalog (Go).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};

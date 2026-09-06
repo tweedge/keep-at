@@ -2,7 +2,7 @@
 
 Every setting below has both a YAML key (for a config file) and a CLI flag. Flags always take a `--` prefix (e.g. `--port`); YAML keys are lowercase with underscores, nested where noted.
 
-If you're just getting started, you probably only need `--storage-limit` (and optionally `--storage`) - see the README's Quick Start. This page documents everything else for when you want more control.
+If you're just getting started, you probably only need `--storage-location` and `--storage-limit` - see the README's Quick Start. This page documents everything else for when you want more control.
 
 Precedence, when more than one source could set a value:
 
@@ -12,46 +12,39 @@ Precedence, when more than one source could set a value:
 
 ## Storage
 
-### `storage.locations` (config file only)
+### `storage` (config file)
 
-A list of `{path, limit}` pairs. Each `limit` is either a fixed integer followed by `M`, `G`, `T`, or `P` (binary units - `1G` is `1024^3` bytes, not `1000^3`), or the literal `all` - see below. There's no default limit; keep-at always requires at least one explicit location with a positive limit before it will run.
+A list of `{path, limit}` pairs. Each `limit` is either a byte size (`500G`, `2T` - binary units, `1G` is `1024^3` bytes), or the literal `all` - see below. There's no default limit; keep-at always requires at least one explicit location with a positive limit before it will run.
 
 ```yaml
 storage:
-  locations:
-    - path: /mnt/disk1/keep-at
-      limit: 500G
-    - path: /mnt/disk2/keep-at
-      limit: 2T
+- path: /mnt/disk1/keep-at
+  limit: 500G
+- path: /mnt/disk2/keep-at
+  limit: 2T
 ```
 
-Limits are enforced **post-compression**: keep-at compares a location's limit against the actual on-disk bytes its pieces occupy (each piece is stored gzip-compressed), not the nominal torrent sizes. A torrent that compresses well consumes less of the limit than its catalog size, and the compression gains count toward free space for the next torrent. Free-space checks are also capped by what the device actually reports free, so filesystem block slack and metadata can't push real usage past capacity.
+Limits are enforced against nominal torrent sizes plus a small per-torrent buffer (for the cached `.torrent` file and state overhead): a 100 GB torrent consumes ~100 GB of the limit regardless of how compressible its bytes are. Free-space checks are also capped by what the device actually reports free, so filesystem block slack and metadata can't push real usage past capacity, and keep-at never exceeds a location's limit.
 
 `limit: all` (or `--storage-limit all`) resolves at startup to 97.5% of the storage device's total formatted capacity, measured with statfs on the location path - the device is dedicated to keep-at and the last 2.5% (plus whatever the filesystem reserves) is left for the journal, metadata, and the OS's emergency operations. **Only use `all` on a dedicated data drive.** On an OS drive, keep-at will attempt to fill the device to that fraction and can choke the OS out of room for logs, swap, and the boot process. A fixed byte limit is the safe choice whenever the drive isn't exclusively keep-at's.
 
 keep-at fills multiple locations proportionally to free space, not sequentially, so they fill up roughly evenly over time instead of one disk taking everything until it's full. See [DESIGN.md](DESIGN.md) for the weighting logic.
 
-Multiple locations are a config-file-only feature. The CLI flags below manage exactly one location; combining `--storage`/`--storage-limit` with `--config` is rejected outright (edit the file instead).
+Multiple locations work from flags too: repeat `--storage-location PATH --storage-limit SIZE` pairs for as many drives as you have, and keep-at fills them proportionally to free space. Combining storage flags with `--config` is rejected outright (edit the file instead).
 
-### `--storage` (CLI only)
+### `--storage-location` / `--storage-limit` (CLI only)
 
-The single storage location to use, when not using a config file. Defaults to an OS-appropriate location:
+Repeatable pairs configuring any number of storage locations without a config file. The single-location `--storage` shorthand pairs with one `--storage-limit` the same way.
 
-* Linux: `$XDG_DATA_HOME/keep-at/storage`, or `~/.local/share/keep-at/storage` if `XDG_DATA_HOME` isn't set
-* macOS: `~/Library/Application Support/keep-at/storage`
-* Windows: `%LOCALAPPDATA%\keep-at\storage`
-
-### `--storage-limit` (CLI only)
-
-How much space `--storage` is allowed to use, e.g. `500G`, `2T`, or `all` for a dedicated drive (see `storage.locations` above for the `all` caveats). Required whenever you're not using a config file - keep-at will not guess this.
+If no storage flag is passed, keep-at uses `~/.local/share/keep-at/storage` (`/var/lib/keep-at/storage` when `HOME` is unset), but still requires an explicit `--storage-limit` - it will not guess how much space to take.
 
 ## Data directory
 
 ### `data_dir` / `--data-dir`
 
-Where keep-at keeps its own bookkeeping: persisted state (what it's currently holding), the PID/log files `start`/`stop`/`status` use, cached `.torrent` files and catalog data, and network-status snapshots. This is separate from `storage.locations`, which is only for the torrent data itself.
+Where keep-at keeps its own bookkeeping: persisted state (what it's currently holding), the PID/log files `start`/`stop`/`status` use, cached `.torrent` files and catalog data, and network-status snapshots. This is separate from `storage`, which is only for the torrent data itself.
 
-Defaults to the same OS-appropriate base directory as `--storage` (see above), under `.../keep-at` rather than `.../keep-at/storage`.
+Defaults to `~/.local/share/keep-at` (`/var/lib/keep-at` when `HOME` is unset).
 
 ## Scanning behavior
 
@@ -125,7 +118,7 @@ Security notes:
 Setting it:
 
 ```
-keep-at run --api-key 'uid=12345;pass=abcdef...' --storage-limit 500G
+keep-at run --api-key 'uid=12345;pass=abcdef...' --storage-location ~/.local/share/keep-at/storage --storage-limit 500G
 ```
 
 or in a config file:
@@ -181,7 +174,7 @@ runtime stats (as of 2026-08-08 20:55:00 UTC, uptime 2h0m0s):
 
 **Useful** transfer is the piece data that actually mattered: bytes sent to peers that requested them, and bytes received that keep-at needed. **Total network** is everything that moved over peer connections since boot - useful payload plus protocol overhead, handshakes, and duplicate/wasted chunks received from the swarm. The gap between the two is the cost of swarming, which is why a naive "downloaded" figure can far exceed what actually ended up on disk. The average rates are total-network bytes since boot divided by uptime, in bits per second.
 
-Disk utilization is measured against keep-at's **configured storage limits** (the `storage.locations`/`--storage-limit` totals), not raw filesystem usage - 100% means keep-at has reached the limit it was given. Disk *used* is reported as actual on-disk bytes (post-compression), so a location full of compressible torrents shows less usage than its nominal catalog sizes would suggest - the compression gains read as headroom, exactly as keep-at's placement math treats them. "Since boot" means since this keep-at process started.
+Disk utilization is measured against keep-at's **configured storage limits** (the `storage`/`--storage-limit` totals), not raw filesystem usage - 100% means keep-at has reached the limit it was given. Disk *used* is actual on-disk bytes under each location. Torrents are stored as plain sparse files, so reported usage tracks nominal sizes closely (unallocated sparse regions cost nothing). "Since boot" means since this keep-at process started.
 
 ## Flags that aren't config fields
 

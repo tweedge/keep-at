@@ -1,6 +1,5 @@
 //! Daemon lifecycle: PID files, foreground detection, container
-//! detection, process liveness. Ported from internal/daemonctl (Go).
-//! Linux-only.
+//! detection, process liveness. Linux-only.
 
 use std::path::{Path, PathBuf};
 

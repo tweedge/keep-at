@@ -1,7 +1,7 @@
 //! `keep-at network-status`: on-demand census of the keep-at network.
 //! Walks the catalog, scrapes seeder counts (feeding the p10 floor), and
 //! briefly joins each swarm with a disposable scraper-identity session to
-//! count other keep-at seeders. Ported from internal/engine/census.go (Go).
+//! count other keep-at seeders.
 
 use std::collections::HashSet;
 use std::path::PathBuf;

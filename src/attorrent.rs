@@ -1,5 +1,5 @@
 //! Per-torrent Academic Torrents access: .torrent fetch/parse and
-//! tracker scrapes. Ported from internal/attorrent (Go).
+//! tracker scrapes.
 
 use anyhow::{Context, Result};
 use librqbit_core::torrent_metainfo;

@@ -1,5 +1,4 @@
 //! RAM budget: torrent-count cap derived from system RAM.
-//! Ported from internal/engine/ram.go (Go), re-based on measured rqbit costs.
 //!
 //! Measured on librqbit 9.0.1 (release profile) against real Academic
 //! Torrents metainfo:

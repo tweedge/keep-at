@@ -1,6 +1,6 @@
 //! Academic Torrents API-key handling: resolve the operator's key to a
 //! per-user announce URL, and rewrite tracker lists to use it only on AT's
-//! own https hosts. Ported from internal/engine/atkey.go (Go).
+//! own https hosts.
 //!
 //! Security contract (preserved): the key and derived URLs carry the
 //! account's passkey - they are sent only to academictorrents.com tracker

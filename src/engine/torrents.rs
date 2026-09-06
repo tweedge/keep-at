@@ -32,8 +32,8 @@ pub async fn add_torrent_bytes(
         trackers: Some(trackers.into_iter().flatten().collect()),
         // Re-announces use the tracker's own min-interval (typically 15+ min
         // for AT); never force a faster cadence. Combined with AT-only
-        // tracker filtering, automatic announce traffic stays minimal - the
-        // Go version additionally routed tracker dials through the shared
+        // tracker filtering, automatic announce traffic stays minimal - an
+        // older build additionally routed tracker dials through the shared
         // rate limiter, which rqbit does not support.
         force_tracker_interval: Some(std::time::Duration::from_secs(1800)),
         ..Default::default()

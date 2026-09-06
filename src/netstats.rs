@@ -1,6 +1,5 @@
 //! Scan progress snapshots and runtime summaries, persisted as JSON so
 //! `status` / `network-status` can read them without talking to the daemon.
-//! Ported from internal/netstats (Go).
 
 use chrono::{DateTime, Utc};
 use std::path::Path;

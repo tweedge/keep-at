@@ -1,5 +1,4 @@
-//! Persisted view of what keep-at holds. Ported from internal/state
-//! (Go). Plain JSON, atomic writes.
+//! Persisted view of what keep-at holds. Plain JSON, atomic writes.
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;

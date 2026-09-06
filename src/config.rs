@@ -1,6 +1,5 @@
 //! Configuration: every setting keep-at runs with, loadable from an
 //! optional YAML file and overridable field-by-field from CLI flags.
-//! Ported from internal/config (Go).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

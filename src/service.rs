@@ -1,5 +1,4 @@
 //! systemd service install/uninstall. Linux-only.
-//! Ported from internal/service (Go).
 
 use std::path::Path;
 
