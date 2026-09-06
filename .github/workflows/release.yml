@@ -1,6 +1,6 @@
 name: release
 
-# Builds Linux binaries (musl-static) and publishes them as a GitHub release
+# Builds Linux binaries (glibc-linked) and publishes them as a GitHub release
 # whenever a version tag is pushed, e.g.:
 #
 #   git tag v1.2.3 && git push origin v1.2.3
@@ -24,21 +24,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install musl targets and C cross-compilers
+      - name: Install cross targets and C cross-compilers
         run: |
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf i686-unknown-linux-musl
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf i686-unknown-linux-gnu
           sudo apt-get update
-          sudo apt-get install -y musl-tools musl-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-i686-linux-gnu
-          # Linker shims: aws-lc-sys looks for <triple>-gcc companions.
-          for t in x86_64-linux-musl aarch64-linux-musl arm-linux-musleabihf i686-linux-musl; do
-            case "$t" in
-              x86_64-*) sys=gcc ;;
-              aarch64-*) sys=aarch64-linux-gnu-gcc ;;
-              arm-*) sys=arm-linux-gnueabihf-gcc ;;
-              i686-*) sys=i686-linux-gnu-gcc ;;
-            esac
-            sudo ln -sf "$(command -v "$sys")" "/usr/local/bin/${t}-gcc"
-          done
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-i686-linux-gnu
 
       - name: Run tests
         run: cargo test --locked

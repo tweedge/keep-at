@@ -1,6 +1,6 @@
-# Rust static build (musl): no OpenSSL needed (rustls/ring), fully
-# static binary. musl target required once per host:
-#   rustup target add x86_64-unknown-linux-musl
+# Debian-based build: glibc-linked binary (see build-release.sh for why not
+# musl). Cross target required once per host:
+#   rustup target add x86_64-unknown-linux-gnu
 # VERSION/COMMIT stamp the binary's reported version.
 FROM --platform=$BUILDPLATFORM rust:bookworm AS build
 ARG VERSION=dev
@@ -8,24 +8,21 @@ ARG TARGETARCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+RUN apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu \
     && rm -rf /var/lib/apt/lists/* \
     && case "$TARGETARCH" in \
-         amd64) TRIPLE=x86_64-unknown-linux-musl; MUSL_CC=x86_64-linux-musl-gcc ;; \
-         arm64) TRIPLE=aarch64-unknown-linux-musl; MUSL_CC=aarch64-linux-musl-gcc ;; \
+         amd64) TRIPLE=x86_64-unknown-linux-gnu ;; \
+         arm64) TRIPLE=aarch64-unknown-linux-gnu; export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc ;; \
          *) echo "unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
        esac \
     && rustup target add "$TRIPLE" \
-    && if [ "$TARGETARCH" = "arm64" ]; then \
-         apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu \
-         && ln -s "$(command -v aarch64-linux-gnu-gcc)" /usr/local/bin/aarch64-linux-musl-gcc; \
-       fi \
     && KEEPAT_VERSION_OVERRIDE="$VERSION" \
        cargo build --release --target "$TRIPLE" \
     && cp "target/${TRIPLE}/release/keep-at" /out-keep-at
 
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out-keep-at /usr/local/bin/keep-at
 
 # keep-at refuses to run without a storage limit (no default space

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Cross-compiles keep-at (Rust) for Linux targets and packages each into
 # keep-at_linux_<arch>.tar.gz, the naming self-update expects.
-# Linux-only (the Rust migration dropped macOS/Windows).
+# Linux-only.
 #
+# Binaries link glibc dynamically (gnu targets) - fine for any reasonably
+# recent distro, the systemd unit, and the install script. Fully static musl
+# builds were tried and dropped: aws-lc (rustls's crypto provider) does not
+# link against musl's libc (undefined __memcpy_chk/__vsnprintf_chk at final
+# link), and working around it would mean vendoring a musl gcc per target.
 # Needs: cargo + rustup targets installed once:
-#   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
-#     armv7-unknown-linux-musleabihf i686-unknown-linux-musl
-# musl targets produce fully static binaries (no OpenSSL needed: rustls/ring).
-#
-# NOTE: aws-lc (via rustls default features) needs a musl-aware C compiler
-# per target triple when cross-compiling. On Debian/Ubuntu runners:
-#   sudo apt-get install -y musl-tools musl-dev gcc-aarch64-linux-gnu \
+#   rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+#     armv7-unknown-linux-gnueabihf i686-unknown-linux-gnu
+# plus the matching C cross-compilers for the non-native targets:
+#   sudo apt-get install -y gcc-aarch64-linux-gnu \
 #     gcc-arm-linux-gnueabihf gcc-i686-linux-gnu
-# and export the matching CC_<triple_underscored> (done below automatically).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -31,24 +32,32 @@ else
   export KEEPAT_VERSION_OVERRIDE="$VERSION"
 fi
 
-# target triple -> asset arch -> musl C compiler package prefix
+# target triple -> asset arch -> cross C compiler (for aws-lc-sys C build)
 TARGETS=(
-  "x86_64-unknown-linux-musl amd64 x86_64-linux-musl"
-  "aarch64-unknown-linux-musl arm64 aarch64-linux-musl"
-  "armv7-unknown-linux-musleabihf arm arm-linux-musleabihf"
-  "i686-unknown-linux-musl 386 i686-linux-musl"
+  "x86_64-unknown-linux-gnu amd64"
+  "aarch64-unknown-linux-gnu arm64 aarch64-linux-gnu-gcc"
+  "armv7-unknown-linux-gnueabihf arm arm-linux-gnueabihf-gcc"
+  "i686-unknown-linux-gnu 386 i686-linux-gnu-gcc"
 )
 
 for target in "${TARGETS[@]}"; do
-  read -r triple arch musl_cc_prefix <<<"$target"
+  read -r triple arch cross_cc <<<"$target"
   name="keep-at_linux_${arch}"
 
   echo "building ${name} (${triple})..."
   build_dir="$(mktemp -d)"
 
-  # Point cc at the musl-aware gcc for this triple (aws-lc-sys honors CC).
-  cc_var="CC_${triple//-/_}"
-  export "${cc_var}=${musl_cc_prefix}-gcc"
+  # Point cc at the cross gcc for this triple (aws-lc-sys honors CC).
+  # Native x86_64 needs nothing; the compiler must exist for the rest.
+  if [ -n "${cross_cc:-}" ]; then
+    command -v "$cross_cc" >/dev/null || {
+      echo "missing cross compiler $cross_cc for $triple" >&2
+      echo "install it, e.g.: sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-i686-linux-gnu" >&2
+      exit 1
+    }
+    cc_var="CC_${triple//-/_}"
+    export "${cc_var}=${cross_cc}"
+  fi
 
   cargo build --release --target "$triple"
   cp "target/${triple}/release/keep-at" "${build_dir}/keep-at"
