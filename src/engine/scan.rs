@@ -218,9 +218,8 @@ async fn eval_scrape_swarm(
             ctx.rate.lock().await.wait().await;
         }
         if !tracker.starts_with("http://") && !tracker.starts_with("https://") {
-            // UDP trackers (BEP 15 scrape) are not implemented - the old Go
-            // build scraped them as a fallback. Skip quietly; the AT https
-            // tracker answers for AT content.
+            // UDP trackers (BEP 15 scrape) are not implemented - skip
+            // quietly; the AT https tracker answers for AT content.
             continue;
         }
         stats.scrape_requests.fetch_add(1, Ordering::Relaxed);
@@ -642,10 +641,11 @@ impl Engine {
         stats.library_bytes.store(library_bytes, Ordering::Relaxed);
 
         let scrape_started = std::time::Instant::now();
-        // Incremental acting: evaluate in streaming batches and act on the
-        // top window as results arrive (mirrors Go's actEvery batching).
-        // evaluate_candidates_stream runs the full walk; the callback fires
-        // once per EVALUATE_CONCURRENCY arrivals plus a final flush.
+        // Incremental acting: evaluate the walk, then act over its output in
+        // arrival-sized batches to preserve the windowing behavior below.
+        // (evaluate_candidates buffers the whole walk before returning;
+        // true streaming is future work - the batching still bounds each
+        // re-rank to EVALUATE_CONCURRENCY arrivals plus a final flush.)
         let mut acted: HashSet<String> = HashSet::new();
         let mut held_count = self.state.all().len();
         let mut batch: Vec<Evaluated> = Vec::new();
@@ -1599,18 +1599,9 @@ fn decode_hash(hex_str: &str) -> Result<[u8; 20]> {
     Ok(h)
 }
 
-/// Greedy displaceable-set selection within one location, mirroring Go's
-/// selectDisplaceable. Sizes are nominal bytes here (plain storage: nominal
-/// == on-disk up to the fixed buffer, applied symmetrically on both sides).
-///
-/// The set must free enough disk AND enough RAM: freed RAM is the sum of the
-/// displaced torrents' footprints (stored piece counts, unknown = typical),
-/// and the swap proceeds only when freed RAM covers the candidate's cost.
-/// This keeps a many-piece candidate from evicting one cheap torrent and
-/// pushing RSS past the budget — the displaced set must price out.
-/// Greedy displaceable-set selection within one location, mirroring Go's
-/// selectDisplaceable. Sizes are nominal bytes here (plain storage: nominal
-/// == on-disk up to the fixed buffer, applied symmetrically on both sides).
+/// Greedy displaceable-set selection within one location. Sizes are
+/// nominal bytes here (plain storage: nominal == on-disk up to the fixed
+/// buffer, applied symmetrically on both sides).
 ///
 /// The set must free enough disk AND enough RAM: freed RAM is the sum of the
 /// displaced torrents' footprints (stored piece counts, unknown = typical),

@@ -275,8 +275,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load a config file, writing a starter one (and erroring) if missing -
-    /// same contract as Go's config.Load.
+    /// Load a config file, writing a starter one (and erroring) if missing.
     pub fn load(path: &Path) -> Result<Config> {
         let data = match std::fs::read(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

@@ -67,7 +67,7 @@ pub fn status(data_dir: &Path) -> Status {
 }
 
 /// Find a foreground `keep-at run/start --data-dir DIR` process by scanning
-/// /proc (same lookup Go's status used). Returns Some(pid) when found.
+/// /proc. Returns Some(pid) when found.
 pub fn find_foreground(data_dir: &Path) -> Option<Option<u32>> {
     let want = data_dir.to_string_lossy().into_owned();
     let procs = std::fs::read_dir("/proc").ok()?;
@@ -143,9 +143,8 @@ pub fn is_containerized() -> bool {
     false
 }
 
-/// Double-fork detach is unnecessary in Rust: `start` spawns a detached
-/// child via std::process::Command + setsid and exits. This helper reports
-/// whether stdin/stdout look like a terminal (for log routing parity).
+/// `start` spawns a detached child via std::process::Command + setsid and
+/// exits.
 pub fn setsid_spawn(exe: &Path, args: &[String]) -> Result<u32> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(exe);

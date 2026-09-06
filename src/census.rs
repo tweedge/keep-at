@@ -3,8 +3,6 @@
 //! briefly joins each swarm with a disposable scraper-identity session to
 //! count other keep-at seeders.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -339,7 +337,6 @@ async fn probe_swarm(
         .await;
     rqsession::stop_session(&session, Duration::from_secs(5)).await;
     let _ = std::fs::remove_dir_all(&probe_dir);
-    let _ = HashSet::<PathBuf>::new();
     Ok(out)
 }
 

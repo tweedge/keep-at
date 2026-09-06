@@ -58,7 +58,7 @@ Defaults to `~/.local/share/keep-at` (`/var/lib/keep-at` when `HOME` is unset).
 
 ### `scan.min_seed_margin` / `--min-seed-margin`
 
-*Default: `2`.* How many fewer seeds a candidate torrent needs, relative to a held torrent (or torrents), before keep-at will displace it to make room. Higher values make keep-at more conservative about swapping; `0` means any strictly-lower seed count qualifies. This is the swap-specific guard on top of the global seed-scarcity gate - see DESIGN.md's "Seeding minimally-seeded torrents" section for how the two interact.
+*Default: `2`.* How many fewer seeds a candidate torrent needs, relative to each held torrent it would displace (or the least-seeded of a displaced set), before keep-at will displace it to make room. Higher values make keep-at more conservative about swapping; `0` means any strictly-lower seed count qualifies. This is the swap-specific guard on top of the global seed-scarcity gate - see DESIGN.md's "Seeding minimally-seeded torrents" section for how the two interact.
 
 ### `scan.moderation_delay` / `--moderation-delay`
 
@@ -152,24 +152,25 @@ download_rate_limit: 20M
 
 ### `stats_interval` / `--stats-interval`
 
-*Default: `30m`.* How often keep-at logs a brief summary of what it's doing - torrents held/seeding/downloading, disk utilization, transfer since boot (both useful payload and total network traffic, with average rates), active peers, and uptime - and writes that same summary to disk (in `data_dir/runtime-stats.json`) so `keep-at status` can display it. A summary is always written once at startup; `stats_interval: 0` disables the periodic ones. The log line looks like:
+*Default: `30m`.* How often keep-at logs a brief summary of what it's doing - torrents held/seeding/downloading, disk utilization, transfer since boot (both useful payload and total network traffic, with average rates), active peers, process RSS, and uptime - and writes that same summary to disk (in `data_dir/runtime-stats.json`) so `keep-at status` can display it. A summary is always written once at startup and once after every scan; `stats_interval: 0` disables the periodic ones. The log line looks like:
 
 ```
-runtime stats kind=periodic held=12 seeding=10 downloading=2 disk_used=50.0G disk_limit=100.0G disk_used_pct=50 uploaded_useful=5.0G downloaded_useful=1.0G uploaded_total=5.2G downloaded_total=1.4G upload_rate_avg=500 kbps download_rate_avg=100 kbps peers=24 uptime=2h0m0s
+runtime stats (kind=periodic held=12 seeding=10 downloading=2 disk=50.0 GiB/100.0 GiB up=5.0 GiB down=1.0 GiB peers=24 rss=300.0 MiB uptime=7200s)
 ```
 
 and `keep-at status` prints the same picture:
 
 ```
 keep-at is running (pid 12345)
-runtime stats (as of 2026-08-08 20:55:00 UTC, uptime 2h0m0s):
+runtime stats (2026-08-08 20:55:00 UTC uptime, uptime 2h0m0s):
   torrents: 12 held, 10 seeding, 2 downloading
-  disk: 50.0 GB used of 100.0 GB configured (50.0%)
-  useful upload since boot: 5.0 GB (total network 5.2 GB)
-  useful download since boot: 1.0 GB (total network 1.4 GB)
-  avg upload since boot: 500 kbps
-  avg download since boot: 100 kbps
+  disk: 50.0 GiB used of 100.0 GiB configured (50.0%)
+  useful upload since boot: 5.0 GiB (total network 5.2 GiB)
+  useful download since boot: 1.0 GiB (total network 1.4 GiB)
+  avg upload since boot: 500.0 Kbit/s
+  avg download since boot: 100.0 Kbit/s
   active peers: 24
+  memory: 300.0 MiB RSS
 ```
 
 **Useful** transfer is the piece data that actually mattered: bytes sent to peers that requested them, and bytes received that keep-at needed. **Total network** is everything that moved over peer connections since boot - useful payload plus protocol overhead, handshakes, and duplicate/wasted chunks received from the swarm. The gap between the two is the cost of swarming, which is why a naive "downloaded" figure can far exceed what actually ended up on disk. The average rates are total-network bytes since boot divided by uptime, in bits per second.
@@ -181,5 +182,17 @@ Disk utilization is measured against keep-at's **configured storage limits** (th
 A few flags control CLI behavior rather than keep-at's own settings, and don't have a YAML equivalent:
 
 * `--config PATH` - use a config file (see precedence above).
+* `--data-dir PATH` - override the data directory for this invocation (on `run`/`start`/`stop`/`status`/`hosted-torrents`; wins over the config file).
 * `--foreground` (`start` only) - run attached instead of daemonizing. Implied automatically inside a container.
 * `--user` (`service install` only) - which user the systemd unit runs as (default `root`).
+* `--probe-timeout` (`network-status` only) - how long to wait per torrent for peers while probing its swarm (default `10s`).
+
+## Logging
+
+### `log_file` / `--log-file`
+
+*Default: unset (log to stdout).* Write logs to a file instead of standard output. `start` sets this automatically to `<data_dir>/keep-at.log` when you don't pass one (a detached daemon's stdio is discarded, so without a log file its output would go nowhere); `run` in a terminal leaves it on stdout. The systemd unit captures stdout via the journal instead, so it needs no log file.
+
+### `debug` / `--debug`
+
+*Default: `false`.* Verbose diagnostics: debug-level logging (overridable per-process with `RUST_LOG`, e.g. `RUST_LOG=keep_at::engine=debug`). There is no debug-artifact directory - diagnostics are the log lines themselves plus the persisted snapshots (`network-stats.json`, `runtime-stats.json`, `scrape-cache.json`) under the data dir.

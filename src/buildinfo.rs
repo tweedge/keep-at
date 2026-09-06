@@ -17,6 +17,8 @@ pub const ROLE_SEEDER: &str = "seeder";
 pub const ROLE_SCRAPER: &str = "scraper";
 
 /// Azureus-style peer ID prefix, independent of the extended handshake string.
+/// rqbit builds peer IDs per session and does not accept a custom prefix,
+/// so this is used only for deterministic unit tests of the matching logic.
 pub const PEER_ID_PREFIX: [u8; 8] = *b"-KA0100-";
 
 fn role_client_version(role: &str) -> String {
@@ -50,10 +52,10 @@ pub fn scraper_user_agent() -> String {
 }
 
 /// Reports whether a peer's advertised client string identifies it as a
-/// keep-at node that is actually seeding (not merely probing). Matches the
-/// Go IsKeepAtSeeder semantics: prefix match on "keep-at", excluding the
-/// scraper role; the seeder role suffix is not required so older versions
-/// advertising the bare "keep-at/version" string still count.
+/// keep-at node that is actually seeding (not merely probing): prefix match
+/// on "keep-at", excluding the scraper role; the seeder role suffix is not
+/// required so older versions advertising the bare "keep-at/version" string
+/// still count.
 pub fn is_keep_at_seeder(client_name: &str) -> bool {
     if !client_name.starts_with(CLIENT_NAME) {
         return false;
