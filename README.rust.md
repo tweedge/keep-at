@@ -57,6 +57,45 @@ Accounting uses nominal size + a small per-torrent buffer and never exceeds
 a location's limit. `limit: all` (or `--storage-limit all`) resolves to
 97.5% of the device's formatted capacity - dedicated data drives only.
 
+## Napkin math: how much RAM per TB of storage
+
+Rule of thumb: **~1 GiB of physical RAM per 1 TB of storage fills the disk;
+~60 GiB of physical RAM per 1 TB fills it with 16 MB-average torrents.**
+The two numbers differ because RAM cost tracks torrent *count* and piece
+count, while disk tracks bytes. Derivation (measured on rqbit 9.0.1,
+release profile):
+
+- Per-torrent RAM ≈ 256 KiB base + 64 B/piece + 48 KiB × peer-limit.
+  A typical catalog torrent (~1k pieces) costs ~0.7 MiB at peer-limit 8.
+- Budget is 80% of physical RAM, so a 1 GiB box plans around ~820 MiB →
+  ~1,190 slots.
+- What those slots total in bytes depends on *which* torrents urgency
+  ranking selects, and that is the whole ballgame:
+  - Live 327-torrent node: 16 MB average → 1,190 slots ≈ 20 GB per TB
+    of attached disk (~2% utilization of a 1 TB drive).
+  - Same 1,190 slots at the 1.72 GB average of the catalog's 600 largest
+    entries → ~2 TB. The 1 GiB box fills a 1 TB drive twice over.
+
+So RAM per TB is not a property of the disk - it is a property of the
+average torrent size the network needs seeded when your node scans:
+
+| torus profile | slots/TB | RAM per TB of *filled* disk |
+|---|---|---|
+| 16 MB average (small-torrent mix) | ~67,000 | ~60 GiB physical |
+| 1.7 GB average (600 largest catalog entries) | ~600 | ~1 GiB physical |
+
+On a RAM-short box (512 MiB + 1 TB) the disk will sit mostly empty by
+design: ~600 slots fill with the largest, fewest-piece torrents urgency
+ranking surfaces, and free-space fill refuses anything whose RAM price
+exceeds remaining headroom. That is the correct behavior - the alternative
+is exceeding the RAM budget and OOMing the host. If the disk must be full,
+add RAM, not flags: no selection parameter can hold more torrents than the
+budget prices.
+
+`--max-ram` caps the budget below the 80% default (never above). The
+startup log prints the resolved `budget`, `peer-limit`, and `max-torrents`
+so the arithmetic above is checkable per host.
+
 ## Design notes
 
 See `docs/DESIGN.md` for the selection math and operational lessons (much of
