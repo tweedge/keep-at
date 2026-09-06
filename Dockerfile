@@ -2,7 +2,7 @@
 # static binary. musl target required once per host:
 #   rustup target add x86_64-unknown-linux-musl
 # VERSION/COMMIT stamp the binary's reported version.
-FROM --platform=$BUILDPLATFORM rust:1.85-bookworm AS build
+FROM --platform=$BUILDPLATFORM rust:bookworm AS build
 ARG VERSION=dev
 ARG TARGETARCH
 WORKDIR /src

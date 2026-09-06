@@ -5,7 +5,7 @@ edition = "2021"
 description = "A smart node that seeds Academic Torrents"
 license = "MIT"
 repository = "https://github.com/tweedge/keep-at"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [[bin]]
 name = "keep-at"

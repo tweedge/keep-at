@@ -673,7 +673,7 @@ impl Engine {
             }
             batch.push(ev);
             processed += 1;
-            if batch.len() % EVALUATE_CONCURRENCY == 0 {
+            if batch.len().is_multiple_of(EVALUATE_CONCURRENCY) {
                 let ram_bound = held_count >= self.max_torrents;
                 self.act_on_windowed(
                     &batch,
@@ -686,7 +686,7 @@ impl Engine {
                 .await;
             }
         }
-        if processed % (EVALUATE_CONCURRENCY as u64) != 0 {
+        if !processed.is_multiple_of(EVALUATE_CONCURRENCY as u64) {
             let ram_bound = held_count >= self.max_torrents;
             self.act_on_windowed(
                 &batch,

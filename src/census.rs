@@ -147,7 +147,7 @@ pub async fn cmd_network_status(args: &NetworkStatusArgs) -> Result<()> {
             items.len(),
             &tracker,
             started.elapsed(),
-            processed % PROGRESS_EVERY == 0,
+            processed.is_multiple_of(PROGRESS_EVERY),
         );
     }
 
