@@ -22,10 +22,7 @@ use crate::config::Config;
 /// peer buffers are the dominant per-torrent RAM term, so small hosts trade
 /// per-torrent swarm speed for more held torrents.
 pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Session>> {
-    let ratelimits = LimitsConfig {
-        upload_bps: nonzero_u32(cfg.upload_rate_limit),
-        download_bps: nonzero_u32(cfg.download_rate_limit),
-    };
+    let ratelimits = session_rate_limits(cfg);
 
     // Default output folder is unused (every torrent passes output_folder
     // explicitly); point it at the data dir so nothing lands somewhere odd.
@@ -121,6 +118,18 @@ fn nonzero_u32(v: u64) -> Option<std::num::NonZeroU32> {
     u32::try_from(v).ok().and_then(std::num::NonZeroU32::new)
 }
 
+/// Resolve the effective session rate limits for a config: `0` (unset)
+/// means unlimited (None); anything else caps that direction session-wide.
+/// Values above u32::MAX saturate to unlimited rather than wrapping -
+/// no sane link exceeds 4 GiB/s, and a wrapped tiny limit would
+/// mysteriously stall all transfers.
+pub fn session_rate_limits(cfg: &Config) -> librqbit::limits::LimitsConfig {
+    LimitsConfig {
+        upload_bps: nonzero_u32(cfg.upload_rate_limit),
+        download_bps: nonzero_u32(cfg.download_rate_limit),
+    }
+}
+
 fn peer_id_from_prefix() -> librqbit_core::Id20 {
     let mut rng = rand::thread_rng();
     let id = buildinfo::make_peer_id(&mut rng);
@@ -130,4 +139,76 @@ fn peer_id_from_prefix() -> librqbit_core::Id20 {
 /// Graceful shutdown with a bounded wait.
 pub async fn stop_session(session: &Arc<Session>, timeout: Duration) {
     let _ = tokio::time::timeout(timeout, session.stop()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, StorageLimit, StorageLocation};
+
+    fn cfg_with_limits(up: u64, down: u64) -> Config {
+        let mut cfg = Config {
+            storage: vec![StorageLocation {
+                path: "/tmp/keep-at-test-storage".into(),
+                limit: StorageLimit::Bytes(1 << 30),
+            }],
+            upload_rate_limit: up,
+            download_rate_limit: down,
+            ..Config::default()
+        };
+        cfg.scan.interval = Duration::from_secs(60);
+        cfg
+    }
+
+    #[test]
+    fn unlimited_by_default() {
+        let lim = session_rate_limits(&cfg_with_limits(0, 0));
+        assert_eq!(lim.upload_bps, None);
+        assert_eq!(lim.download_bps, None);
+    }
+
+    #[test]
+    fn limits_pass_through() {
+        let lim = session_rate_limits(&cfg_with_limits(50 * 1024 * 1024, 20 * 1024 * 1024));
+        assert_eq!(lim.upload_bps.map(|v| v.get()), Some(50 * 1024 * 1024));
+        assert_eq!(lim.download_bps.map(|v| v.get()), Some(20 * 1024 * 1024));
+    }
+
+    #[test]
+    fn overflow_saturates_to_unlimited() {
+        let lim = session_rate_limits(&cfg_with_limits(u64::MAX, u64::MAX));
+        assert_eq!(lim.upload_bps, None);
+        assert_eq!(lim.download_bps, None);
+    }
+
+    #[tokio::test]
+    async fn session_reports_configured_limits() {
+        // End-to-end: a real session exposes exactly the configured caps via
+        // its live Limits handle (the same handle the peer data path
+        // acquires through on every chunk).
+        let cfg = cfg_with_limits(1024 * 1024, 2 * 1024 * 1024);
+        let dir = std::env::temp_dir().join(format!("keep-at-limit-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let session = Session::new_with_opts(
+            dir.clone(),
+            SessionOptions {
+                ratelimits: session_rate_limits(&cfg),
+                dht: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("session builds");
+        assert_eq!(
+            session.ratelimits.get_upload_bps().map(|v| v.get()),
+            Some(1024 * 1024)
+        );
+        assert_eq!(
+            session.ratelimits.get_download_bps().map(|v| v.get()),
+            Some(2 * 1024 * 1024)
+        );
+        stop_session(&session, Duration::from_secs(5)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

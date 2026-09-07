@@ -134,6 +134,16 @@ keep-at run --api-key 'uid=12345;pass=abcdef...' --storage-location ~/.local/sha
 
 keep-at announces to AT's tracker with that passkey so the attribution happens automatically. The key is only ever sent to Academic Torrents' own trackers (`academictorrents.com` and `ipv6.academictorrents.com`); third-party trackers never see it, and keep-at never logs it or writes it into cached torrent files. You can also set it in a config file as `api_key` (see below).
 
+### Bandwidth limits
+
+*Optional.* By default keep-at transfers as fast as the swarms allow in both directions. On a connection you share with other things - or a seedbox with a monthly transfer quota - cap it globally:
+
+```
+keep-at run --upload-rate-limit 50M --download-rate-limit 20M --storage-location ~/.local/share/keep-at/storage --storage-limit 500G
+```
+
+Each limit applies **across all torrents at once** (one shared limiter on the torrent client, not a per-torrent budget), in bytes per second with the usual size suffixes (`50M` = 50 MiB/s); `0` means unlimited. The same settings live in a config file as `upload_rate_limit` / `download_rate_limit`. Note the scan traffic to Academic Torrents itself (catalog fetches, scrapes) has its own separate limiter (`--rate-limit`, default 0.5 requests/second) and is unaffected by these caps. Full details in [docs/CONFIG.md](docs/CONFIG.md).
+
 ### VPN Compatibility
 
 *Optional.* Running behind a VPN comes with real tradeoffs (mainly around port forwarding and speed) that are worth understanding before turning one on - see [docs/VPN.md](docs/VPN.md) for a general guide covering both Docker (via [gluetun](https://github.com/passteque/gluetun)) and service-level (WireGuard) setups.
