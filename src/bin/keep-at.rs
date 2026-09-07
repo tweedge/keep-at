@@ -244,10 +244,99 @@ async fn cmd_self_update(beta: bool) -> Result<()> {
         println!("keep-at is already up to date ({current})");
         return Ok(());
     }
+    // Never "update" sideways or backwards: the non-beta channel resolves
+    // to the latest STABLE, which can lag a running beta (e.g. running
+    // 0.8.6-beta while stable is 0.7.2). Suggest --beta instead of
+    // downloading an older binary over a newer one.
+    if !beta && version_older_or_equal(&latest, current) {
+        println!(
+            "latest stable is {latest}, but this binary is {current} (newer). Nothing to do — pass --beta to track prereleases."
+        );
+        return Ok(());
+    }
     println!("updating keep-at {current} -> {latest}...");
     let exe = std::env::current_exe().context("locating keep-at executable")?;
+    // Root-owned binary in /usr/local/bin or /usr/bin: a plain replace
+    // fails with permission denied. Elevate (re-exec self, same policy as
+    // `service install` — see service::elevate) so `self-update` works
+    // without a manual sudo prefix, using the exact same argv.
+    if let Err(e) = can_replace_file(&exe) {
+        tracing::debug!("binary not replaceable in place ({e:#}); elevating");
+        keep_at::service::elevate("replace the keep-at binary for self-update")?;
+        // elevate() only returns when already root; re-check after it.
+        can_replace_file(&exe).with_context(|| {
+            format!(
+                "binary {} still not replaceable after elevation",
+                exe.display()
+            )
+        })?;
+    }
     let _exe_dir: PathBuf = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let new_version = keep_at::updater::apply(&http, &ua, &exe, beta).await?;
     println!("updated to {new_version}; restart keep-at to run it");
     Ok(())
+}
+
+/// Compare dotted version strings (leading 'v' stripped): true when `a` is
+/// older than or equal to `b`. Non-numeric segments compare as 0. Used to
+/// refuse downgrades on the stable channel (running beta vs lagging stable).
+fn version_older_or_equal(a: &str, b: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.trim_start_matches('v')
+            .split('.')
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+    let (pa, pb) = (parts(a), parts(b));
+    let n = pa.len().max(pb.len());
+    for i in 0..n {
+        let (x, y) = (
+            pa.get(i).copied().unwrap_or(0),
+            pb.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x < y;
+        }
+    }
+    true // equal
+}
+
+/// Can this process replace `exe` in place? Probes writability of the
+/// binary's directory (where the atomic-replace temp file lands) without
+/// writing anything lasting: if the directory isn't writable, self-update
+/// would fail with permission denied, so the caller elevates first.
+fn can_replace_file(exe: &std::path::Path) -> Result<()> {
+    let dir = exe.parent().context("executable has no parent dir")?;
+    // Simplest honest probe is attempting the temp file the updater itself
+    // would write, then removing it. Suffix differs so a concurrent real
+    // update never collides.
+    let probe = dir.join(format!(".keep-at-writable-{}", std::process::id()));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("{} is not writable", dir.display())),
+    }
+}
+
+#[cfg(test)]
+mod self_update_tests {
+    use super::version_older_or_equal;
+
+    #[test]
+    fn version_ordering() {
+        assert!(version_older_or_equal("v0.7.2", "0.8.6"));
+        assert!(version_older_or_equal("0.8.6", "0.8.6"));
+        assert!(version_older_or_equal("v0.8.6", "v0.8.6-beta"));
+        assert!(!version_older_or_equal("0.8.6", "v0.7.2"));
+        assert!(!version_older_or_equal("v0.9.0", "0.8.6"));
+        assert!(version_older_or_equal("1.2", "1.2.0"));
+    }
 }

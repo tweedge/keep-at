@@ -88,21 +88,21 @@ pub fn device_total_bytes(path: &Path) -> Result<u64> {
     Ok(st.f_blocks.saturating_mul(st.f_frsize))
 }
 
-/// Resolve `limit: all` locations to concrete byte counts (safe fraction of
-/// the device's total formatted capacity). The caller's original keeps "all".
+/// Resolve `limit: max` locations to concrete byte counts (safe fraction of
+/// the device's total formatted capacity). The caller's original keeps "max".
 pub fn resolve_all_limits(cfg: &Config) -> Result<Config> {
     let mut out = cfg.clone();
     for loc in &mut out.storage {
         if loc.limit == StorageLimit::All {
             let total = device_total_bytes(&loc.path).with_context(|| {
                 format!(
-                    "resolving `limit: all` for {}: cannot stat device",
+                    "resolving `limit: max` for {}: cannot stat device",
                     loc.path.display()
                 )
             })?;
             loc.limit = StorageLimit::Bytes((total as f64 * ALL_LIMIT_FRACTION) as u64);
             tracing::info!(
-                "resolved `limit: all` for {} to {}",
+                "resolved `limit: max` for {} to {}",
                 loc.path.display(),
                 crate::humanize::human_bytes(loc.limit_bytes() as i64),
             );

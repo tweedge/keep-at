@@ -47,11 +47,11 @@ That's the only variable you need to set to start. `keep-at run --help` lists ev
 
 ### Service Usage
 
-keep-at is designed to be used as a long-running service on an always-on server, VM, or similar. Where `keep-at run` starts it in the foreground (good for seeing what's going on), `service install` is what you want for something that stays up (requires root, Linux with systemd):
+keep-at is designed to be used as a long-running service on an always-on server, VM, or similar. Where `keep-at run` starts it in the foreground (good for seeing what's going on), `service install` is what you want for something that stays up (Linux with systemd; elevates automatically when needed, no sudo prefix required):
 
 ```
-sudo keep-at service install --storage-location /mnt/data/keep-at --storage-limit 500G
-sudo keep-at service uninstall
+keep-at service install --storage-location /mnt/data/keep-at --storage-limit 500G
+keep-at service uninstall
 ```
 
 `service install` takes the same flags as `run`, resolves them the same way, and writes the result to `/etc/keep-at/config.yaml` - installing the config alongside the service, rather than baking flags into the unit or requiring you to remember them. That's also what makes every other command below work with no arguments at all: once that file exists, `stop`, `status`, `network-status`, `hosted-torrents`, and even a bare `run`/`start` all check it automatically to find out where the running instance lives.
@@ -68,7 +68,7 @@ keep-at hosted-torrents
 
 `start` and `run` take the exact same flags as `service install` - `start` just forks `run` into the background for you (or runs it in the foreground directly, inside a container). None of these commands need `--config` once keep-at is installed as a service; pass it explicitly only if you're managing a non-service instance, or one installed somewhere unusual.
 
-To change settings later, edit `/etc/keep-at/config.yaml` directly and run `sudo systemctl restart keep-at`, or just run `service install` again with new flags.
+To change settings later, edit `/etc/keep-at/config.yaml` directly and run `systemctl restart keep-at` (with sudo if your shell isn't root), or just run `service install` again with new flags. `service install` and `self-update` re-execute keep-at elevated on their own when the target needs root (system files, or a root-owned binary in /usr/local/bin or /usr/bin) — you never prefix them with sudo yourself, which also sidesteps the classic failure where keep-at is on your PATH but not root's.
 
 And to update to the latest release:
 
@@ -102,21 +102,21 @@ storage:
 
 Every field here, plus its CLI flag equivalent and what it actually does, is documented in [docs/CONFIG.md](docs/CONFIG.md). You never have to touch a config file if you don't want to: repeatable `--storage-location PATH --storage-limit SIZE` pairs configure any number of drives entirely from flags.
 
-### Filling a dedicated drive: `limit: all`
+### Filling a dedicated drive: `limit: max`
 
-A storage location's `limit` can be the literal `all` (or `--storage-limit all`) instead of a byte count. keep-at then resolves it at startup to **97.5% of the device's total formatted capacity** - it measures the filesystem and leaves the last 2.5% (plus whatever the filesystem itself reserves) for the journal, metadata, and the OS's emergency operations.
+A storage location's `limit` can be the literal `max` (or `--storage-limit max`) instead of a byte count. keep-at then resolves it at startup to **97.5% of the device's total formatted capacity** - it measures the filesystem and leaves the last 2.5% (plus whatever the filesystem itself reserves) for the journal, metadata, and the OS's emergency operations.
 
 ```
-keep-at run --storage-location ~/.local/share/keep-at/storage --storage-limit all
+keep-at run --storage-location ~/.local/share/keep-at/storage --storage-limit max
 ```
 
 ```yaml
 storage:
 - path: /mnt/dedicated-drive/keep-at
-  limit: all
+  limit: max
 ```
 
-> **DANGER: dedicated drives only. Never use `all` on an OS drive.** With `limit: all`, keep-at will attempt to fill the device to the resolved fraction - on a system disk that can choke the OS out of space for logs, swap, package managers, and the boot process itself. Use it only on a drive whose entire purpose is storing torrent data. A fixed byte limit is always safer if you're unsure.
+> **DANGER: dedicated drives only. Never use `max` on an OS drive.** With `limit: max`, keep-at will attempt to fill the device to the resolved fraction - on a system disk that can choke the OS out of space for logs, swap, package managers, and the boot process itself. Use it only on a drive whose entire purpose is storing torrent data. A fixed byte limit is always safer if you're unsure.
 
 ### Stalled downloads free themselves
 

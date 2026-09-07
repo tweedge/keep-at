@@ -14,7 +14,7 @@ Precedence, when more than one source could set a value:
 
 ### `storage` (config file)
 
-A list of `{path, limit}` pairs. Each `limit` is either a byte size (`500G`, `2T` - binary units, `1G` is `1024^3` bytes), or the literal `all` - see below. There's no default limit; keep-at always requires at least one explicit location with a positive limit before it will run.
+A list of `{path, limit}` pairs. Each `limit` is either a byte size (`500G`, `2T` - binary units, `1G` is `1024^3` bytes), or the literal `max` (`all` still works as a deprecated alias) - see below. There's no default limit; keep-at always requires at least one explicit location with a positive limit before it will run.
 
 ```yaml
 storage:
@@ -24,9 +24,9 @@ storage:
   limit: 2T
 ```
 
-Limits are enforced against nominal torrent sizes plus a small per-torrent buffer (for the cached `.torrent` file and state overhead): a 100 GB torrent consumes ~100 GB of the limit regardless of how compressible its bytes are. Free-space checks are also capped by what the device actually reports free, so filesystem block slack and metadata can't push real usage past capacity, and keep-at never exceeds a location's limit.
+Limits are enforced against nominal torrent sizes plus a small per-torrent buffer (for the cached `.torrent` file and state overhead): a 100 GB torrent consumes ~100 GB of the limit regardless of how compressible its bytes are. Limits under 100M are rejected outright (certainly a units mistake - did you mean gigabytes?); limits under 1G warn but proceed. Free-space checks are also capped by what the device actually reports free, so filesystem block slack and metadata can't push real usage past capacity, and keep-at never exceeds a location's limit.
 
-`limit: all` (or `--storage-limit all`) resolves at startup to 97.5% of the storage device's total formatted capacity, measured with statfs on the location path - the device is dedicated to keep-at and the last 2.5% (plus whatever the filesystem reserves) is left for the journal, metadata, and the OS's emergency operations. **Only use `all` on a dedicated data drive.** On an OS drive, keep-at will attempt to fill the device to that fraction and can choke the OS out of room for logs, swap, and the boot process. A fixed byte limit is the safe choice whenever the drive isn't exclusively keep-at's.
+`limit: max` (or `--storage-limit max`) resolves at startup to 97.5% of the storage device's total formatted capacity, measured with statfs on the location path - the device is dedicated to keep-at and the last 2.5% (plus whatever the filesystem reserves) is left for the journal, metadata, and the OS's emergency operations. **Only use `max` on a dedicated data drive.** On an OS drive, keep-at will attempt to fill the device to that fraction and can choke the OS out of room for logs, swap, and the boot process. A fixed byte limit is the safe choice whenever the drive isn't exclusively keep-at's.
 
 keep-at fills multiple locations proportionally to free space, not sequentially, so they fill up roughly evenly over time instead of one disk taking everything until it's full. See [DESIGN.md](DESIGN.md) for the weighting logic.
 
@@ -137,7 +137,7 @@ api_key: uid=12345;pass=abcdef...
 
 ### `upload_rate_limit` / `--upload-rate-limit` and `download_rate_limit` / `--download-rate-limit`
 
-*Default: `0` (unlimited).* Caps how fast keep-at transfers data, in bytes per second, e.g. `50M` = 50 MiB/s. A limit applies **across all torrents at once** - one shared limiter on the torrent client, not a per-torrent budget - so `upload_rate_limit: 10M` means keep-at will never upload faster than 10 MiB/s total. Values use the same size syntax as storage limits (`M`/`G`/`T`/`P`), or a plain byte count; `0` means unlimited. Set both in a config file, or one via flags:
+*Default: `0` (unlimited).* Caps how fast keep-at transfers data, in bytes per second, e.g. `50M` = 50 MiB/s. A limit applies **across all torrents at once** - one shared limiter on the torrent client, not a per-torrent budget - so `upload_rate_limit: 10M` means keep-at will never upload faster than 10 MiB/s total. Values use the same size syntax as storage limits (`M`/`G`/`T`/`P`), or a plain byte count; `0` means unlimited. Absurdly small caps are rejected (<100K, certainly a units mistake - did you mean megabytes?); caps under 1M warn but proceed. Set both in a config file, or one via flags:
 
 ```
 keep-at run --upload-rate-limit 50M --download-rate-limit 20M

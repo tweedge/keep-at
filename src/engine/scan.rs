@@ -1758,7 +1758,7 @@ impl crate::config::StorageLocation {
 }
 
 /// Sum of resolved disk limits across storage locations. Must be called
-/// after `resolve_all_limits`, so `limit: all` is already concrete bytes.
+/// after `resolve_all_limits`, so `limit: max` is already concrete bytes.
 fn disk_limit_total(cfg: &Config) -> u64 {
     cfg.storage.iter().map(|l| l.limit_bytes()).sum()
 }

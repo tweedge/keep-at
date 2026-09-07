@@ -30,7 +30,7 @@ pub enum Command {
     Stop(CommonArgs),
     /// Report whether keep-at is running
     Status(CommonArgs),
-    /// Install/remove a systemd service (Linux, root)
+    /// Install/remove a systemd service (elevates automatically when needed)
     Service(ServiceArgs),
     /// Census the keep-at network (RAM/time-heavy, on demand)
     NetworkStatus(NetworkStatusArgs),
@@ -63,70 +63,76 @@ pub struct RunArgs {
     pub foreground: bool,
 }
 
-/// Every config setting as a flag. Storage locations are repeatable pairs:
-/// `--storage-location PATH --storage-limit SIZE` (limit accepts 500G/2T/all).
+/// Every config setting as a flag. Storage is `--storage-location PATH`
+/// plus `--storage-limit SIZE` pairs (repeatable); `--storage PATH` is the
+/// single-location shorthand, and a bare `--storage-limit` fills the
+/// default location.
+///
+/// Flags are grouped by purpose in --help (storage, network, selection,
+/// limits, logging) rather than alphabetically, so the most-changed
+/// settings come first.
 #[derive(Debug, Args)]
 pub struct ConfigArgs {
     /// Storage location for torrent data (repeatable; pairs with --storage-limit)
-    #[arg(long = "storage-location")]
+    #[arg(long = "storage-location", help_heading = "Storage")]
     pub storage_location: Vec<PathBuf>,
-    /// How much space to use, e.g. 500G, 2T, or 'all' (repeatable; pairs with --storage-location)
-    #[arg(long = "storage-limit")]
+    /// How much space to use, e.g. 500G, 2T, or 'max' (repeatable; pairs with --storage-location; a bare --storage-limit fills the default location)
+    #[arg(long = "storage-limit", help_heading = "Storage")]
     pub storage_limit: Vec<String>,
     /// Single storage location shorthand (equivalent to one --storage-location)
-    #[arg(long)]
+    #[arg(long, help_heading = "Storage")]
     pub storage: Option<PathBuf>,
     /// BitTorrent listen port
-    #[arg(long)]
+    #[arg(long, help_heading = "Network")]
     pub port: Option<u16>,
-    /// Directory for keep-at's own state, logs, and cached metadata
-    /// (duplicate of --data-dir on CommonArgs for convenience)
-    #[arg(long = "cfg-data-dir")]
-    pub cfg_data_dir: Option<PathBuf>,
+    /// Max requests per second to Academic Torrents' own infrastructure
+    #[arg(long, help_heading = "Network")]
+    pub rate_limit: Option<f64>,
+    /// Academic Torrents API key (uid=...;pass=...) - only sent to AT trackers
+    #[arg(long, help_heading = "Network")]
+    pub api_key: Option<String>,
     /// Anti-cascade base (0-1); lower backs off faster as more keep-at nodes join
-    #[arg(long)]
+    #[arg(long, help_heading = "Selection")]
     pub aggressiveness: Option<f64>,
     /// How many fewer seeds a candidate needs before displacing a held torrent
-    #[arg(long)]
+    #[arg(long, help_heading = "Selection")]
     pub min_seed_margin: Option<i32>,
     /// How often to rescan the Academic Torrents catalog (e.g. 168h)
-    #[arg(long, value_parser = parse_duration)]
+    #[arg(long, value_parser = parse_duration, help_heading = "Selection")]
     pub scan_interval: Option<std::time::Duration>,
     /// Minimum torrent age before keep-at will download it
-    #[arg(long, value_parser = parse_duration)]
+    #[arg(long, value_parser = parse_duration, help_heading = "Selection")]
     pub moderation_delay: Option<std::time::Duration>,
-    /// Max requests per second to Academic Torrents' own infrastructure
-    #[arg(long)]
-    pub rate_limit: Option<f64>,
     /// How long a zero-seeder torrent with no progress can sit before removal (0 disables)
-    #[arg(long, value_parser = parse_duration)]
+    #[arg(long, value_parser = parse_duration, help_heading = "Selection")]
     pub stall_eviction_timeout: Option<std::time::Duration>,
     /// Comma-separated keywords to block, matched against title and description
-    #[arg(long)]
+    #[arg(long, help_heading = "Selection")]
     pub keyword_blocklist: Option<String>,
     /// Keep seeding a torrent even if Academic Torrents removes it
-    #[arg(long)]
+    #[arg(long, help_heading = "Selection")]
     pub preserve_deleted_torrents: Option<bool>,
     /// Max RAM to plan around, e.g. 1G (default: 80% of system RAM)
-    #[arg(long)]
+    #[arg(long, help_heading = "Limits")]
     pub max_ram: Option<String>,
-    /// Academic Torrents API key (uid=...;pass=...) - only sent to AT trackers
-    #[arg(long)]
-    pub api_key: Option<String>,
     /// Max upload speed across all torrents, e.g. 50M (default: unlimited)
-    #[arg(long)]
+    #[arg(long, help_heading = "Limits")]
     pub upload_rate_limit: Option<String>,
     /// Max download speed across all torrents, e.g. 20M (default: unlimited)
-    #[arg(long)]
+    #[arg(long, help_heading = "Limits")]
     pub download_rate_limit: Option<String>,
+    /// Directory for keep-at's own state, logs, and cached metadata
+    /// (duplicate of --data-dir on CommonArgs for convenience)
+    #[arg(long = "cfg-data-dir", help_heading = "Logging")]
+    pub cfg_data_dir: Option<PathBuf>,
     /// How often to log a summary; 0 disables periodic summaries
-    #[arg(long, value_parser = parse_duration)]
+    #[arg(long, value_parser = parse_duration, help_heading = "Logging")]
     pub stats_interval: Option<std::time::Duration>,
     /// Verbose diagnostics
-    #[arg(long)]
+    #[arg(long, help_heading = "Logging")]
     pub debug: Option<bool>,
     /// Write logs to PATH instead of stdout (for background daemons)
-    #[arg(long)]
+    #[arg(long, help_heading = "Logging")]
     pub log_file: Option<PathBuf>,
 }
 
@@ -142,9 +148,9 @@ pub struct ServiceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ServiceOp {
-    /// Install a systemd service (Linux, root)
+    /// Install a systemd service (elevates automatically when needed)
     Install(Box<ServiceInstallArgs>),
-    /// Remove the systemd service (Linux, root)
+    /// Remove the systemd service (elevates automatically when needed)
     Uninstall,
 }
 
@@ -250,18 +256,24 @@ impl ConfigArgs {
             cfg.preserve_deleted_torrents = v;
         }
         if let Some(v) = &self.max_ram {
-            cfg.max_ram = config::parse_byte_size(v).with_context(|| "--max-ram")?;
+            let bytes = config::parse_byte_size(v).with_context(|| "--max-ram")?;
+            config::check_bandwidth_limit("--max-ram", bytes).with_context(|| "--max-ram")?;
+            cfg.max_ram = bytes;
         }
         if let Some(v) = &self.api_key {
             cfg.api_key = v.clone();
         }
         if let Some(v) = &self.upload_rate_limit {
-            cfg.upload_rate_limit =
-                config::parse_byte_size(v).with_context(|| "--upload-rate-limit")?;
+            let bytes = config::parse_byte_size(v).with_context(|| "--upload-rate-limit")?;
+            config::check_bandwidth_limit("--upload-rate-limit", bytes)
+                .with_context(|| "--upload-rate-limit")?;
+            cfg.upload_rate_limit = bytes;
         }
         if let Some(v) = &self.download_rate_limit {
-            cfg.download_rate_limit =
-                config::parse_byte_size(v).with_context(|| "--download-rate-limit")?;
+            let bytes = config::parse_byte_size(v).with_context(|| "--download-rate-limit")?;
+            config::check_bandwidth_limit("--download-rate-limit", bytes)
+                .with_context(|| "--download-rate-limit")?;
+            cfg.download_rate_limit = bytes;
         }
         if let Some(v) = self.stats_interval {
             cfg.stats_interval = v;
@@ -276,7 +288,9 @@ impl ConfigArgs {
     }
 
     /// Build storage locations from flags. Combines --storage-location (with
-    /// --storage-limit) and the --storage shorthand.
+    /// --storage-limit) and the --storage shorthand. A bare --storage-limit
+    /// with no location fills the default storage location (documented in
+    /// --storage-limit help); nothing here guesses *how much*, only *where*.
     fn storage_from_flags(&self) -> Result<Vec<StorageLocation>> {
         let mut locs: Vec<StorageLocation> = Vec::new();
         let mut limits = self.storage_limit.iter();
@@ -292,20 +306,26 @@ impl ConfigArgs {
                 limit: StorageLimit::parse(raw)?,
             });
         }
-        if limits.next().is_some() {
-            bail!("--storage-limit given without a matching --storage-location");
-        }
+        let leftover: Vec<String> = limits.cloned().collect();
         if let Some(path) = &self.storage {
             // --storage shorthand pairs with a single --storage-limit.
-            let raw = match self.storage_limit.as_slice() {
-                [single] if self.storage_location.is_empty() => single.clone(),
-                [] => bail!("--storage-limit is required (e.g. --storage-limit 500G, or --storage-limit all)"),
+            let raw = match leftover.as_slice() {
+                [single] => single.clone(),
+                [] => bail!("--storage-limit is required (e.g. --storage-limit 500G, or --storage-limit max)"),
                 _ => bail!("--storage can't be combined with multiple --storage-location/--storage-limit pairs; use --storage-location instead"),
             };
             locs.push(StorageLocation {
                 path: path.clone(),
                 limit: StorageLimit::parse(&raw)?,
             });
+        } else if let [single] = leftover.as_slice() {
+            // Bare --storage-limit: use the default storage location.
+            locs.push(StorageLocation {
+                path: crate::config::default_storage_location(),
+                limit: StorageLimit::parse(single)?,
+            });
+        } else if !leftover.is_empty() {
+            bail!("--storage-limit given without a matching --storage-location (pair each location with its own limit, or use --storage PATH --storage-limit SIZE)");
         }
         Ok(locs)
     }
@@ -359,7 +379,7 @@ pub fn resolve(common: &CommonArgs, args: &ConfigArgs) -> Result<Config> {
         }
         let locs = args.storage_from_flags()?;
         if locs.is_empty() {
-            bail!("--storage-limit is required (e.g. --storage-limit 500G, or --storage-limit all to use a dedicated drive)");
+            bail!("--storage-limit is required (e.g. --storage-limit 500G, or --storage-limit max to use a dedicated drive)");
         }
         cfg.storage = locs;
     } else if !file_loaded && cfg.storage.is_empty() {

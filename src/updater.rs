@@ -81,8 +81,21 @@ pub async fn latest_version(
         .tag_name)
 }
 
+/// Asset arch in the release naming scheme (Go-style GOARCH, matching
+/// scripts/build-release.sh): amd64/arm64/arm/386 — NOT Rust target_arch
+/// (x86_64/aarch64), which names no published asset.
+pub fn asset_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "arm" => "arm",
+        "x86" => "386",
+        other => other,
+    }
+}
+
 fn asset_name() -> String {
-    format!("keep-at_linux_{}.tar.gz", std::env::consts::ARCH)
+    format!("keep-at_linux_{}.tar.gz", asset_arch())
 }
 
 /// Download the matching asset and replace current_exe atomically.
@@ -148,4 +161,28 @@ fn replace_executable(target: &std::path::Path, new_binary: &[u8]) -> Result<()>
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
     std::fs::rename(&tmp, target).with_context(|| format!("replacing {}", target.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asset_arch_matches_release_naming() {
+        // Release assets use Go-style GOARCH (build-release.sh). A mismatch
+        // here breaks self-update on every platform with zero test signal
+        // otherwise (found live: x86_64 vs amd64 on the stable channel).
+        assert_eq!(
+            asset_arch(),
+            match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                "arm" => "arm",
+                "x86" => "386",
+                other => other,
+            }
+        );
+        assert!(asset_name().starts_with("keep-at_linux_"));
+        assert!(asset_name().ends_with(".tar.gz"));
+    }
 }

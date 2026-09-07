@@ -16,9 +16,26 @@ pub const DEFAULT_RATE_LIMIT_PER_SEC: f64 = 0.5;
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_STALL_EVICTION_TIMEOUT: Duration = Duration::from_secs(14 * 24 * 3600);
 
-/// Fraction of a device's total formatted capacity `limit: all` resolves to.
-/// Dedicated data drives only - see the Go config.AllLimitFraction docs.
+/// Fraction of a device's total formatted capacity `limit: max` resolves to.
+/// Dedicated data drives only.
 pub const ALL_LIMIT_FRACTION: f64 = 0.975;
+
+/// Minimum storage limit: below this is certainly a units mistake (e.g.
+/// meaning megabytes but typing a bare number, or a misplaced decimal), not
+/// a real allocation. keep-at refuses to run with less.
+pub const MIN_STORAGE_LIMIT: u64 = 100 * 1024 * 1024; // 100 MiB
+
+/// Below this, a storage limit is probably a units mistake worth warning
+/// about (but not refusing): a GiB-scale node holds almost nothing.
+pub const STORAGE_LIMIT_WARN: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+/// Minimum bandwidth limit: below this is certainly a units mistake, not a
+/// real cap (100 KiB/s cannot usefully seed). keep-at refuses to run slower.
+pub const MIN_BANDWIDTH_LIMIT: u64 = 100 * 1024; // 100 KiB/s
+
+/// Below this, a bandwidth limit is probably a units mistake worth warning
+/// about (but not refusing): sub-MiB/s caps make downloads take days.
+pub const BANDWIDTH_LIMIT_WARN: u64 = 1024 * 1024; // 1 MiB/s
 
 /// Share of system RAM keep-at will ever plan around, regardless of --max-ram.
 pub const SYSTEM_RAM_FRACTION_HARD_CAP: f64 = 0.8;
@@ -61,14 +78,15 @@ where
     S: serde::Serializer,
 {
     match l {
-        StorageLimit::All => s.serialize_str("all"),
+        StorageLimit::All => s.serialize_str("max"),
         StorageLimit::Bytes(b) => s.serialize_str(&format_byte_size(*b)),
         StorageLimit::Unset => s.serialize_str(""),
     }
 }
 
-/// A storage location's space limit: a byte count, or "all" (resolved at
+/// A storage location's space limit: a byte count, or "max" (resolved at
 /// startup to a safe fraction of the device's formatted capacity).
+/// "all" is accepted as a deprecated alias for "max".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageLimit {
     /// No limit parsed yet (zero value of a fresh location - invalid).
@@ -81,7 +99,7 @@ pub enum StorageLimit {
 impl StorageLimit {
     pub fn parse(s: &str) -> Result<Self> {
         let t = s.trim();
-        if t.eq_ignore_ascii_case("all") {
+        if t.eq_ignore_ascii_case("max") || t.eq_ignore_ascii_case("all") {
             return Ok(StorageLimit::All);
         }
         Ok(StorageLimit::Bytes(parse_byte_size(t)?))
@@ -343,6 +361,7 @@ impl Config {
                 }
                 _ => {}
             }
+            check_storage_limit(&loc.path, loc.limit)?;
             if !seen.insert(loc.path.clone()) {
                 bail!(
                     "storage location {} is listed more than once",
@@ -365,6 +384,9 @@ impl Config {
         if self.scan.rate_limit_per_second <= 0.0 {
             bail!("scan.rate_limit_per_second must be positive");
         }
+        check_bandwidth_limit("max_ram", self.max_ram)?;
+        check_bandwidth_limit("upload_rate_limit", self.upload_rate_limit)?;
+        check_bandwidth_limit("download_rate_limit", self.download_rate_limit)?;
         Ok(())
     }
 }
@@ -405,20 +427,28 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 /// Parse "500G", "2T", "50M", "1024", "1.5G" into bytes (binary units).
+/// Rejects empty input, negatives, and unknown suffixes. The error for an
+/// unknown suffix names the valid suffixes AND the `max` keyword, because
+/// the most common failure is typing a limit like "500" (bare bytes, almost
+/// certainly meant as gigabytes) or a typo of "max" — either way the
+/// operator needs to see the keyword exists.
 pub fn parse_byte_size(s: &str) -> Result<u64> {
     let t = s.trim();
     if t.is_empty() {
-        bail!("empty byte size");
+        bail!("empty byte size (e.g. 500G, 2T, or max for a dedicated drive)");
     }
     let split = t
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .unwrap_or(t.len());
     let (num, suffix) = t.split_at(split);
-    let n: f64 = num
-        .parse()
-        .with_context(|| format!("invalid byte size {s:?}"))?;
+    let n: f64 = num.parse().with_context(|| {
+        format!("invalid byte size {s:?} (e.g. 500G, 2T, or max for a dedicated drive)")
+    })?;
     if n < 0.0 {
         bail!("byte size must not be negative: {s:?}");
+    }
+    if num.is_empty() {
+        bail!("byte size {s:?} has no number (e.g. 500G, 2T, or max for a dedicated drive)");
     }
     let mult: f64 = match suffix.trim().to_ascii_uppercase().as_str() {
         "" | "B" => 1.0,
@@ -427,9 +457,56 @@ pub fn parse_byte_size(s: &str) -> Result<u64> {
         "G" | "GB" | "GI" | "GIB" => 1024.0 * 1024.0 * 1024.0,
         "T" | "TB" | "TI" | "TIB" => 1024.0_f64.powi(4),
         "P" | "PB" | "PI" | "PIB" => 1024.0_f64.powi(5),
-        other => bail!("unknown byte-size suffix {other:?} in {s:?}"),
+        other => bail!("unknown byte-size suffix {other:?} in {s:?} (use K/M/G/T/P, a plain byte count, or max for a dedicated drive)"),
     };
     Ok((n * mult) as u64)
+}
+
+/// Check a parsed storage limit against the sanity floors. Rejects
+/// absurdly small limits (<100M, certainly a units mistake); warns on
+/// merely small ones (<1G). `max` (All) always passes.
+pub fn check_storage_limit(path: &std::path::Path, limit: StorageLimit) -> Result<()> {
+    let bytes = match limit {
+        StorageLimit::All | StorageLimit::Unset => return Ok(()),
+        StorageLimit::Bytes(b) => b,
+    };
+    if bytes < MIN_STORAGE_LIMIT {
+        anyhow::bail!(
+            "storage location {} limit {} is under 100M — certainly a units mistake (did you mean gigabytes?). Use max for a dedicated drive, or a limit of at least 100M",
+            path.display(),
+            format_byte_size(bytes),
+        );
+    }
+    if bytes < STORAGE_LIMIT_WARN {
+        tracing::warn!(
+            "storage location {} limit {} is under 1G — it will hold almost nothing; use max for a dedicated drive if that's what you meant",
+            path.display(),
+            format_byte_size(bytes),
+        );
+    }
+    Ok(())
+}
+
+/// Check a parsed bandwidth limit (upload/download/max-ram take the same
+/// byte-size syntax). `0` means unlimited and always passes. Rejects <100K,
+/// warns <1M.
+pub fn check_bandwidth_limit(flag: &str, bytes: u64) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    if bytes < MIN_BANDWIDTH_LIMIT {
+        anyhow::bail!(
+            "{flag} {} is under 100K/s — certainly a units mistake (did you mean megabytes?). Use 0 for unlimited, or at least 100K",
+            format_byte_size(bytes),
+        );
+    }
+    if bytes < BANDWIDTH_LIMIT_WARN {
+        tracing::warn!(
+            "{flag} {} is under 1M/s — downloads will take days at this cap",
+            format_byte_size(bytes),
+        );
+    }
+    Ok(())
 }
 
 pub fn format_byte_size(n: u64) -> String {
@@ -465,8 +542,38 @@ mod tests {
         );
         assert!(parse_byte_size("10X").is_err());
         assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("G").is_err());
         assert_eq!(StorageLimit::parse("all").unwrap(), StorageLimit::All);
         assert_eq!(StorageLimit::parse("ALL").unwrap(), StorageLimit::All);
+        // "max" is the documented keyword; "all" stays as a deprecated alias.
+        assert_eq!(StorageLimit::parse("max").unwrap(), StorageLimit::All);
+        assert_eq!(StorageLimit::parse("MAX").unwrap(), StorageLimit::All);
+    }
+
+    #[test]
+    fn storage_limit_floors() {
+        use std::path::Path;
+        let p = Path::new("/mnt/d1");
+        // Under 100M rejected.
+        assert!(check_storage_limit(p, StorageLimit::Bytes(50 * 1024 * 1024)).is_err());
+        assert!(check_storage_limit(p, StorageLimit::Bytes(99)).is_err());
+        // 100M..1G passes (warns, not asserted here).
+        assert!(check_storage_limit(p, StorageLimit::Bytes(500 * 1024 * 1024)).is_ok());
+        assert!(check_storage_limit(p, StorageLimit::Bytes(2 * 1024 * 1024 * 1024)).is_ok());
+        // max always passes.
+        assert!(check_storage_limit(p, StorageLimit::All).is_ok());
+    }
+
+    #[test]
+    fn bandwidth_limit_floors() {
+        // 0 = unlimited always passes.
+        assert!(check_bandwidth_limit("--upload-rate-limit", 0).is_ok());
+        // Under 100K rejected.
+        assert!(check_bandwidth_limit("--upload-rate-limit", 50 * 1024).is_err());
+        assert!(check_bandwidth_limit("--download-rate-limit", 99).is_err());
+        // 100K..1M and above pass (warns, not asserted here).
+        assert!(check_bandwidth_limit("--upload-rate-limit", 500 * 1024).is_ok());
+        assert!(check_bandwidth_limit("--download-rate-limit", 50 * 1024 * 1024).is_ok());
     }
 
     #[test]
