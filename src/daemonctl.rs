@@ -9,10 +9,11 @@ pub fn pid_path(data_dir: &Path) -> PathBuf {
     data_dir.join("keep-at.pid")
 }
 
-/// Write our PID file (background daemon mode).
+/// Write our PID file (background daemon mode). World-readable: `status`
+/// (any user) reads it to find the daemon.
 pub fn write_pid(data_dir: &Path) -> Result<()> {
     let pid = std::process::id().to_string();
-    std::fs::write(pid_path(data_dir), format!("{pid}\n"))
+    crate::config::atomic_write(pid_path(data_dir).as_path(), pid.as_bytes())
         .with_context(|| format!("writing {}", pid_path(data_dir).display()))
 }
 

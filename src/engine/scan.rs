@@ -535,8 +535,13 @@ impl Engine {
         cfg.validate()?;
         let cfg = storage::resolve_all_limits(&cfg)?;
 
+        // Data dir: traversable by everyone (0o755 masked in) so any user's
+        // `status`/`hosted-torrents` can reach the world-readable snapshots
+        // inside — even when the daemon runs as root with a strict umask.
+        // Repair pass: an existing dir keeps whatever it had, so fix it up.
         std::fs::create_dir_all(&cfg.data_dir)
             .with_context(|| format!("creating data dir {}", cfg.data_dir.display()))?;
+        crate::config::ensure_shared_dirs(&cfg.data_dir);
         for loc in &cfg.storage {
             std::fs::create_dir_all(&loc.path)
                 .with_context(|| format!("creating storage {}", loc.path.display()))?;

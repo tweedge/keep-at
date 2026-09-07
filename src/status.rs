@@ -9,6 +9,10 @@ use crate::netstats;
 
 pub fn cmd_status(args: &CommonArgs) -> Result<()> {
     let dir = crate::cli::resolve_data_dir(args)?;
+    // Best-effort repair: a root-owned data dir from an older/umask-strict
+    // run may block traversal for this user. Repair only helps when WE own
+    // an ancestor (no-op otherwise — never an error).
+    crate::config::ensure_shared_dirs(&dir);
 
     let st = daemonctl::status(&dir);
     if st.running {

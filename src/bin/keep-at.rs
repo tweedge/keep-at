@@ -15,11 +15,22 @@ fn init_logging_to(debug: bool, log_file: Option<&std::path::Path>) {
     let env = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
     if let Some(path) = log_file {
+        // World-readable log: operators tail it without root. Created with
+        // an explicit 0o644 (ignoring umask), same policy as snapshots.
+        use std::os::unix::fs::OpenOptionsExt;
         if let Ok(f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o644)
             .open(path)
         {
+            // Pre-existing log from an older/umask-restricted run: open
+            // read access for everyone (best effort, never fatal).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+            }
             tracing_subscriber::fmt()
                 .with_env_filter(env)
                 .with_target(false)
@@ -148,8 +159,8 @@ async fn cmd_start(cfg: Config, foreground: bool) -> Result<()> {
             tmp_path.to_string_lossy().into_owned(),
         ],
     )?;
-    // Record the daemon PID for stop/status.
-    std::fs::write(keep_at::daemonctl::pid_path(&data_dir), format!("{pid}\n"))?;
+    // Record the daemon PID for stop/status (world-readable: any user).
+    keep_at::daemonctl::write_pid(&data_dir)?;
     println!("keep-at started in the background (pid {pid})");
     Ok(())
 }

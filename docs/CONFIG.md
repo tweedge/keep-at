@@ -46,6 +46,8 @@ Where keep-at keeps its own bookkeeping: persisted state (what it's currently ho
 
 Defaults to `~/.local/share/keep-at` (`/var/lib/keep-at` when `HOME` is unset).
 
+Read-only operations are readable by every local user: `status`, `hosted-torrents`, and the log file work for any user against a daemon owned by anyone (including a root-run service), because snapshots, caches, state files, the PID file, and the log are written world-readable (0o644, umask-independent) and the daemon repairs directory traversal (0o755 masked in) on startup. Writes stay owner-only — a non-owner second `run` against the same data dir fails on permissions, as it should. The one exception is the config file itself (including `/etc/keep-at/config.yaml`): owner-only (0o600), since it may carry the API key.
+
 ## Scanning behavior
 
 ### `scan.interval` / `--scan-interval`
@@ -191,7 +193,7 @@ A few flags control CLI behavior rather than keep-at's own settings, and don't h
 
 ### `log_file` / `--log-file`
 
-*Default: unset (log to stdout).* Write logs to a file instead of standard output. `start` sets this automatically to `<data_dir>/keep-at.log` when you don't pass one (a detached daemon's stdio is discarded, so without a log file its output would go nowhere); `run` in a terminal leaves it on stdout. The systemd unit captures stdout via the journal instead, so it needs no log file.
+*Default: unset (log to stdout).* Write logs to a file instead of standard output. `start` sets this automatically to `<data_dir>/keep-at.log` when you don't pass one (a detached daemon's stdio is discarded, so without a log file its output would go nowhere); `run` in a terminal leaves it on stdout. The systemd unit captures stdout via the journal instead, so it needs no log file. The log file is created world-readable (like the snapshots below) so any local user can tail it.
 
 ### `debug` / `--debug`
 

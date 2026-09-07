@@ -60,15 +60,8 @@ impl Fetcher {
             .with_context(|| format!("reading {url}"))?;
         let md = parse_torrent_bytes(&body)?;
         if let Some(path) = cache_path {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let mut tmp_os = path.as_os_str().to_owned();
-            tmp_os.push(".tmp");
-            let tmp = std::path::PathBuf::from(tmp_os);
-            if std::fs::write(&tmp, &body).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
+            // Best effort; world-readable like every other cache.
+            let _ = crate::config::atomic_write(path, &body);
         }
         Ok((md, body.to_vec()))
     }

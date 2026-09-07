@@ -338,7 +338,8 @@ impl Config {
         }
         let mut out = header.to_string();
         out.push_str(&serde_yaml::to_string(self).context("marshalling config")?);
-        atomic_write(path, out.as_bytes())
+        // Configs may carry the API key (passkey-equivalent): owner-only.
+        atomic_write_mode(path, out.as_bytes(), 0o600)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -412,18 +413,69 @@ fn write_starter_config(path: &Path) -> Result<()> {
 }
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_mode(path, data, 0o644)
+}
+
+/// Atomic write with an explicit file mode, ignoring umask. Read-only
+/// operations (`status`, `hosted-torrents`, `network-status` against cached
+/// files) must work for any local user, so snapshots, caches, and state
+/// files are world-readable (0o644) while the daemon keeps sole write
+/// access. Secrets (API keys in configs) use 0o600 via this same helper —
+/// see `save`.
+pub fn atomic_write_mode(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir)
+            // Directories need +x for traversal: 0o755 regardless of umask,
+            // applied to every level create_dir_all makes (existing levels
+            // keep their modes — see ensure_shared_dirs below for repair).
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o755)
+                .create(dir)
                 .with_context(|| format!("creating directory for {}", path.display()))?;
         }
     }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
+    // OpenOptions with explicit mode: umask cannot strip what we set here
+    // (mode applies at creation; umask only masks it — and 0o644/0o600
+    // survive every sane umask: 022, 027, even 077 for the public files?
+    // NO — umask 077 WOULD strip group/other. So set permissions explicitly
+    // after writing, which ignores umask entirely.)
     std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting mode on {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("finalizing {}", path.display()))?;
+    // rename preserves the temp file's mode; belt-and-suspenders in case a
+    // platform ever copies instead of renaming.
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
     Ok(())
+}
+
+/// Walk up from `dir`, ensuring every existing level is at least
+/// owner-rwx + group/other rx (0o755 masked in, never stripped), so a data
+/// dir created earlier under a restrictive umask (or by root's 077 default)
+/// still lets other users traverse to the world-readable snapshots inside.
+/// Stops at filesystem boundaries it can't change (errors ignored past the
+/// first failure — best effort, never fatal).
+pub fn ensure_shared_dirs(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        match std::fs::metadata(d) {
+            Ok(m) => {
+                let mode = m.permissions().mode() & 0o777;
+                let fixed = mode | 0o755;
+                if fixed != mode {
+                    let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(fixed));
+                }
+            }
+            Err(_) => break,
+        }
+        cur = d.parent().filter(|p| !p.as_os_str().is_empty());
+    }
 }
 
 /// Parse "500G", "2T", "50M", "1024", "1.5G" into bytes (binary units).
@@ -580,5 +632,61 @@ mod tests {
     fn validate_rejects_empty_storage() {
         let cfg = Config::default();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn shared_files_world_readable_despite_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        // Simulate a root-like restrictive umask: even under 077, snapshot
+        // writes must land world-readable (status/hosted-torrents run as
+        // any user against a possibly-root-owned data dir).
+        let dir = std::env::temp_dir().join(format!("keep-at-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: umask is process-global; tests run threads sharing it.
+        // Save, set 077, restore immediately after the writes under test.
+        let old = libc_umask(0o077);
+        let p = dir.join("sub").join("runtime-stats.json");
+        atomic_write(&p, b"{}").unwrap();
+        ensure_shared_dirs(&dir.join("sub"));
+        libc_umask(old);
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "snapshot world-readable under umask 077");
+        let dmode = std::fs::metadata(dir.join("sub"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dmode & 0o755, 0o755, "dirs traversable by everyone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn configs_stay_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("keep-at-cfgmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            storage: vec![StorageLocation {
+                path: dir.join("storage"),
+                limit: StorageLimit::Bytes(200 * 1024 * 1024),
+            }],
+            api_key: "uid=1;pass=secret".to_string(),
+            ..Config::default()
+        };
+        let path = dir.join("keep-at.yaml");
+        cfg.save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config with possible API key is owner-only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    unsafe extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
+
+    // `unsafe_op_in_unsafe_fn` style: the wrapper is safe (umask only sets
+    // the process mask and returns the old one), so callers need no block.
+    fn libc_umask(mask: u32) -> u32 {
+        unsafe { umask(mask) }
     }
 }

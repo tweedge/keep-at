@@ -158,15 +158,9 @@ fn cache_age(path: &Path) -> Option<Duration> {
 }
 
 fn atomic_cache_write(path: &Path, data: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // World-readable like every other cache/snapshot (status and
+    // hosted-torrents read as any user).
+    crate::config::atomic_write(path, data)
 }
 
 #[cfg(test)]

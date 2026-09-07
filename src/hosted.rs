@@ -12,6 +12,8 @@ use crate::state::State;
 
 pub fn cmd_hosted(args: &CommonArgs) -> Result<()> {
     let dir = crate::cli::resolve_data_dir(args)?;
+    // Same traversal repair as status (read-only op, any user).
+    crate::config::ensure_shared_dirs(&dir);
     let st = State::load(&dir.join("state.json"))?;
     let held = st.all();
     if held.is_empty() {
