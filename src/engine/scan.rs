@@ -60,6 +60,10 @@ pub struct Engine {
     rate: Arc<tokio::sync::Mutex<RateLimiter>>,
     evaluated_counts: tokio::sync::Mutex<Vec<u32>>,
     last_scan: tokio::sync::Mutex<Option<LastScanStats>>,
+    /// Infohashes already fully downloaded the last time completions were
+    /// reported. Diffed on every runtime-stats pass so each completion logs
+    /// exactly one `download completed` line (see log_and_save_runtime).
+    completed_seen: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Counters from the most recent scan, for tests and status callers.
@@ -622,6 +626,7 @@ impl Engine {
             })),
             evaluated_counts: tokio::sync::Mutex::new(Vec::new()),
             last_scan: tokio::sync::Mutex::new(None),
+            completed_seen: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
         eng.blocklist = KeywordBlocklist::new(eng.cfg.keyword_blocklist.clone());
         {
@@ -670,6 +675,12 @@ impl Engine {
         let stats_interval = self.cfg.stats_interval;
         let mut scan_interval =
             tokio::time::interval(self.cfg.scan.interval.max(Duration::from_secs(60)));
+        // Consume the immediate first tick: tokio intervals fire at once on
+        // creation, which would otherwise launch a second full scan the
+        // instant the initial scan finishes (observed live: two back-to-back
+        // full catalog walks per boot, doubling AT load for no reason).
+        // The cadence starts counting after the initial scan completes.
+        scan_interval.tick().await;
 
         self.run_scan_logged("initial", shutdown.clone()).await;
         self.log_and_save_runtime("post-initial-scan");
@@ -1448,6 +1459,13 @@ impl Engine {
                 .await;
             if ok {
                 for h in &displaced {
+                    tracing::info!(
+                        "swapped out displaced torrent (title={} seeders={} size={} for candidate={})",
+                        h.title,
+                        h.last_known_seeders,
+                        crate::humanize::human_bytes(h.size_bytes as i64),
+                        c.title,
+                    );
                     let out_dir =
                         engtorrents::torrent_output_dir(&h.storage_location, &h.info_hash);
                     if let Err(e) =
@@ -1505,6 +1523,9 @@ impl Engine {
             if *shutdown.borrow() {
                 tracing::info!("held refresh interrupted by shutdown ({done}/{total})");
                 break;
+            }
+            if done % 25 == 0 {
+                tracing::info!("refreshing held seeder counts ({done}/{total})");
             }
             let hex = h.info_hash.clone();
             let md = match self.fetch_metadata(&hex).await {
@@ -1587,7 +1608,11 @@ impl Engine {
     async fn resume_held(&mut self) -> Result<()> {
         let held = self.state.all();
         tracing::info!("resuming {} held torrents", held.len());
-        for h in held {
+        let total = held.len();
+        for (done, h) in held.into_iter().enumerate() {
+            if done % 25 == 0 {
+                tracing::info!("resuming held torrents ({done}/{total})");
+            }
             let out_dir = engtorrents::torrent_output_dir(&h.storage_location, &h.info_hash);
             // Parse-then-drop: raw bytes are freed before the blocking add,
             // so resume never holds more than one .torrent in memory.
@@ -1625,15 +1650,43 @@ impl Engine {
 
     fn log_and_save_runtime(&self, kind: &str) {
         let held = self.state.all();
+        let by_hash: std::collections::HashMap<String, &state::Torrent> =
+            held.iter().map(|t| (t.info_hash.clone(), t)).collect();
         let seeding = std::cell::Cell::new(0usize);
+        let finished_now = std::cell::RefCell::new(Vec::<String>::new());
         self.session.with_torrents(|it| {
             for (_, h) in it {
                 if h.stats().finished {
                     seeding.set(seeding.get() + 1);
+                    finished_now.borrow_mut().push(h.info_hash().as_string());
                 }
             }
         });
         let seeding = seeding.get();
+        // One info line per newly completed download (titles + sizes from
+        // state; unknown hashes are session-managed but untracked, e.g.
+        // census probes - those never log here).
+        if let Ok(mut seen) = self.completed_seen.lock() {
+            for hex in finished_now.borrow().iter() {
+                if seen.insert(hex.clone()) {
+                    match by_hash.get(hex) {
+                        Some(t) => tracing::info!(
+                            "download completed (title={} size={})",
+                            t.title,
+                            crate::humanize::human_bytes(t.size_bytes as i64),
+                        ),
+                        None => {
+                            tracing::info!("download completed (infohash={} not in state)", hex)
+                        }
+                    }
+                }
+            }
+            // Forget hashes no longer managed, so a re-added torrent logs
+            // again on its next completion instead of staying silent.
+            let live: std::collections::HashSet<String> =
+                finished_now.borrow().iter().cloned().collect();
+            seen.retain(|h| live.contains(h));
+        }
         let locs: Vec<(PathBuf, u64)> = self
             .cfg
             .storage

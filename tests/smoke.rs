@@ -64,6 +64,14 @@ fn test_config(data_dir: PathBuf, storage_dir: PathBuf, port: u16, rate: f64) ->
     };
     cfg.scan.moderation_delay = Duration::ZERO;
     cfg.scan.rate_limit_per_second = rate;
+    // Force the seed-scarcity gate open: live fixture seeder counts drift
+    // between runs (observed 3 one day, 5 the next), and the test asserts a
+    // selection outcome - at the default 0.6 a high-seeder fixture day can
+    // fail the roll and flake the test. chance = aggr^max(0,seeders-floor):
+    // at 0.999999 even a 100-seeder fixture passes with p ~= 1. The gate
+    // itself is covered by selector unit tests; the smoke test proves the
+    // pipeline (fetch -> scrape -> add -> download), not the gate math.
+    cfg.aggressiveness = 0.999999;
     if let Ok(k) = std::env::var("KEEPAT_API_KEY") {
         if !k.is_empty() {
             cfg.api_key = k;
