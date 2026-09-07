@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.3-beta - IPv4-only TCP listener (restart fix, part 2)
+
+This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
+
+### The TCP listener had the same dualstack problem as DHT
+
+v0.8.2 moved DHT to IPv4-only sockets, but the TCP listen socket still defaulted to dualstack `[::]:port` - and on the production host it failed with the same `EADDRINUSE` on restart. `ListenerOptions.ipv4_only` is now set alongside the session-level flag, so every socket keep-at opens binds `0.0.0.0`. Same rationale, same (non-)effect on connectivity: Academic Torrents trackers and peers are overwhelmingly IPv4.
+
 ## v0.8.2-beta - restart reliably: IPv4 sockets + session retry
 
 This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
