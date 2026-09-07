@@ -7,6 +7,11 @@ on:
   push:
   pull_request:
 
+# Least privilege: CI only reads the repo (checkout) and runs local checks.
+# (The release workflow needs contents:write to publish; this one must not.)
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
