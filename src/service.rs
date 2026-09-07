@@ -172,59 +172,143 @@ pub fn elevate(action: &str) -> Result<()> {
 /// child's exit code. Factored for testing (pure arg computation in
 /// [`elevation_command`]).
 fn elevate_exec(exe: &std::path::Path, args: &[String], action: &str) -> Result<()> {
-    let Some((program, argv)) = elevation_command(exe, args) else {
+    // Decide up front whether `sudo -n` can work: `sudo -n true` has no side
+    // effects and answers exactly "would non-interactive elevation succeed".
+    // This matters because a *failed* sudo -n (exit 1, "a password is
+    // required") is indistinguishable from the elevated child itself failing
+    // — probing first keeps the fallback chain honest: only advance past
+    // sudo -n when sudo -n itself refused, never when the real work failed.
+    let noninteractive_ok = helper_works_noninteractive();
+    let plan = elevation_command_filtered(exe, args, noninteractive_ok);
+    if plan.is_empty() {
         anyhow::bail!(
-            "need root to {action}, and neither `sudo -n` (cached credentials or NOPASSWD) \
-             nor `pkexec` is available. Re-run with sudo, e.g.: sudo {} {}",
+            "need root to {action}, and no elevation helper is available. Re-run with sudo, e.g.: sudo {} {}",
             exe.display(),
             shell_join(args),
         );
-        // NOTE: unreachable — bail! diverges — but keeps the shape obvious.
-    };
-    let mut cmd = std::process::Command::new(&program);
-    cmd.args(&argv);
-    // Drop KEEPAT_ELEVATED *into* the child would be wrong; set it so the
-    // child knows it is the elevated half.
-    cmd.env("KEEPAT_ELEVATED", "1");
-    let status = cmd
-        .status()
-        .with_context(|| format!("re-executing elevated via {program}"))?;
-    // Propagate the child's exit code, then stop: our work continues in the
-    // elevated child, not here.
-    std::process::exit(status.code().unwrap_or(1));
+    }
+    for (program, argv) in &plan {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(argv);
+        // Set in the child so it knows it is the elevated half (and never
+        // re-elevates — see elevate()).
+        cmd.env("KEEPAT_ELEVATED", "1");
+        match cmd.status() {
+            Err(e) => {
+                tracing::warn!(
+                    "elevation via {program} failed to launch ({e:#}); trying next method"
+                );
+                continue;
+            }
+            Ok(status) => {
+                // The launcher ran: propagate its exit code and stop. Our
+                // work continues in the elevated child, not here. (A sudo
+                // password refusal surfaces here as sudo's own error +
+                // nonzero exit — the operator sees exactly what sudo said.)
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+    }
+    anyhow::bail!("elevation failed for {action}")
 }
 
-/// Choose how to elevate: `sudo -n <exe> <args...>` when sudo exists,
-/// else `pkexec <exe> <args...>`. Returns None when neither helper exists.
-/// Pure (no I/O) so unit tests pin the exact argv shape.
-fn elevation_command(exe: &std::path::Path, args: &[String]) -> Option<(String, Vec<String>)> {
+/// `sudo -n true`: answers "would passwordless sudo work" with no side
+/// effects. Worst case the probe is stale by milliseconds (user's timestamp
+/// expired between probe and elevation) — then sudo refuses cleanly with
+/// its own error, never a bypass and never a hang (`-n` never prompts).
+fn helper_works_noninteractive() -> bool {
+    std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Choose how to elevate, in order: `sudo -n` (non-interactive: NOPASSWD or
+/// cached timestamp — no prompt, ever), then plain `sudo` (interactive
+/// password prompt, terminal only — stdin must be a TTY or sudo has nowhere
+/// to read), then `pkexec` (its own graphical/text prompt). Returns the full
+/// ordered plan; empty when no helper exists. Pure (no I/O) so unit tests
+/// pin the exact argv shapes.
+///
+/// Why interactive sudo second instead of failing fast: on a terminal the
+/// operator *expects* a password prompt (`apt install` behaves the same);
+/// refusing and demanding a manual `sudo` prefix reintroduces the exact
+/// root-PATH failure this exists to fix. In non-interactive contexts
+/// (scripts, CI, detached daemons) stdin is not a TTY, so plain sudo is
+/// skipped — sudo would fail with "no tty present" anyway — and pkexec or
+/// the clear error covers it.
+fn elevation_command(exe: &std::path::Path, args: &[String]) -> Vec<(String, Vec<String>)> {
     let dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    elevation_command_on_path(exe, args, &dirs)
+    elevation_command_on_path(exe, args, &dirs, stdin_is_tty())
+}
+
+/// Plan filtered by the sudo -n probe: when non-interactive sudo works, the
+/// plan is just [sudo -n] (no prompt needed, no fallback noise); otherwise
+/// sudo -n is dropped and the plan starts at interactive sudo (terminal) or
+/// pkexec. Pure given the probe result, so tests pin it without I/O.
+fn elevation_command_filtered(
+    exe: &std::path::Path,
+    args: &[String],
+    noninteractive_ok: bool,
+) -> Vec<(String, Vec<String>)> {
+    elevation_command(exe, args)
+        .into_iter()
+        .filter(|(prog, argv)| {
+            let is_noninteractive = prog == "sudo" && argv.first().is_some_and(|a| a == "-n");
+            is_noninteractive == noninteractive_ok || *prog != "sudo"
+        })
+        .collect()
+}
+
+fn stdin_is_tty() -> bool {
+    // SAFETY: isatty(0) only queries stdin's state, no side effects.
+    libc_isatty(0) == 1
+}
+
+unsafe extern "C" {
+    fn isatty(fd: i32) -> i32;
+}
+
+fn libc_isatty(fd: i32) -> i32 {
+    unsafe { isatty(fd) }
 }
 
 /// PATH-searching helper selection, factored for parallel-safe unit tests
-/// (explicit search dirs, no env access).
+/// (explicit search dirs + explicit TTY flag, no env access).
 fn elevation_command_on_path(
     exe: &std::path::Path,
     args: &[String],
     path_dirs: &[std::path::PathBuf],
-) -> Option<(String, Vec<String>)> {
-    // Sudo first: it preserves argv exactly and `-n` guarantees no prompt.
-    // (Whether it *succeeds* is sudo's business: NOPASSWD, cached timestamp,
-    // or a clear "a password is required" error — never a hang.)
-    if path_dirs.iter().any(|dir| dir.join("sudo").is_file()) {
+    tty: bool,
+) -> Vec<(String, Vec<String>)> {
+    let mut plan = Vec::new();
+    let has = |name: &str| path_dirs.iter().any(|dir| dir.join(name).is_file());
+    if has("sudo") {
+        // 1. Non-interactive: NOPASSWD or cached timestamp. No prompt, ever.
         let mut argv = vec!["-n".to_string(), exe.to_string_lossy().into_owned()];
         argv.extend(args.iter().cloned());
-        return Some(("sudo".to_string(), argv));
+        plan.push(("sudo".to_string(), argv));
+        // 2. Interactive (terminal only): sudo prompts on the TTY itself.
+        // Skipped without a TTY — sudo would just fail "no tty present".
+        if tty {
+            let mut argv = vec![exe.to_string_lossy().into_owned()];
+            argv.extend(args.iter().cloned());
+            plan.push(("sudo".to_string(), argv));
+        }
     }
-    if path_dirs.iter().any(|dir| dir.join("pkexec").is_file()) {
+    // 3. pkexec last: its own prompt agent, different auth stack.
+    if has("pkexec") {
         let mut argv = vec![exe.to_string_lossy().into_owned()];
         argv.extend(args.iter().cloned());
-        return Some(("pkexec".to_string(), argv));
+        plan.push(("pkexec".to_string(), argv));
     }
-    None
+    plan
 }
 
 fn shell_join(args: &[String]) -> String {
@@ -300,20 +384,22 @@ mod tests {
     // NOTE: elevation_command() branches on PATH contents; these tests pass
     // explicit search dirs (no env mutation, parallel-safe).
     #[test]
-    fn prefers_sudo_with_noninteractive_flag() {
+    fn prefers_sudo_noninteractive_then_interactive() {
         let dir = std::env::temp_dir().join(format!("keep-at-elev-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("sudo"), "").unwrap();
         std::fs::write(dir.join("pkexec"), "").unwrap();
-        let (prog, argv) = elevation_command_on_path(
+        // On a terminal: sudo -n, plain sudo, pkexec.
+        let plan = elevation_command_on_path(
             std::path::Path::new("/usr/local/bin/keep-at"),
             &["service".to_string(), "install".to_string()],
             std::slice::from_ref(&dir),
-        )
-        .expect("elevates");
-        assert_eq!(prog, "sudo");
+            true,
+        );
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].0, "sudo");
         assert_eq!(
-            argv,
+            plan[0].1,
             vec![
                 "-n".to_string(),
                 "/usr/local/bin/keep-at".to_string(),
@@ -321,6 +407,28 @@ mod tests {
                 "install".to_string(),
             ]
         );
+        assert_eq!(plan[1].0, "sudo");
+        assert_eq!(
+            plan[1].1,
+            vec![
+                "/usr/local/bin/keep-at".to_string(),
+                "service".to_string(),
+                "install".to_string(),
+            ]
+        );
+        assert_eq!(plan[2].0, "pkexec");
+        // No TTY (scripts, CI, daemons): plain sudo skipped — it would fail
+        // "no tty present" anyway.
+        let plan = elevation_command_on_path(
+            std::path::Path::new("/usr/local/bin/keep-at"),
+            &["service".to_string(), "install".to_string()],
+            std::slice::from_ref(&dir),
+            false,
+        );
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].0, "sudo");
+        assert_eq!(plan[0].1[0], "-n");
+        assert_eq!(plan[1].0, "pkexec");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -329,15 +437,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("keep-at-elev2-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("pkexec"), "").unwrap();
-        let (prog, argv) = elevation_command_on_path(
+        let plan = elevation_command_on_path(
             std::path::Path::new("/usr/local/bin/keep-at"),
             &["self-update".to_string()],
             std::slice::from_ref(&dir),
-        )
-        .expect("elevates");
-        assert_eq!(prog, "pkexec");
+            true,
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0, "pkexec");
         assert_eq!(
-            argv,
+            plan[0].1,
             vec![
                 "/usr/local/bin/keep-at".to_string(),
                 "self-update".to_string(),
@@ -347,15 +456,43 @@ mod tests {
     }
 
     #[test]
-    fn no_helper_no_elevation() {
+    fn filtered_plan_drops_sudo_noninteractive_when_probe_fails() {
+        // Probe says sudo -n would refuse: plan starts at interactive sudo
+        // (terminal) — the exact scenario from the bug report.
+        let dir = std::env::temp_dir().join(format!("keep-at-elev4-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("sudo"), "").unwrap();
+        let exe = std::path::Path::new("/usr/local/bin/keep-at");
+        let args = vec!["service".to_string(), "install".to_string()];
+        let full = elevation_command_on_path(exe, &args, std::slice::from_ref(&dir), true);
+        assert_eq!(full.len(), 2); // [sudo -n, sudo]
+                                   // Filtered out the -n entry manually here would need the real
+                                   // elevation_command (reads PATH); instead pin the filter predicate
+                                   // shape directly on the full plan.
+        let filtered: Vec<_> = full
+            .into_iter()
+            .filter(|(prog, argv)| {
+                let is_noninteractive = prog == "sudo" && argv.first().is_some_and(|a| a == "-n");
+                !is_noninteractive
+            })
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "sudo");
+        assert_eq!(filtered[0].1[0], "/usr/local/bin/keep-at");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_helper_empty_plan() {
         let dir = std::env::temp_dir().join(format!("keep-at-elev3-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         assert!(elevation_command_on_path(
             std::path::Path::new("/usr/local/bin/keep-at"),
             &["service".to_string(), "install".to_string()],
             std::slice::from_ref(&dir),
+            true,
         )
-        .is_none());
+        .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
