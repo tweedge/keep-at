@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.1-beta - decision-gate debug tracing
+
+This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
+
+### Decision gates traceable at debug level, no special build needed
+
+A month-long production test (3.8 TB / 8 GB node) showed that a scan can evaluate hundreds of candidates with zero adds and leave no trace of why: seed-scarcity roll failures on an empty node are deliberately silent at info level. Three `debug!` lines now cover the gates - candidate eligibility (seeders, size, pieces), roll failure (chance vs roll), and swap consideration (locations, held count). Enable on any live node with `RUST_LOG=keep_at::engine=debug` (or `debug: true`); zero cost when disabled. No behavior change in this release.
+
 ## v0.8.0-beta - the Rust build, on rqbit
 
 This is a beta release for field validation of the rewrite below; the next stable cut will be identical apart from the version tag.

@@ -1,6 +1,6 @@
 [package]
 name = "keep-at"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "A smart node that seeds Academic Torrents"
 license = "MIT"
