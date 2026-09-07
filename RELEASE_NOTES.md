@@ -1,5 +1,37 @@
 # keep-at release notes
 
+## v0.8.7-beta - no-sudo elevation, grouped help, max keyword, byte-size linting, updater fixes
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### Privilege elevation without a sudo prefix
+
+`service install`/`uninstall` and `self-update` (on a root-owned binary) now re-execute keep-at elevated on their own: `sudo -n` with the absolute binary path first (cached credentials or NOPASSWD; `-n` fails instead of prompting, never hangs), `pkexec` fallback, clear re-run-with-sudo instructions if neither exists. This also fixes the classic failure where keep-at is on the user's PATH but not root's - the binary is located by its own absolute path, never by PATH lookup - and `systemctl` is now invoked by absolute path for the same reason. Elevation exists only in these two paths (guarded against re-elevation loops); scans and network commands never elevate.
+
+### Storage flags that actually work, help grouped by purpose
+
+`--storage PATH` pairs with one `--storage-limit` (previously a hard error), and a bare `--storage-limit` fills the default location (also previously a hard error). `run --help` groups flags by purpose - Storage, Network, Selection, Limits, Logging, most-changed first - instead of alphabetically.
+
+### `limit: max` replaces `limit: all`
+
+The dedicated-drive keyword is now `max` (`--storage-limit max`, `limit: max`); `all` still parses as a deprecated alias and serializes back as `max`. All docs, comments, and log lines updated.
+
+### Byte-size linting against units mistakes
+
+Storage limits under 100M are rejected (certainly a units mistake - did you mean gigabytes?), under 1G warn; bandwidth caps (upload/download/max-ram) under 100K rejected, under 1M warn, enforced on both CLI and config-file paths. Every byte-size parse error now names the valid suffixes and the `max` keyword, so a typo like `500X` tells you `max` exists instead of leaving you guessing.
+
+### Self-update repairs found live
+
+Release assets use Go-style GOARCH (`amd64`), but the updater looked for Rust arch (`x86_64`) - self-update was broken on every platform. Fixed and pinned by test. The stable channel also offered downgrades (running 0.8.6-beta "updating" to stable 0.7.2); it now refuses and suggests `--beta` instead.
+
+### Diagnosability batch from the production test
+
+Download completions log one info line each (title + size); swap displacement logs the evicted title/seeders/size with its candidate; held-refresh and resume log progress every 25 torrents (closing a 70-minute silent resume gap); the run loop consumes tokio's immediate first interval tick so a boot runs one scan instead of two back-to-back. The fast smoke test forces the seed-scarcity gate open (live fixture seeder counts drifted 3 to 5 between runs and flaked the hold assert).
+
+### Hermetic integration suite
+
+21 integration tests across 8 files plus a shared local-stub fixture (catalog server, synthetic torrents, canned scrapes - no live network): selection gate, swap economics, nominal-plus-buffer accounting regression, stall/deleted maintenance, resume + shutdown promptness, tracker discipline with injectable 429 backoff, CLI contract, and two-session byte transfer. CI runs the full suite (`cargo test --locked`); `docs/TESTING.md` documents the three tiers and expectations. Writing the suite caught three production-code bugs: dotted-quad tracker truncation, empty-scan floor clobbering, and the non-injectable backoff.
+
 ## v0.8.6-beta - fix storage over-commit: price held nominal, not on-disk actuals
 
 This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
