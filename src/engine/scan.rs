@@ -42,7 +42,7 @@ pub struct Engine {
     session: Arc<Session>,
     api: Api,
     state: State,
-    swarm_cache: std::sync::Mutex<SwarmCache>,
+    swarm_cache: Arc<std::sync::Mutex<SwarmCache>>,
     blocklist: KeywordBlocklist,
     http: reqwest::Client,
     catalog: atcatalog::Fetcher,
@@ -163,6 +163,170 @@ fn add_into(dst: &ScanStats, src: &ScanStats) {
 
 /// Arc-owned evaluation context: everything evaluate_one_item needs, without
 /// borrowing the Engine across spawned tasks.
+/// Owned inputs for one evaluation walk. Lets the evaluation task run
+/// without borrowing the Engine while the scan's consume loop acts.
+/// The swarm cache is shared by Arc (not reloaded): inserts made by
+/// evaluation workers are visible to the Engine immediately, and the Engine
+/// saves it at scan end as before.
+struct EvaluationDispatch {
+    ctx: Arc<EvalCtx>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    items: Vec<atcatalog::Item>,
+    held_hashes: HashSet<String>,
+    scan_started_at: DateTime<Utc>,
+    total_candidates: u64,
+    max_fittable: u64,
+    blocklist: KeywordBlocklist,
+    swarm_cache: Arc<std::sync::Mutex<SwarmCache>>,
+    network_stats_path: PathBuf,
+}
+
+/// Drive one evaluation walk to completion, streaming each eligible
+/// candidate over `emit` as it completes. Merges the shared stat counters
+/// into `stats` at the end (atomics - safe across tasks).
+async fn run_evaluation(
+    dispatch: EvaluationDispatch,
+    emit: tokio::sync::mpsc::UnboundedSender<Evaluated>,
+    stats: Arc<ScanStats>,
+) {
+    let EvaluationDispatch {
+        ctx,
+        shutdown,
+        items,
+        held_hashes,
+        scan_started_at,
+        total_candidates,
+        max_fittable,
+        blocklist,
+        swarm_cache: shared_cache,
+        network_stats_path,
+    } = dispatch;
+    // `stats` is the caller-shared accumulator (Arc<ScanStats>, all-atomics).
+    // Workers record into it directly; the pre-filter records locally and
+    // merges at the end.
+    let prefilter = ScanStats::default();
+
+    let sem = Arc::new(Semaphore::new(EVALUATE_CONCURRENCY));
+    let processed = Arc::new(AtomicU64::new(0));
+
+    // Progress saver (same as before: persists processed counts every 2s).
+    let stats_path = network_stats_path;
+    let seeder_floor = netstats::load_snapshot(&stats_path)
+        .map(|s| s.seeder_floor)
+        .unwrap_or(0);
+    let prog_processed = processed.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let progress_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PROGRESS_SAVE_INTERVAL);
+        loop {
+            tick.tick().await;
+            if stop2.load(Ordering::Relaxed) {
+                break;
+            }
+            let _ = netstats::save_snapshot(
+                &stats_path,
+                &Snapshot {
+                    scan_started_at: Some(scan_started_at),
+                    scan_completed_at: None,
+                    total_candidates,
+                    processed_candidates: prog_processed.load(Ordering::Relaxed),
+                    seeder_floor,
+                },
+            );
+        }
+    });
+
+    // Pre-filter (cheap, synchronous): held / blocked / too-big never even
+    // reach the worker pool. Skipped-held/blocked/too-big counters merge
+    // into stats at the end via add_into below... they are recorded on
+    // `stats` directly here (same task tree, no race beyond atomics).
+    let mut pending: Vec<atcatalog::Item> = Vec::new();
+    for item in &items {
+        if *shutdown.borrow() {
+            break;
+        }
+        let hex = hex::encode(item.info_hash);
+        if held_hashes.contains(&hex) {
+            prefilter.skipped_held.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if blocklist.blocks(&item.title, &item.description).is_some() {
+            prefilter.skipped_blocked.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if max_fittable > 0 && item.size_bytes > max_fittable {
+            prefilter.skipped_too_big.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        pending.push(item.clone());
+    }
+
+    let tx2 = emit.clone();
+    let mut handles = Vec::new();
+    for chunk in pending.chunks(EVALUATE_CONCURRENCY * 4) {
+        if *shutdown.borrow() {
+            break;
+        }
+        let chunk = chunk.to_vec();
+        let sem = sem.clone();
+        let tx = tx2.clone();
+        let processed = processed.clone();
+        let ctx = ctx.clone();
+        let shared_cache = shared_cache.clone();
+        let stats_outer = stats.clone();
+        handles.push(tokio::spawn(async move {
+            let mut inner = Vec::new();
+            for item in chunk {
+                let permit = sem.clone().acquire_owned().await;
+                let tx = tx.clone();
+                let processed = processed.clone();
+                let ctx = ctx.clone();
+                let shared_cache = shared_cache.clone();
+                let stats = stats_outer.clone();
+                inner.push(tokio::spawn(async move {
+                    let _permit = permit;
+                    let r = evaluate_one_item(&ctx, &shared_cache, &item, &stats).await;
+                    processed.fetch_add(1, Ordering::Relaxed);
+                    if let Some(ev) = r {
+                        let _ = tx.send(ev);
+                    }
+                }));
+            }
+            for h in inner {
+                let _ = h.await;
+            }
+        }));
+    }
+    drop(tx2);
+    // Dispatch tasks run detached: results stream to the caller over the
+    // channel as they complete. Abandoned tasks on shutdown finish in the
+    // background; their sends fail silently once the caller drops the
+    // receiver. Await the dispatchers (not the per-item workers - those are
+    // joined by their dispatcher) so the progress task and merges below
+    // run after dispatch, while the caller keeps consuming.
+    //
+    // Shutdown-abort: don't await wedged dispatchers forever; the caller's
+    // consume loop bails on shutdown independently, and drops the receiver.
+    let mut sd = shutdown.clone();
+    tokio::select! {
+        _ = async {
+            for h in handles {
+                let _ = h.await;
+            }
+        } => {}
+        _ = sd.changed() => {}
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = progress_task.await;
+    drop(emit);
+    // Merge pre-filter counters into the caller's scan stats (workers wrote
+    // theirs directly into the shared accumulator).
+    add_into(&stats, &prefilter);
+    // No Engine-cache merge needed: workers inserted directly into the
+    // shared Engine cache via Arc (visible immediately, saved at scan end).
+}
+
 #[derive(Clone)]
 struct EvalCtx {
     data_dir: PathBuf,
@@ -441,7 +605,7 @@ impl Engine {
             session,
             api,
             state,
-            swarm_cache: std::sync::Mutex::new(swarm_cache),
+            swarm_cache: Arc::new(std::sync::Mutex::new(swarm_cache)),
             blocklist: KeywordBlocklist::new(Vec::new()),
             http,
             catalog,
@@ -641,7 +805,8 @@ impl Engine {
         }
         tracing::info!("starting scrape: fetching torrent metadata and tracker data for every pending catalog candidate ({total_candidates} total)");
 
-        let stats = ScanStats::default();
+        // Shared with the spawned evaluation task (all-atomics: Sync).
+        let stats = Arc::new(ScanStats::default());
         let mut library_bytes = 0u64;
         for item in &items {
             library_bytes += item.size_bytes;
@@ -649,50 +814,111 @@ impl Engine {
         stats.library_bytes.store(library_bytes, Ordering::Relaxed);
 
         let scrape_started = std::time::Instant::now();
-        // Incremental acting: evaluate the walk, then act over its output in
-        // arrival-sized batches to preserve the windowing behavior below.
-        // (evaluate_candidates buffers the whole walk before returning;
-        // true streaming is future work - the batching still bounds each
-        // re-rank to EVALUATE_CONCURRENCY arrivals plus a final flush.)
+        // TRUE incremental acting: evaluation streams results over a channel
+        // as each completes, and this loop acts on the top window every 16
+        // arrivals - the most urgent torrents start seeding within minutes,
+        // not after the whole catalog is walked.
+        //
+        // evaluate_candidates only needs shared (&self) state - internally
+        // everything crossing spawn boundaries is Arc-owned (EvalCtx,
+        // swarm_cache Mutex, rate Mutex) - but its future still borrows
+        // &self, which conflicts with acting's &mut self. Resolve by
+        // snapshotting the shared inputs into an owned dispatch bundle and
+        // running evaluation as a free function on a spawned task; the
+        // consume loop below keeps &mut self free for acting.
         let mut acted: HashSet<String> = HashSet::new();
         let mut held_count = self.state.all().len();
         let mut batch: Vec<Evaluated> = Vec::new();
         let mut processed = 0u64;
-        let evaluated_all = self
-            .evaluate_candidates(
-                &shutdown,
-                &items,
-                &held_hashes,
-                scan_started_at,
-                total_candidates,
-                &stats,
-                max_fittable,
-            )
-            .await;
+        let (emit_tx, mut emit_rx) = tokio::sync::mpsc::unbounded_channel::<Evaluated>();
+        // Fresh floor accumulator for this scan. evaluated_counts is a
+        // tokio Mutex (not Clone): wrap in an Arc for the consume loop.
+        *self.evaluated_counts.lock().await = Vec::new();
+        let floor_accum = Arc::new(tokio::sync::Mutex::new(Vec::<u32>::new()));
+        let dispatch = self.evaluation_dispatch(
+            &shutdown,
+            items,
+            held_hashes,
+            scan_started_at,
+            total_candidates,
+            max_fittable,
+        );
+        let eval_stats = stats.clone();
+        let mut eval_handle = tokio::spawn(async move {
+            run_evaluation(dispatch, emit_tx, eval_stats).await;
+        });
+        let mut eval_done = false;
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut eval_handle, if !eval_done => {
+                    // Join the dispatch task (propagates panics); the walk
+                    // is over, but drained results may still be queued.
+                    let _ = r;
+                    eval_done = true;
+                }
+                ev = emit_rx.recv() => {
+                    match ev {
+                        Some(ev) => {
+                            // Floor accumulator (was previously filled from
+                            // the buffered vec at the end).
+                            floor_accum.lock().await.push(ev.seeders);
+                            if *shutdown.borrow() {
+                                anyhow::bail!("scan interrupted by shutdown");
+                            }
+                            batch.push(ev);
+                            processed += 1;
+                            if batch.len().is_multiple_of(EVALUATE_CONCURRENCY) {
+                                let ram_bound = held_count >= self.max_torrents;
+                                self.act_on_windowed(
+                                    &batch,
+                                    &mut acted,
+                                    &mut held_count,
+                                    ram_bound,
+                                    seeder_floor,
+                                    &stats,
+                                )
+                                .await;
+                            }
+                        }
+                        None => {
+                            // All senders dropped and channel drained. If the
+                            // evaluation task also finished, the walk is over.
+                            if eval_done {
+                                break;
+                            }
+                            // Channel drained but dispatch still running
+                            // (senders alive, nothing queued): briefly yield
+                            // rather than busy-loop.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
+            if eval_done {
+                // Drain anything that arrived after the last recv.
+                while let Ok(ev) = emit_rx.try_recv() {
+                    floor_accum.lock().await.push(ev.seeders);
+                    batch.push(ev);
+                    processed += 1;
+                    if batch.len().is_multiple_of(EVALUATE_CONCURRENCY) {
+                        let ram_bound = held_count >= self.max_torrents;
+                        self.act_on_windowed(
+                            &batch,
+                            &mut acted,
+                            &mut held_count,
+                            ram_bound,
+                            seeder_floor,
+                            &stats,
+                        )
+                        .await;
+                    }
+                }
+                break;
+            }
+        }
         if *shutdown.borrow() {
             anyhow::bail!("scan interrupted by shutdown");
-        }
-        // NOTE: evaluate_candidates currently buffers the whole walk before
-        // returning (streaming is a TODO); act incrementally over its output
-        // in arrival-sized batches to preserve the windowing behavior.
-        for ev in evaluated_all {
-            if *shutdown.borrow() {
-                anyhow::bail!("scan interrupted by shutdown");
-            }
-            batch.push(ev);
-            processed += 1;
-            if batch.len().is_multiple_of(EVALUATE_CONCURRENCY) {
-                let ram_bound = held_count >= self.max_torrents;
-                self.act_on_windowed(
-                    &batch,
-                    &mut acted,
-                    &mut held_count,
-                    ram_bound,
-                    seeder_floor,
-                    &stats,
-                )
-                .await;
-            }
         }
         if !processed.is_multiple_of(EVALUATE_CONCURRENCY as u64) {
             let ram_bound = held_count >= self.max_torrents;
@@ -707,7 +933,8 @@ impl Engine {
             .await;
         }
 
-        let counts: Vec<u32> = self.evaluated_counts.lock().await.clone();
+        let counts: Vec<u32> = floor_accum.lock().await.clone();
+        *self.evaluated_counts.lock().await = counts.clone();
         let floor = selector::seeder_floor(&counts);
         tracing::info!(
             "scrape complete: available={} processed={} total={} elapsed={} library={} fetched={} cached-meta={} scrapes={} cached-scrapes={} eligible={} seeder-floor={}",
@@ -758,179 +985,44 @@ impl Engine {
 
     /// Evaluate every pending candidate concurrently; returns lightweight results.
     #[allow(clippy::too_many_arguments)]
-    async fn evaluate_candidates(
+    /// Evaluate every pending candidate concurrently, STREAMING results:
+    /// each completed evaluation is sent over `emit` immediately, so the
+    /// caller acts on the top window as results arrive instead of waiting
+    /// for the whole walk. Returns the count of eligible (sent) candidates;
+    /// seeder counts for the floor are accumulated on the Engine as they
+    /// arrive (see evaluated_counts).
+    /// Snapshot the shared inputs evaluation needs into an owned dispatch
+    /// bundle, so the evaluation task runs without borrowing &self while
+    /// the consume loop acts with &mut self.
+    fn evaluation_dispatch(
         &self,
         shutdown: &tokio::sync::watch::Receiver<bool>,
-        items: &[atcatalog::Item],
-        held_hashes: &HashSet<String>,
+        items: Vec<atcatalog::Item>,
+        held_hashes: HashSet<String>,
         scan_started_at: DateTime<Utc>,
         total_candidates: u64,
-        stats: &ScanStats,
         max_fittable: u64,
-    ) -> Vec<Evaluated> {
-        // Share stats + swarm cache with spawned tasks via Arcs (atomics +
-        // mutex are Sync; references cannot cross spawn boundaries).
-        let shared = Arc::new(ScanStats {
-            library_bytes: AtomicU64::new(stats.library_bytes.load(Ordering::Relaxed)),
-            metadata_fetched: AtomicU64::new(stats.metadata_fetched.load(Ordering::Relaxed)),
-            metadata_cached: AtomicU64::new(stats.metadata_cached.load(Ordering::Relaxed)),
-            scrape_requests: AtomicU64::new(stats.scrape_requests.load(Ordering::Relaxed)),
-            scrape_cached: AtomicU64::new(stats.scrape_cached.load(Ordering::Relaxed)),
-            skipped_held: AtomicU64::new(stats.skipped_held.load(Ordering::Relaxed)),
-            skipped_blocked: AtomicU64::new(stats.skipped_blocked.load(Ordering::Relaxed)),
-            skipped_too_big: AtomicU64::new(stats.skipped_too_big.load(Ordering::Relaxed)),
-            skipped_age: AtomicU64::new(stats.skipped_age.load(Ordering::Relaxed)),
-            skipped_fetch_err: AtomicU64::new(stats.skipped_fetch_err.load(Ordering::Relaxed)),
-            skipped_scrape_err: AtomicU64::new(stats.skipped_scrape_err.load(Ordering::Relaxed)),
-            eligible: AtomicU64::new(stats.eligible.load(Ordering::Relaxed)),
-        });
-        // Share the swarm cache with spawned tasks via a standalone Arc.
-        // Snapshot current entries into a new shareable cache, then write
-        // back afterwards (evaluation only inserts).
-        let shared_cache = Arc::new(std::sync::Mutex::new(SwarmCache::load(
-            &self.cfg.data_dir.join("scrape-cache.json"),
-            self.cfg.scan.interval,
-        )));
-        let sem = Arc::new(Semaphore::new(EVALUATE_CONCURRENCY));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Evaluated>();
-        let processed = Arc::new(AtomicU64::new(0));
-        let min_age = self.cfg.scan.moderation_delay;
-
-        // Progress saver.
-        let stats_path = self.network_stats_path();
-        let seeder_floor = netstats::load_snapshot(&stats_path)
-            .map(|s| s.seeder_floor)
-            .unwrap_or(0);
-        let prog_processed = processed.clone();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop2 = stop.clone();
-        let progress_task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(PROGRESS_SAVE_INTERVAL);
-            loop {
-                tick.tick().await;
-                if stop2.load(Ordering::Relaxed) {
-                    break;
-                }
-                let _ = netstats::save_snapshot(
-                    &stats_path,
-                    &Snapshot {
-                        scan_started_at: Some(scan_started_at),
-                        scan_completed_at: None,
-                        total_candidates,
-                        processed_candidates: prog_processed.load(Ordering::Relaxed),
-                        seeder_floor,
-                    },
-                );
-            }
-        });
-
-        let mut pending: Vec<atcatalog::Item> = Vec::new();
-        for item in items {
-            if *shutdown.borrow() {
-                break;
-            }
-            let hex = hex::encode(item.info_hash);
-            if held_hashes.contains(&hex) {
-                stats.skipped_held.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            if self
-                .blocklist
-                .blocks(&item.title, &item.description)
-                .is_some()
-            {
-                stats.skipped_blocked.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            if max_fittable > 0 && item.size_bytes > max_fittable {
-                stats.skipped_too_big.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            pending.push(item.clone());
-        }
-
-        // Evaluate with bounded concurrency. evaluate_one only needs shared
-        // state (&self methods used are all &self), so wrap the needed inputs
-        // in an Arc-owned context instead of borrowing self across spawns.
-        let ctx = Arc::new(EvalCtx {
-            data_dir: self.cfg.data_dir.clone(),
-            moderation_bypass: min_age,
-            http: self.http.clone(),
-            torrent_base_url: self.torrent_fetcher.base_url.clone(),
-            user_agent: buildinfo::user_agent(),
-            rate: self.rate.clone(),
+    ) -> EvaluationDispatch {
+        EvaluationDispatch {
+            ctx: Arc::new(EvalCtx {
+                data_dir: self.cfg.data_dir.clone(),
+                moderation_bypass: self.cfg.scan.moderation_delay,
+                http: self.http.clone(),
+                torrent_base_url: self.torrent_fetcher.base_url.clone(),
+                user_agent: buildinfo::user_agent(),
+                rate: self.rate.clone(),
+                shutdown: shutdown.clone(),
+            }),
             shutdown: shutdown.clone(),
-        });
-        let tx2 = tx.clone();
-        let mut handles = Vec::new();
-        for chunk in pending.chunks(EVALUATE_CONCURRENCY * 4) {
-            if *shutdown.borrow() {
-                break;
-            }
-            let chunk = chunk.to_vec();
-            let sem = sem.clone();
-            let tx = tx2.clone();
-            let processed = processed.clone();
-            let ctx = ctx.clone();
-            let shared_cache = shared_cache.clone();
-            let stats_outer = shared.clone();
-            handles.push(tokio::spawn(async move {
-                let mut inner = Vec::new();
-                for item in chunk {
-                    let permit = sem.clone().acquire_owned().await;
-                    let tx = tx.clone();
-                    let processed = processed.clone();
-                    let ctx = ctx.clone();
-                    let shared_cache = shared_cache.clone();
-                    let stats = stats_outer.clone();
-                    inner.push(tokio::spawn(async move {
-                        let _permit = permit;
-                        let r = evaluate_one_item(&ctx, &shared_cache, &item, &stats).await;
-                        processed.fetch_add(1, Ordering::Relaxed);
-                        if let Some(ev) = r {
-                            let _ = tx.send(ev);
-                        }
-                    }));
-                }
-                for h in inner {
-                    let _ = h.await;
-                }
-            }));
+            items,
+            held_hashes,
+            scan_started_at,
+            total_candidates,
+            max_fittable,
+            blocklist: self.blocklist.clone(),
+            swarm_cache: self.swarm_cache.clone(),
+            network_stats_path: self.network_stats_path(),
         }
-        drop(tx2);
-        for h in handles {
-            let _ = h.await;
-        }
-        stop.store(true, Ordering::Relaxed);
-        let _ = progress_task.await;
-        drop(tx);
-        // Merge Arc stats back into the caller's counters.
-        add_into(stats, &shared);
-        // Merge newly scraped entries back into the Engine cache.
-        if let (Ok(shared), Ok(mut own)) = (shared_cache.lock(), self.swarm_cache.lock()) {
-            for (h, e) in &shared.entries {
-                own.entries.entry(*h).or_insert_with(|| e.clone());
-            }
-        }
-
-        let mut out = Vec::new();
-        // Drain whatever arrived. recv() ends when all senders drop; on a
-        // shutdown-abandoned dispatch some senders may linger in wedged
-        // tasks, so bound the drain rather than waiting forever.
-        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(ev)) => out.push(ev),
-                _ => break,
-            }
-        }
-        // Remember seeder counts for the floor computation.
-        *self.evaluated_counts.lock().await = out.iter().map(|e| e.seeders).collect();
-        out
     }
 
     /// Fetch metadata from torrent-cache, else AT (rate-limited), caching to disk.

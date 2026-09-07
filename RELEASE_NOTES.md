@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.5-beta - truly incremental acting (first seeds in minutes, not hours)
+
+This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
+
+### Evaluation now streams: acting starts with the first arrivals
+
+The month-long production test caught a real fill defect: the scan awaited the entire multi-hour evaluation walk before acting on anything, so free disk sat idle for hours and the first seeds appeared only after all ~2,850 candidates processed. Evaluation now streams each eligible candidate over a channel the moment it completes, and the scan acts on the top window every 16 arrivals - on the production host, 26 torrents / 11 GB seeded within 8 minutes of startup, versus zero adds after 1,200+ evaluations on the old path. The p10 floor, ranking, swap, and RAM-budget logic are unchanged; only the plumbing moved (owned dispatch bundle + consume loop, shared Arc stats/cache). Includes the v0.8.1 decision-gate debug tracing and the v0.8.4 dualstack-with-fallback sockets.
+
 ## v0.8.4-beta - dualstack sockets with IPv4 fallback (restart fix, final)
 
 This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
