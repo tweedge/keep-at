@@ -1,5 +1,8 @@
-//! Scan progress snapshots and runtime summaries, persisted as JSON so
-//! `status` / `network-status` can read them without talking to the daemon.
+//! Scan progress snapshots and runtime summaries. `network-stats.json`
+//! holds cross-boot scan state (progress + p10 seeder floor the next scan
+//! needs); `runtime-stats.json` is the offline fallback `status` reads when
+//! no daemon is running (the live socket serves instantaneous numbers when
+//! one is).
 
 use chrono::{DateTime, Utc};
 use std::path::Path;

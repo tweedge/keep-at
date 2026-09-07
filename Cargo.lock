@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "keep-at"
-version = "0.8.9"
+version = "0.8.10"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1558,6 +1558,7 @@ dependencies = [
  "librqbit",
  "librqbit-bencode",
  "librqbit-core",
+ "parking_lot",
  "predicates",
  "quick-xml 0.36.2",
  "rand 0.8.8",

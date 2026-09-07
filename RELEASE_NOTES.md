@@ -1,5 +1,17 @@
 # keep-at release notes
 
+## v0.8.10-beta - live status socket, EMFILE prevention
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### `status` and `hosted-torrents` read live numbers from the daemon
+
+Both commands used to read periodic snapshot files (`runtime-stats.json`) plus on-disk dir sizes. Snapshots go stale between writes (up to `stats_interval`), and the dir-size heuristic misreports a just-added sparse torrent as fully downloaded the instant it appears. The running Engine now serves the truth directly over a Unix socket (`<data_dir>/keep-at.sock`, mode `0o666`, same-host-only — no TCP port, no auth problem): one JSON request line, one JSON response line, two read-only verbs (`runtime`, `held`), no mutation surface. `status` prints live counters with a `live` marker and `hosted-torrents` shows verified bytes + the session's real `finished` flag per torrent; when no daemon is running (or the socket is unreachable) both fall back to the persisted files unchanged. The Engine pushes a state snapshot to the socket handle after every mutation (add/swap/remove/refresh/evict), so the server never blocks the scan. `runtime-stats.json` stays as the offline fallback. Pinned by `tests/live.rs` (protocol shapes, offline None, live round-trip against a stub-backed Engine asserting the socket numbers match the held set and fresh downloads are not misreported as seeding).
+
+### Too-many-open-files failures are prevented, not retried
+
+A many-file add near the fd ceiling failed with `Too many open files` (os error 24) on every scan: rqbit opens one fd per file at add time and holds it, and the service unit inherited systemd's 1024 default. Two native fixes: the unit sets `LimitNOFILE=65536` and startup raises soft `RLIMIT_NOFILE` toward the same target capped by hard (best effort, logged — covers `run`/`start`/manual paths until existing installs re-run `service install`); and `act_on_candidate` refuses an add whose file count plus a 512-fd socket reserve exceeds live headroom (soft limit minus `/proc/self/fd`), before opening, rolling, or touching state. `TorrentMeta` carries the non-padding file count (same fd model as rqbit's `FilesystemStorage::init`); unknown headroom admits. Pinned by `tests/fdlimit.rs` plus a multi-file `.torrent` builder in the shared harness.
+
 ## v0.8.9-beta - world-readable snapshots, stable/beta versioning scheme
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.

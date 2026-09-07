@@ -42,11 +42,11 @@ If no storage flag is passed, keep-at uses `~/.local/share/keep-at/storage` (`/v
 
 ### `data_dir` / `--data-dir`
 
-Where keep-at keeps its own bookkeeping: persisted state (what it's currently holding), the PID/log files `start`/`stop`/`status` use, cached `.torrent` files and catalog data, and network-status snapshots. This is separate from `storage`, which is only for the torrent data itself.
+Where keep-at keeps its own bookkeeping: persisted state (what it's currently holding), the PID/log files `start`/`stop`/`status` use, cached `.torrent` files and catalog data, network-status snapshots, and the live query socket (`keep-at.sock`, created while the daemon runs). This is separate from `storage`, which is only for the torrent data itself.
 
 Defaults to `~/.local/share/keep-at` (`/var/lib/keep-at` when `HOME` is unset).
 
-Read-only operations are readable by every local user: `status`, `hosted-torrents`, and the log file work for any user against a daemon owned by anyone (including a root-run service), because snapshots, caches, state files, the PID file, and the log are written world-readable (0o644, umask-independent) and the daemon repairs directory traversal (0o755 masked in) on startup. Writes stay owner-only — a non-owner second `run` against the same data dir fails on permissions, as it should. The one exception is the config file itself (including `/etc/keep-at/config.yaml`): owner-only (0o600), since it may carry the API key.
+Read-only operations are readable by every local user: `status` and `hosted-torrents` query the running daemon over the query socket when it's up (falling back to the persisted files when it isn't), and the log file works for any user against a daemon owned by anyone (including a root-run service), because snapshots, caches, state files, the PID file, the socket, and the log are written world-readable (0o644 files / 0o666 socket, umask-independent) and the daemon repairs directory traversal (0o755 masked in) on startup. Writes stay owner-only — a non-owner second `run` against the same data dir fails on permissions, as it should. The one exception is the config file itself (including `/etc/keep-at/config.yaml`): owner-only (0o600), since it may carry the API key.
 
 ## Scanning behavior
 
@@ -154,13 +154,13 @@ download_rate_limit: 20M
 
 ### `stats_interval` / `--stats-interval`
 
-*Default: `30m`.* How often keep-at logs a brief summary of what it's doing - torrents held/seeding/downloading, disk utilization, transfer since boot (both useful payload and total network traffic, with average rates), active peers, process RSS, and uptime - and writes that same summary to disk (in `data_dir/runtime-stats.json`) so `keep-at status` can display it. A summary is always written once at startup and once after every scan; `stats_interval: 0` disables the periodic ones. The log line looks like:
+*Default: `30m`.* How often keep-at logs a brief summary of what it's doing - torrents held/seeding/downloading, disk utilization, transfer since boot (both useful payload and total network traffic, with average rates), active peers, process RSS, and uptime - and refreshes the persisted snapshot in `data_dir/runtime-stats.json` (the offline fallback `status` reads when no daemon is running). A summary is always written once at startup and once after every scan; `stats_interval: 0` disables the periodic ones. When the daemon is running, `keep-at status` reads live numbers straight from it over the query socket instead (instantaneous, never stale). The log line looks like:
 
 ```
 runtime stats (kind=periodic held=12 seeding=10 downloading=2 disk=50.0 GiB/100.0 GiB up=5.0 GiB down=1.0 GiB peers=24 rss=300.0 MiB uptime=7200s)
 ```
 
-and `keep-at status` prints the same picture:
+and `keep-at status` prints the same picture (with a `live` marker when the numbers come straight from the running daemon, or the snapshot timestamp when read from disk while no daemon is running):
 
 ```
 keep-at is running (pid 12345)
@@ -197,4 +197,4 @@ A few flags control CLI behavior rather than keep-at's own settings, and don't h
 
 ### `debug` / `--debug`
 
-*Default: `false`.* Verbose diagnostics: debug-level logging (overridable per-process with `RUST_LOG`, e.g. `RUST_LOG=keep_at::engine=debug`). There is no debug-artifact directory - diagnostics are the log lines themselves plus the persisted snapshots (`network-stats.json`, `runtime-stats.json`, `scrape-cache.json`) under the data dir.
+*Default: `false`.* Verbose diagnostics: debug-level logging (overridable per-process with `RUST_LOG`, e.g. `RUST_LOG=keep_at::engine=debug`). There is no debug-artifact directory - diagnostics are the log lines themselves plus the persisted files (`network-stats.json`, `runtime-stats.json` offline fallback, `scrape-cache.json`, `state.json`) under the data dir.

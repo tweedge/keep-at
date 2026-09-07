@@ -68,6 +68,10 @@ pub struct Engine {
     /// reported. Diffed on every runtime-stats pass so each completion logs
     /// exactly one `download completed` line (see log_and_save_runtime).
     completed_seen: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Push handle for the live query socket (status/hosted-torrents read
+    /// from the running daemon instead of stale files). None in tests and
+    /// anywhere no server is wanted. Refreshed after every state mutation.
+    live: Option<crate::live::LiveHandle>,
 }
 
 /// Counters from the most recent scan, for tests and status callers.
@@ -646,6 +650,7 @@ impl Engine {
             evaluated_counts: tokio::sync::Mutex::new(Vec::new()),
             last_scan: tokio::sync::Mutex::new(None),
             completed_seen: std::sync::Mutex::new(std::collections::HashSet::new()),
+            live: None,
         };
         eng.blocklist = KeywordBlocklist::new(eng.cfg.keyword_blocklist.clone());
         {
@@ -661,6 +666,40 @@ impl Engine {
         self.cfg.data_dir.join("network-stats.json")
     }
 
+    /// Build the live-query push handle from current state and spawn the
+    /// socket server. Idempotent: a second call replaces the handle and
+    /// re-binds (the old server task exits when its listener is gone —
+    /// actually it keeps serving the same handle contents; rebinding fails
+    /// gracefully with a warn since the first server still owns the path).
+    /// In practice called once from `run`; tests never call it (live: None).
+    fn start_live_server(&mut self) {
+        let storage: Vec<(PathBuf, u64)> = self
+            .cfg
+            .storage
+            .iter()
+            .map(|l| (l.path.clone(), l.limit_bytes()))
+            .collect();
+        let handle = crate::live::LiveHandle::new(
+            self.session.clone(),
+            self.api.clone(),
+            snapshot_entries(&self.state),
+            self.started_at,
+            storage,
+        );
+        self.live = Some(handle.clone());
+        let data_dir = self.cfg.data_dir.clone();
+        tokio::spawn(async move {
+            crate::live::serve(data_dir, handle).await;
+        });
+    }
+
+    /// Push current state to the live handle (no-op when no server).
+    fn push_live(&self) {
+        if let Some(live) = &self.live {
+            live.refresh(snapshot_entries(&self.state));
+        }
+    }
+
     fn torrent_cache_path(&self, info_hash_hex: &str) -> PathBuf {
         self.cfg
             .data_dir
@@ -671,8 +710,11 @@ impl Engine {
     // ---- main loop (Run) ----
 
     /// Run scans on the scan-interval cadence until cancelled. First scan runs
-    /// immediately unless a scan completed recently.
+    /// immediately unless a scan completed recently. Spawns the live query
+    /// socket (`status`/`hosted-torrents` read here, not stale files) before
+    /// the first scan; state pushes after every mutation keep it current.
     pub async fn run(&mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+        self.start_live_server();
         self.log_and_save_runtime("startup");
 
         if self.delay_until_next_scan() > Duration::ZERO {
@@ -1018,6 +1060,25 @@ impl Engine {
     /// Held torrents snapshot (for tests / status paths without an Engine clone).
     pub fn held_torrents(&self) -> Vec<crate::state::Torrent> {
         self.state.all()
+    }
+
+    /// Live-query push handle over this Engine's real session + held set.
+    /// Construction seam `run` uses internally; public so integration tests
+    /// can serve a real socket without starting the main loop.
+    pub fn test_live_handle(&self) -> crate::live::LiveHandle {
+        let storage: Vec<(PathBuf, u64)> = self
+            .cfg
+            .storage
+            .iter()
+            .map(|l| (l.path.clone(), l.limit_bytes()))
+            .collect();
+        crate::live::LiveHandle::new(
+            self.session.clone(),
+            self.api.clone(),
+            snapshot_entries(&self.state),
+            self.started_at,
+            storage,
+        )
     }
 
     // ---- evaluation ----
@@ -1442,6 +1503,7 @@ impl Engine {
         }) {
             tracing::error!("failed to persist state for {}: {e:#}", c.title);
         }
+        self.push_live();
         (true, decision)
     }
 
@@ -1506,6 +1568,7 @@ impl Engine {
                 .try_add(c, md, size_bytes, &location, &sel_held, seeder_floor)
                 .await;
             if ok {
+                let mut removed_any = false;
                 for h in &displaced {
                     tracing::info!(
                         "swapped out displaced torrent (title={} seeders={} size={} for candidate={})",
@@ -1524,7 +1587,12 @@ impl Engine {
                     let _ = std::fs::remove_file(self.torrent_cache_path(&h.info_hash));
                     if let Err(e) = self.state.remove(&h.info_hash) {
                         tracing::error!("failed to drop state for {}: {e:#}", h.title);
+                    } else {
+                        removed_any = true;
                     }
+                }
+                if removed_any {
+                    self.push_live();
                 }
                 return (true, decision);
             } else {
@@ -1544,6 +1612,7 @@ impl Engine {
         if self.cfg.preserve_deleted_torrents {
             return;
         }
+        let mut removed_any = false;
         for h in held {
             if catalog_hashes.contains(&h.info_hash) {
                 continue;
@@ -1560,13 +1629,19 @@ impl Engine {
             let _ = std::fs::remove_file(self.torrent_cache_path(&h.info_hash));
             if let Err(e) = self.state.remove(&h.info_hash) {
                 tracing::error!("failed to drop state for {}: {e:#}", h.title);
+            } else {
+                removed_any = true;
             }
+        }
+        if removed_any {
+            self.push_live();
         }
     }
 
     async fn refresh_held_seeder_counts(&mut self, shutdown: &tokio::sync::watch::Receiver<bool>) {
         let held = self.state.all();
         let total = held.len();
+        let mut updated_any = false;
         for (done, h) in held.into_iter().enumerate() {
             if *shutdown.borrow() {
                 tracing::info!("held refresh interrupted by shutdown ({done}/{total})");
@@ -1592,16 +1667,21 @@ impl Engine {
                 Ok(sw) => {
                     // Progress = verified bytes on disk; grows iff new data lands.
                     let progress = self.held_progress_bytes(&h);
-                    let _ = self.state.update(&hex, |t| {
+                    if let Ok(true) = self.state.update(&hex, |t| {
                         t.last_known_seeders = sw.seeders;
                         if progress > t.completed_pieces as u64 || t.last_progress_at.is_none() {
                             t.completed_pieces = progress.min(u32::MAX as u64) as u32;
                             t.last_progress_at = Some(Utc::now());
                         }
-                    });
+                    }) {
+                        updated_any = true;
+                    }
                 }
                 Err(e) => tracing::warn!("could not scrape held torrent {}: {e:#}", h.title),
             }
+        }
+        if updated_any {
+            self.push_live();
         }
     }
 
@@ -1623,6 +1703,7 @@ impl Engine {
             return;
         }
         let now = Utc::now();
+        let mut removed_any = false;
         for h in self.state.all() {
             if !catalog_hashes.contains(&h.info_hash) {
                 continue;
@@ -1649,7 +1730,12 @@ impl Engine {
             let _ = std::fs::remove_file(self.torrent_cache_path(&h.info_hash));
             if let Err(e) = self.state.remove(&h.info_hash) {
                 tracing::error!("failed to drop state for {}: {e:#}", h.title);
+            } else {
+                removed_any = true;
             }
+        }
+        if removed_any {
+            self.push_live();
         }
     }
 
@@ -1696,6 +1782,9 @@ impl Engine {
         Ok(())
     }
 
+    /// Log the runtime summary line and persist the snapshot file. The
+    /// socket serves live numbers from the same inputs; the file stays as
+    /// the offline fallback `status` reads when no daemon is running.
     fn log_and_save_runtime(&self, kind: &str) {
         let held = self.state.all();
         let by_hash: std::collections::HashMap<String, &state::Torrent> =
@@ -1784,6 +1873,20 @@ impl crate::config::StorageLocation {
 /// after `resolve_all_limits`, so `limit: max` is already concrete bytes.
 fn disk_limit_total(cfg: &Config) -> u64 {
     cfg.storage.iter().map(|l| l.limit_bytes()).sum()
+}
+
+/// Snapshot the held set into live-query entries (title/hash/size/seeders).
+fn snapshot_entries(state: &State) -> Vec<crate::live::StateEntry> {
+    state
+        .all()
+        .into_iter()
+        .map(|t| crate::live::StateEntry {
+            title: t.title,
+            info_hash: t.info_hash,
+            size_bytes: t.size_bytes,
+            last_known_seeders: t.last_known_seeders,
+        })
+        .collect()
 }
 
 fn shuffle<T>(v: &mut [T]) {

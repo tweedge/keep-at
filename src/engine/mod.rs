@@ -13,6 +13,5 @@ pub use ram::{
     torrent_ram,
 };
 pub use scan::{Engine, LastScanStats, Options as EngineOptions};
-pub use stats::runtime_stats_path;
 pub use storage::{device_free_bytes, device_total_bytes, dir_size_bytes, resolve_all_limits};
 pub use torrents::{find_torrent, torrent_output_dir, ManagedTorrentHandle};

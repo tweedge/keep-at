@@ -1,5 +1,8 @@
 //! Runtime stats collection: what the node holds, disk use vs limits,
-//! transfer totals, memory. Persisted for `keep-at status`.
+//! transfer totals, memory. The Engine logs a summary line on a cadence and
+//! persists the same snapshot (`runtime-stats.json`) as the offline fallback
+//! `status` reads when no daemon is running; the live socket serves the same
+//! numbers instantaneously from the same inputs (see `live`).
 
 use std::path::Path;
 use std::time::Instant;
@@ -55,7 +58,7 @@ pub fn disk_usage(locations: &[(std::path::PathBuf, u64)]) -> (u64, u64) {
 }
 
 #[cfg(target_os = "linux")]
-fn process_rss_bytes() -> u64 {
+pub fn process_rss_bytes() -> u64 {
     // /proc/self/statm: second field is resident pages.
     let data = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
     let rss_pages: u64 = data

@@ -1,10 +1,15 @@
 //! `keep-at status`: running state + runtime summary.
+//!
+//! Live-first: when the daemon is running, numbers come straight from it
+//! over the query socket (instantaneous, never stale). Otherwise — or when
+//! the socket is unreachable — falls back to the persisted snapshot files.
 
 use anyhow::Result;
 
 use crate::cli::CommonArgs;
 use crate::daemonctl;
 use crate::humanize;
+use crate::live;
 use crate::netstats;
 
 pub fn cmd_status(args: &CommonArgs) -> Result<()> {
@@ -24,54 +29,119 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
         println!("keep-at is not running");
     }
 
-    let rs = netstats::load_runtime(&dir.join("runtime-stats.json"))?;
-    if rs.collected_at.is_none() {
+    // Live daemon answers from in-process state; files are the offline path.
+    if let Some(live::Response::Runtime(v)) = live::query(&dir, &live::Request::Runtime) {
+        print_live(&v);
         return Ok(());
     }
+    print_snapshot(&netstats::load_runtime(&dir.join("runtime-stats.json"))?);
+    Ok(())
+}
 
+fn print_live(v: &live::RuntimeView) {
+    println!(
+        "runtime stats (live, uptime {}):",
+        humanize::human_duration(std::time::Duration::from_secs(v.uptime_seconds))
+    );
+    print_numbers(
+        v.held_torrents,
+        v.seeding_torrents,
+        v.downloading_torrents,
+        v.disk_used_bytes,
+        v.disk_limit_bytes,
+        v.useful_bytes_uploaded,
+        v.total_bytes_uploaded,
+        v.useful_bytes_downloaded,
+        v.total_bytes_downloaded,
+        v.uptime_seconds,
+        v.active_peers,
+        v.process_rss_bytes,
+    );
+}
+
+fn print_snapshot(rs: &netstats::RuntimeStats) {
+    if rs.collected_at.is_none() {
+        return;
+    }
     println!(
         "runtime stats ({} uptime, uptime {}):",
         rs.collected_at.map(format_time).unwrap_or_default(),
         humanize::human_duration(rs.uptime())
     );
-    println!(
-        "  torrents: {} held, {} seeding, {} downloading",
-        rs.held_torrents, rs.seeding_torrents, rs.downloading_torrents
+    print_numbers(
+        rs.held_torrents,
+        rs.seeding_torrents,
+        rs.downloading_torrents,
+        rs.disk_used_bytes,
+        rs.disk_limit_bytes,
+        rs.useful_bytes_uploaded,
+        rs.total_bytes_uploaded,
+        rs.useful_bytes_downloaded,
+        rs.total_bytes_downloaded,
+        rs.uptime_seconds,
+        rs.active_peers,
+        rs.process_rss_bytes,
     );
-    if rs.disk_limit_bytes > 0 {
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_numbers(
+    held: usize,
+    seeding: usize,
+    downloading: usize,
+    disk_used: u64,
+    disk_limit: u64,
+    up_useful: u64,
+    up_total: u64,
+    down_useful: u64,
+    down_total: u64,
+    uptime_secs: u64,
+    peers: usize,
+    rss: u64,
+) {
+    println!("  torrents: {held} held, {seeding} seeding, {downloading} downloading");
+    if disk_limit > 0 {
+        let pct = if disk_limit > 0 {
+            (disk_used as f64 / disk_limit as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
         println!(
             "  disk: {} used of {} configured ({:.1}%)",
-            humanize::human_bytes(rs.disk_used_bytes as i64),
-            humanize::human_bytes(rs.disk_limit_bytes as i64),
-            rs.disk_used_pct()
+            humanize::human_bytes(disk_used as i64),
+            humanize::human_bytes(disk_limit as i64),
+            pct
         );
     }
     println!(
         "  useful upload since boot: {} (total network {})",
-        humanize::human_bytes(rs.useful_bytes_uploaded as i64),
-        humanize::human_bytes(rs.total_bytes_uploaded as i64)
+        humanize::human_bytes(up_useful as i64),
+        humanize::human_bytes(up_total as i64)
     );
     println!(
         "  useful download since boot: {} (total network {})",
-        humanize::human_bytes(rs.useful_bytes_downloaded as i64),
-        humanize::human_bytes(rs.total_bytes_downloaded as i64)
+        humanize::human_bytes(down_useful as i64),
+        humanize::human_bytes(down_total as i64)
     );
     println!(
         "  avg upload since boot: {}",
-        humanize::human_bits_per_sec(rs.upload_bits_per_sec())
+        humanize::human_bits_per_sec(bits_per_sec(up_total, uptime_secs))
     );
     println!(
         "  avg download since boot: {}",
-        humanize::human_bits_per_sec(rs.download_bits_per_sec())
+        humanize::human_bits_per_sec(bits_per_sec(down_total, uptime_secs))
     );
-    println!("  active peers: {}", rs.active_peers);
-    if rs.process_rss_bytes > 0 {
-        println!(
-            "  memory: {} RSS",
-            humanize::human_bytes(rs.process_rss_bytes as i64)
-        );
+    println!("  active peers: {peers}");
+    if rss > 0 {
+        println!("  memory: {} RSS", humanize::human_bytes(rss as i64));
     }
-    Ok(())
+}
+
+fn bits_per_sec(total_bytes: u64, uptime_secs: u64) -> f64 {
+    if uptime_secs == 0 {
+        return 0.0;
+    }
+    total_bytes as f64 * 8.0 / uptime_secs as f64
 }
 
 fn format_time(t: chrono::DateTime<chrono::Utc>) -> String {

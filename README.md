@@ -64,7 +64,7 @@ keep-at network-status
 keep-at hosted-torrents
 ```
 
-`hosted-torrents` lists everything this host currently holds and seeds: title, actual space on disk, seeding/downloading status, last-scrape seeder counts, and a link to each torrent's Academic Torrents page. Like `status` and `network-status`, it reads keep-at's persisted files, so it works whether or not the daemon is running.
+`hosted-torrents` lists everything this host currently holds and seeds: title, verified bytes present, seeding/downloading status, last-scrape seeder counts, and a link to each torrent's Academic Torrents page. When the daemon is running both it and `status` read live numbers straight from it (never stale); when it isn't, they fall back to the persisted files.
 
 `start` and `run` take the exact same flags as `service install` - `start` just forks `run` into the background for you (or runs it in the foreground directly, inside a container). None of these commands need `--config` once keep-at is installed as a service; pass it explicitly only if you're managing a non-service instance, or one installed somewhere unusual.
 
