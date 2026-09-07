@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
         Command::Run(a) => {
             let cfg = cli::resolve(&a.common, &a.cfg)?;
             init_logging_to(cfg.debug, cfg.log_file.as_deref());
-            cmd_run(cfg).await
+            cmd_run(cfg, a.common.config.clone()).await
         }
         Command::Start(a) => {
             let cfg = cli::resolve(&a.common, &a.cfg)?;
@@ -77,9 +77,30 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_run(cfg: Config) -> Result<()> {
+async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("creating data dir {}", cfg.data_dir.display()))?;
+    // Split-secret migration (pre-0.8.11 configs): API key inline in an
+    // owner-only config file. As the daemon user (the owner) rewrite the
+    // config world-readable; the key lands in <data_dir>/api_key below.
+    // Best effort: a failure leaves the legacy shape in place, never fatal.
+    if let Some(p) = &config_path {
+        if let Err(e) = Config::split_inline_secret(p, &cfg) {
+            tracing::warn!("could not migrate config secrets ({}): {e:#}", p.display());
+        }
+    }
+    // Key file is the runtime home of the API key (owner-only 0600), written
+    // whenever a key is configured — flag runs included — so restarts via the
+    // same config keep attribution without re-passing --api-key.
+    if !cfg.api_key.is_empty() {
+        if let Err(e) = cfg.write_api_key_file() {
+            tracing::warn!("could not persist api key file: {e:#}");
+        }
+    }
+    // Data-dir pointer: world-readable breadcrumb so `status` /
+    // `hosted-torrents` as any user find this instance without reading the
+    // config. Only written in a service context (/etc/keep-at exists).
+    keep_at::service::write_data_dir_pointer(&cfg.data_dir);
     // Raise the fd soft limit before the session opens anything: a few
     // hundred held torrents (one fd per file each) plus peer sockets
     // otherwise exhaust low defaults (systemd's 1024 without LimitNOFILE).
@@ -140,7 +161,8 @@ async fn cmd_run(cfg: Config) -> Result<()> {
 async fn cmd_start(cfg: Config, foreground: bool) -> Result<()> {
     if foreground || keep_at::daemonctl::is_containerized() {
         // Behave as run (foreground) inside containers or on request.
-        return cmd_run(cfg).await;
+        // No config file path: `start` resolves flags into the saved config.
+        return cmd_run(cfg, None).await;
     }
     // Resolve + validate now so a bad config fails here, not in the daemon.
     let mut cfg = cfg;

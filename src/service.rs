@@ -17,6 +17,34 @@ use crate::config::Config;
 pub const UNIT_PATH: &str = "/etc/systemd/system/keep-at.service";
 pub const CONFIG_DIR: &str = "/etc/keep-at";
 pub const CONFIG_PATH: &str = "/etc/keep-at/config.yaml";
+/// World-readable one-line pointer to the service's data dir. `status` /
+/// `hosted-torrents` (any user) read this instead of the config file, so a
+/// not-yet-migrated root-only config never blocks a read-only command.
+pub const DATA_DIR_POINTER: &str = "/etc/keep-at/data_dir";
+
+/// Persist the pointer file (0o644). Best effort: called from install and
+/// daemon startup; only writes when the config dir exists (service context).
+pub fn write_data_dir_pointer(data_dir: &Path) {
+    if !Path::new(CONFIG_DIR).is_dir() {
+        return;
+    }
+    let body = format!("{}\n", data_dir.display());
+    let _ = crate::config::atomic_write_mode(Path::new(DATA_DIR_POINTER), body.as_bytes(), 0o644);
+}
+
+/// Read the pointer file; None when absent/empty.
+pub fn read_data_dir_pointer() -> Option<std::path::PathBuf> {
+    read_pointer_file_at(Path::new(DATA_DIR_POINTER))
+}
+
+pub fn read_pointer_file_at(path: &Path) -> Option<std::path::PathBuf> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(t))
+}
 
 /// Absolute path to systemctl. sudo(8) resets PATH to a minimal secure
 /// default, so resolving `systemctl` via PATH fails when keep-at is
@@ -77,6 +105,7 @@ pub fn install(opts: &InstallOpts) -> Result<()> {
     require_systemd()?;
 
     opts.config.save(Path::new(CONFIG_PATH))?;
+    write_data_dir_pointer(&opts.config.data_dir);
 
     let unit = UNIT_TEMPLATE
         .replace(

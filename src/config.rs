@@ -40,6 +40,11 @@ pub const BANDWIDTH_LIMIT_WARN: u64 = 1024 * 1024; // 1 MiB/s
 /// Share of system RAM keep-at will ever plan around, regardless of --max-ram.
 pub const SYSTEM_RAM_FRACTION_HARD_CAP: f64 = 0.8;
 
+/// Filename (inside the data dir) holding the Academic Torrents API key,
+/// owner-only (0o600). The config file itself carries no secrets so it can
+/// stay world-readable for `status`/`hosted-torrents` as any user.
+pub const API_KEY_FILE: &str = "api_key";
+
 /// Legacy flat per-torrent estimate. Superseded by the measured model in
 /// engine::ram (BASE + per-piece + per-peer at the budget's peer limit);
 /// kept so the hard-cap log line and external callers still compile.
@@ -294,6 +299,10 @@ impl Default for Config {
 
 impl Config {
     /// Load a config file, writing a starter one (and erroring) if missing.
+    ///
+    /// The API key no longer lives in the file: it is merged from
+    /// `<data_dir>/api_key` (owner-only) when present. A legacy inline
+    /// `api_key:` field still parses for back-compat; the key file wins.
     pub fn load(path: &Path) -> Result<Config> {
         let data = match std::fs::read(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -305,6 +314,12 @@ impl Config {
                 })?;
                 bail!(
                     "wrote a starter config to {}: set at least one storage location and limit, then run keep-at again",
+                    path.display()
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                bail!(
+                    "reading config {} denied: {e}. The config of an older keep-at install is root-only; run `sudo keep-at service install` once (or restart the daemon) to migrate it world-readable",
                     path.display()
                 );
             }
@@ -326,20 +341,70 @@ impl Config {
         if cfg.scan.rate_limit_per_second == 0.0 {
             cfg.scan.rate_limit_per_second = DEFAULT_RATE_LIMIT_PER_SEC;
         }
+        // API key from the secret file (authoritative at runtime). Unreadable
+        // (non-owner) => keep whatever the config field said, never fatal —
+        // an anonymous node is a supported mode.
+        if let Ok(k) = std::fs::read_to_string(cfg.data_dir.join(API_KEY_FILE)) {
+            let k = k.trim();
+            if !k.is_empty() {
+                cfg.api_key = k.to_string();
+            }
+        }
         cfg.validate()?;
         Ok(cfg)
     }
 
+    /// Save the config world-readable (nothing secret in it anymore) and,
+    /// when an API key is set, write it owner-only to
+    /// `<data_dir>/api_key` instead of the config file.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let header = "# keep-at config. Edit this file directly and restart keep-at\n# (`systemctl restart keep-at`, or `keep-at service install` again)\n# to apply changes. Every field here also has a --flag equivalent\n# (`keep-at run --help`).\n\n";
+        let header = "# keep-at config. Edit this file directly and restart keep-at\n# (`systemctl restart keep-at`, or `keep-at service install` again)\n# to apply changes. Every field here also has a --flag equivalent\n# (`keep-at run --help`).\n#\n# The Academic Torrents API key is NOT stored here: it lives in\n# <data_dir>/api_key (owner-only, 0600), so this file can stay\n# world-readable for `status`/`hosted-torrents` run as any user.\n# Set it with --api-key or write the file directly.\n\n";
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("creating directory for {}", path.display()))?;
         }
         let mut out = header.to_string();
-        out.push_str(&serde_yaml::to_string(self).context("marshalling config")?);
-        // Configs may carry the API key (passkey-equivalent): owner-only.
-        atomic_write_mode(path, out.as_bytes(), 0o600)
+        // Never serialize the key: it is not a config-file field anymore.
+        let mut public = self.clone();
+        public.api_key = String::new();
+        out.push_str(&serde_yaml::to_string(&public).context("marshalling config")?);
+        atomic_write_mode(path, out.as_bytes(), 0o644)?;
+        if !self.api_key.is_empty() {
+            self.write_api_key_file()?;
+        }
+        Ok(())
+    }
+
+    /// Persist the API key owner-only under the data dir. Best effort from
+    /// callers that must not fail over it (startup), strict from save().
+    pub fn write_api_key_file(&self) -> Result<()> {
+        let p = self.data_dir.join(API_KEY_FILE);
+        atomic_write_mode(&p, format!("{}\n", self.api_key).as_bytes(), 0o600)
+            .with_context(|| format!("writing {}", p.display()))
+    }
+
+    /// One-time migration of a pre-split config: when the API key is
+    /// embedded in the file, rewrite the config world-readable without it
+    /// (the daemon writes the key file separately at startup). When the key
+    /// is already absent but the file is owner-only (legacy mode), widen it.
+    /// No-op for current-format files. Call as the daemon user (owner).
+    pub fn split_inline_secret(path: &Path, cfg: &Config) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = match std::fs::metadata(path) {
+            Ok(m) => m.permissions().mode() & 0o777,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("stating {}", path.display())),
+        };
+        if cfg.api_key.is_empty() {
+            if mode & 0o077 == 0 {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+                    .with_context(|| format!("widening {}", path.display()))?;
+            }
+            return Ok(());
+        }
+        // save() writes the config keyless + world-readable; the key file
+        // itself is written at startup (write_api_key_file).
+        cfg.save(path)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -393,7 +458,7 @@ impl Config {
 }
 
 fn write_starter_config(path: &Path) -> Result<()> {
-    let header = "# keep-at starter config. This is entirely optional - every field here has\n# a --flag equivalent (run `keep-at run --help`). Reach for a config file\n# once you want more than one storage location, or don't want to repeat\n# flags every time.\n#\n# At minimum, set a real limit (e.g. 500G, 2T) below.\n#\n# To get credit for the torrents you seed, set api_key to your Academic\n# Torrents API key (https://academictorrents.com/my.php) - it's only sent\n# to AT's own trackers and never logged.\n\n";
+    let header = "# keep-at starter config. This is entirely optional - every field here has\n# a --flag equivalent (run `keep-at run --help`). Reach for a config file\n# once you want more than one storage location, or don't want to repeat\n# flags every time.\n#\n# At minimum, set a real limit (e.g. 500G, 2T) below.\n#\n# To get credit for the torrents you seed, set an Academic Torrents API key\n# (https://academictorrents.com/my.php) via --api-key or <data_dir>/api_key\n# (owner-only file) - it's only sent to AT's own trackers and never logged.\n\n";
     let cfg = Config {
         storage: vec![StorageLocation {
             path: default_storage_location(),
@@ -661,11 +726,13 @@ mod tests {
     }
 
     #[test]
-    fn configs_stay_owner_only() {
+    fn secrets_split_from_world_readable_config() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("keep-at-cfgmode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let cfg = Config {
+            data_dir: dir.clone(),
             storage: vec![StorageLocation {
                 path: dir.join("storage"),
                 limit: StorageLimit::Bytes(200 * 1024 * 1024),
@@ -675,8 +742,75 @@ mod tests {
         };
         let path = dir.join("keep-at.yaml");
         cfg.save(&path).unwrap();
+        // Config: world-readable, no secret inside.
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "config with possible API key is owner-only");
+        assert_eq!(mode, 0o644, "config without secrets is world-readable");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("pass=secret"), "key never in config file");
+        // Key: owner-only beside the state.
+        let kp = dir.join(API_KEY_FILE);
+        let kmode = std::fs::metadata(&kp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(kmode, 0o600, "api_key file owner-only");
+        assert_eq!(
+            std::fs::read_to_string(&kp).unwrap().trim(),
+            "uid=1;pass=secret"
+        );
+        // Round trip: load merges the key file back.
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.api_key, "uid=1;pass=secret");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_inline_secret_migrates_legacy_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("keep-at-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Legacy shape: owner-only file, api_key inline.
+        let path = dir.join("config.yaml");
+        let legacy = format!(
+            "port: {}\ndata_dir: {}\nstorage:\n- path: {}/storage\n  limit: 200M\napi_key: uid=9;pass=hush\n",
+            DEFAULT_PORT,
+            dir.display(),
+            dir.display()
+        );
+        std::fs::write(&path, legacy).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.api_key, "uid=9;pass=hush", "legacy inline key parses");
+        Config::split_inline_secret(&path, &cfg).unwrap();
+        // Config now world-readable, key gone from the file, key file written.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "migrated config world-readable");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("pass=hush"));
+        let kp = dir.join(API_KEY_FILE);
+        let kmode = std::fs::metadata(&kp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(kmode, 0o600);
+        // Second run: no inline key, file already 0644 — no-op, still 0644.
+        let cfg2 = Config::load(&path).unwrap();
+        assert_eq!(cfg2.api_key, "uid=9;pass=hush", "key file merged on load");
+        Config::split_inline_secret(&path, &cfg2).unwrap();
+        let mode2 = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o644);
+        // Owner-only config with no inline key: widened, content untouched.
+        let bare = dir.join("bare.yaml");
+        std::fs::write(
+            &bare,
+            format!(
+                "port: {}\ndata_dir: {}\nstorage:\n- path: {}/s\n  limit: 200M\n",
+                DEFAULT_PORT,
+                dir.display(),
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bare, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg3 = Config::load(&bare).unwrap();
+        Config::split_inline_secret(&bare, &cfg3).unwrap();
+        let bmode = std::fs::metadata(&bare).unwrap().permissions().mode() & 0o777;
+        assert_eq!(bmode, 0o644, "keyless legacy config widened in place");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -34,6 +34,15 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
         print_live(&v);
         return Ok(());
     }
+    if st.running {
+        // A daemon is up but didn't answer: either a pre-socket binary
+        // (upgraded keep-at, not yet restarted) or an unreadable socket.
+        // Say so explicitly — silently showing a stale snapshot reads as
+        // live data and has confused operators before.
+        println!(
+            "  (live stats unavailable — daemon may need a restart after upgrading; showing the last persisted snapshot)"
+        );
+    }
     print_snapshot(&netstats::load_runtime(&dir.join("runtime-stats.json"))?);
     Ok(())
 }
@@ -64,7 +73,7 @@ fn print_snapshot(rs: &netstats::RuntimeStats) {
         return;
     }
     println!(
-        "runtime stats ({} uptime, uptime {}):",
+        "runtime stats (snapshot from {}, uptime {}):",
         rs.collected_at.map(format_time).unwrap_or_default(),
         humanize::human_duration(rs.uptime())
     );

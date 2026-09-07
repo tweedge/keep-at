@@ -391,19 +391,32 @@ pub fn resolve(common: &CommonArgs, args: &ConfigArgs) -> Result<Config> {
 }
 
 /// Config for commands that only need the data dir (status/stop/hosted).
+///
+/// Resolution order: --data-dir flag, --config file, then the service's
+/// world-readable data-dir pointer (`/etc/keep-at/data_dir`), then the
+/// service config file itself (legacy installs, pre-pointer), then the
+/// default. The pointer exists precisely so a root-only legacy config never
+/// blocks a read-only command run as a normal user.
 pub fn resolve_data_dir(args: &CommonArgs) -> Result<PathBuf> {
     if let Some(d) = &args.data_dir {
         return Ok(d.clone());
     }
-    let mut path = args.config.clone();
-    if path.is_none() {
-        path = service_config_if_present();
+    if let Some(p) = &args.config {
+        return Ok(Config::load(p)?.data_dir);
     }
-    if let Some(p) = path {
-        Ok(Config::load(&p)?.data_dir)
-    } else {
-        Ok(Config::default().data_dir)
+    if let Some(d) = crate::service::read_data_dir_pointer() {
+        return Ok(d);
     }
+    if let Some(p) = service_config_if_present() {
+        match Config::load(&p) {
+            Ok(cfg) => return Ok(cfg.data_dir),
+            Err(e) => anyhow::bail!(
+                "{e:#}\nhint: this is an older install; run `sudo keep-at service install` once (or restart the daemon) to write {} and open the config up",
+                crate::service::DATA_DIR_POINTER
+            ),
+        }
+    }
+    Ok(Config::default().data_dir)
 }
 
 /// Config for network-status: data dir + API key + rate limit, no storage.

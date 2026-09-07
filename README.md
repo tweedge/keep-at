@@ -132,7 +132,7 @@ Academic Torrents shows a "Hosted by" box on every torrent's details page listin
 keep-at run --api-key 'uid=12345;pass=abcdef...' --storage-location ~/.local/share/keep-at/storage --storage-limit 500G
 ```
 
-keep-at announces to AT's tracker with that passkey so the attribution happens automatically. The key is only ever sent to Academic Torrents' own trackers (`academictorrents.com` and `ipv6.academictorrents.com`); third-party trackers never see it, and keep-at never logs it or writes it into cached torrent files. You can also set it in a config file as `api_key` (see below).
+keep-at announces to AT's tracker with that passkey so the attribution happens automatically. The key is only ever sent to Academic Torrents' own trackers (`academictorrents.com` and `ipv6.academictorrents.com`); third-party trackers never see it, and keep-at never logs it or writes it into cached torrent files. It's stored owner-only in `<data_dir>/api_key` - never in the config file, so the config stays world-readable for `status` and `hosted-torrents` run as any user (see docs/CONFIG.md).
 
 ### Bandwidth limits
 

@@ -46,7 +46,7 @@ Where keep-at keeps its own bookkeeping: persisted state (what it's currently ho
 
 Defaults to `~/.local/share/keep-at` (`/var/lib/keep-at` when `HOME` is unset).
 
-Read-only operations are readable by every local user: `status` and `hosted-torrents` query the running daemon over the query socket when it's up (falling back to the persisted files when it isn't), and the log file works for any user against a daemon owned by anyone (including a root-run service), because snapshots, caches, state files, the PID file, the socket, and the log are written world-readable (0o644 files / 0o666 socket, umask-independent) and the daemon repairs directory traversal (0o755 masked in) on startup. Writes stay owner-only — a non-owner second `run` against the same data dir fails on permissions, as it should. The one exception is the config file itself (including `/etc/keep-at/config.yaml`): owner-only (0o600), since it may carry the API key.
+Read-only operations are readable by every local user: `status` and `hosted-torrents` query the running daemon over the query socket when it's up (falling back to the persisted files when it isn't), and the log file works for any user against a daemon owned by anyone (including a root-run service), because snapshots, caches, state files, the PID file, the socket, the log, and the config file itself are written world-readable (0o644 files / 0o666 socket, umask-independent) and the daemon repairs directory traversal (0o755 masked in) on startup. Writes stay owner-only — a non-owner second `run` against the same data dir fails on permissions, as it should. The one exception is the API key: it lives in `<data_dir>/api_key`, owner-only (0o600), since it is passkey-equivalent. Older installs (pre-0.8.11) kept the whole config at 0o600 for the same reason; the daemon migrates that shape on its first start after upgrading (key extracted to the file, config opened up), or `service install` re-run does it immediately.
 
 ## Scanning behavior
 
@@ -123,11 +123,7 @@ Setting it:
 keep-at run --api-key 'uid=12345;pass=abcdef...' --storage-location ~/.local/share/keep-at/storage --storage-limit 500G
 ```
 
-or in a config file:
-
-```yaml
-api_key: uid=12345;pass=abcdef...
-```
+The key is stored in `<data_dir>/api_key` (owner-only, `0600`) — not in the config file, which stays world-readable so `status`/`hosted-torrents` work for any user. Setting `--api-key` on any start (or `service install`) writes the file; removing it (or emptying the file) reverts to anonymous seeding. A legacy `api_key:` field in a config file still parses for compatibility, but the key file wins when both exist, and the daemon migrates the inline key out on first start.
 
 ## Network
 
