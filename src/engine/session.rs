@@ -38,6 +38,10 @@ pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Ses
     let build_opts = || SessionOptions {
         listen: Some(ListenerOptions {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], cfg.port)),
+            // Match the session-level ipv4_only below: the TCP listener
+            // defaults to dualstack `[::]`, which collides the same way
+            // DHT's UDP bind did on hosts with sticky IPv6 sockets.
+            ipv4_only: true,
             ..ListenerOptions::default()
         }),
         connect: Some(ConnectionOptions {
