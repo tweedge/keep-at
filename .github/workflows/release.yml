@@ -1,9 +1,14 @@
 name: release
 
 # Builds Linux binaries (glibc-linked) and publishes them as a GitHub release
-# whenever a version tag is pushed, e.g.:
+# whenever a version tag is pushed. Versioning scheme: stable releases are
+# `x.y` (e.g. v0.9), development builds are `x.y.z-beta` (e.g. v0.9.1-beta).
+# Three-component tags publish as GitHub prereleases, so the updater's
+# default (non-beta) mode — which resolves via /releases/latest, skipping
+# prereleases — never pulls a development build. Examples:
 #
-#   git tag v1.2.3 && git push origin v1.2.3
+#   git tag v0.9 && git push origin v0.9           # stable
+#   git tag v0.9.1-beta && git push origin v0.9.1-beta  # development beta
 #
 # Needs no repo secrets: GITHUB_TOKEN is provided automatically by
 # Actions, and the `contents: write` permission below is what lets this
@@ -49,11 +54,10 @@ jobs:
             notes_file=/dev/null
           fi
           args=()
-          # A tag with a prerelease suffix (e.g. v0.7.1-beta) must be marked
-          # as a prerelease on GitHub: the updater's default (non-beta) mode
-          # resolves via /releases/latest, which GitHub makes skip
-          # prereleases. Marking beta tags as prereleases is what keeps a
-          # plain `keep-at self-update` from pulling them in.
+          # Development builds (x.y.z-beta) publish as GitHub prereleases
+          # so plain `keep-at self-update` never pulls them; stable x.y
+          # tags publish as full releases. The tag shape is the source of
+          # truth (mirrors updater::channel_of), not a suffix allowlist.
           case "${{ github.ref_name }}" in
             *-beta|*-rc|*-alpha) args+=(--prerelease) ;;
           esac

@@ -45,6 +45,53 @@ async fn fetch_release(client: &reqwest::Client, user_agent: &str, url: &str) ->
     resp.json().await.context("parsing release metadata")
 }
 
+/// Versioning scheme: stable releases are `x.y` (two components, e.g.
+/// `v0.9`), development builds are `x.y.z-beta` (three components plus the
+/// `-beta` suffix for GitHub clarity, e.g. `v0.9.1-beta`). The suffix is
+/// display-only: channel membership is decided by component COUNT, so a
+/// missing suffix can never promote a beta to stable.
+///
+/// Legacy tags (`v0.8.8-beta`, two components + suffix, from before the
+/// scheme change) classify as beta via the suffix rule below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Stable,
+    Beta,
+}
+
+/// Classify a tag into its release channel. Strips a leading `v`, then:
+/// a `-beta`/`-rc`/`-alpha` suffix means beta (covers both the new
+/// `x.y.z-beta` shape and legacy `x.y-beta` tags); no suffix with exactly
+/// two dot-separated components means stable. Anything else (bare
+/// three-component tags, unknown suffixes, unparseable shapes) is neither —
+/// failing closed so an unknown shape can never leak across channels.
+pub fn channel_of(tag: &str) -> Option<Channel> {
+    let t = tag.trim_start_matches('v');
+    let (core, suffix) = match t.split_once('-') {
+        Some((c, s)) => (c, Some(s)),
+        None => (t, None),
+    };
+    if let Some(s) = suffix {
+        let s = s.to_ascii_lowercase();
+        if s.starts_with("beta") || s.starts_with("rc") || s.starts_with("alpha") {
+            return Some(Channel::Beta);
+        }
+        // Unknown suffix: not ours, exclude from both channels — whatever
+        // the component count. (A bare three-component tag without suffix
+        // is likewise NOT ours: the scheme always ships -beta on
+        // development builds. Failing closed keeps an unknown shape from
+        // ever leaking across channels in either direction.)
+        return None;
+    }
+    match core.split('.').count() {
+        // Two components, no suffix: a stable release (x.y).
+        2 => Some(Channel::Stable),
+        // Three components WITHOUT suffix: NOT ours (development builds
+        // always ship -beta). Fail closed — unclassified, never leaks.
+        _ => None,
+    }
+}
+
 async fn fetch_latest(
     client: &reqwest::Client,
     user_agent: &str,
@@ -65,10 +112,16 @@ async fn fetch_latest(
         anyhow::bail!("fetching releases returned {status}");
     }
     let releases: Vec<Release> = resp.json().await.context("parsing release metadata")?;
+    // Beta channel: newest release whose tag classifies as beta. The
+    // releases API returns newest-first, so the first beta-classified,
+    // non-draft release wins. (Drafts excluded; GitHub prerelease flags
+    // ignored — the tag shape is the source of truth, so a mis-flagged
+    // release can't cross channels.)
     releases
         .into_iter()
-        .find(|r| !r.draft)
-        .context("no releases found")
+        .filter(|r| !r.draft)
+        .find(|r| channel_of(&r.tag_name) == Some(Channel::Beta))
+        .context("no beta releases found")
 }
 
 pub async fn latest_version(
@@ -184,5 +237,28 @@ mod tests {
         );
         assert!(asset_name().starts_with("keep-at_linux_"));
         assert!(asset_name().ends_with(".tar.gz"));
+    }
+
+    #[test]
+    fn channel_classification() {
+        use Channel::{Beta, Stable};
+        // New scheme: two components stable, three + suffix beta.
+        assert_eq!(channel_of("v0.9"), Some(Stable));
+        assert_eq!(channel_of("0.10"), Some(Stable));
+        assert_eq!(channel_of("v1.0"), Some(Stable));
+        assert_eq!(channel_of("v0.9.1-beta"), Some(Beta));
+        assert_eq!(channel_of("v0.10.2-beta"), Some(Beta));
+        assert_eq!(channel_of("v1.0.1-beta"), Some(Beta));
+        // Legacy tags (two components + suffix, pre-scheme-change).
+        assert_eq!(channel_of("v0.8.8-beta"), Some(Beta));
+        assert_eq!(channel_of("v0.7.2-rc"), Some(Beta));
+        // Unknown shapes classify as neither (never leak across channels):
+        // a bare three-component tag or an unknown suffix is NOT ours, so
+        // both stay unclassified rather than risk promoting them.
+        assert_eq!(channel_of("v0.9.1"), None);
+        assert_eq!(channel_of("v0.9-experimental"), None);
+        assert_eq!(channel_of("v0.9.1-next"), None);
+        assert_eq!(channel_of("nightly"), None);
+        assert_eq!(channel_of(""), None);
     }
 }

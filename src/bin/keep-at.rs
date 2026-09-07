@@ -255,9 +255,9 @@ async fn cmd_self_update(beta: bool) -> Result<()> {
         println!("keep-at is already up to date ({current})");
         return Ok(());
     }
-    // Never "update" sideways or backwards: the non-beta channel resolves
-    // to the latest STABLE, which can lag a running beta (e.g. running
-    // 0.8.6-beta while stable is 0.7.2). Suggest --beta instead of
+    // Never "update" sideways or backwards: the stable channel resolves
+    // to the latest STABLE (x.y), which can lag a running beta (e.g.
+    // running 0.9.1-beta while stable is 0.9). Suggest --beta instead of
     // downloading an older binary over a newer one.
     if !beta && version_older_or_equal(&latest, current) {
         println!(

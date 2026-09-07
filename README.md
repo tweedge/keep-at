@@ -76,7 +76,7 @@ And to update to the latest release:
 keep-at self-update
 ```
 
-By default this only considers stable releases. To opt into prerelease/beta builds, add `--beta`:
+By default this only considers stable releases (`x.y`, e.g. `v0.9`). To track development builds (`x.y.z-beta`, e.g. `v0.9.1-beta`), add `--beta`:
 
 ```
 keep-at self-update --beta
@@ -208,11 +208,18 @@ The smoke test downloads two real files from Academic Torrents (a few KB each) i
 
 ## Releasing
 
-Update `RELEASE_NOTES.md` at the repo root with what's actually in the release, commit it, then push a matching version tag. Always soft-wrap `RELEASE_NOTES.md` - each paragraph or bullet on one line, no matter how long, letting the renderer wrap it - never hard-wrap with manual line breaks partway through a paragraph. GitHub's release view renders single trailing newlines as literal breaks, so a hard-wrapped paragraph shows up as a jagged staircase instead of a normal paragraph.
+Update `RELEASE_NOTES.md` at the repo root with what's actually in the release, commit it, then push a matching version tag. Versioning scheme: stable releases are `x.y` (e.g. `v0.9`), development builds are `x.y.z-beta` (e.g. `v0.9.1-beta`) — two components stable, three plus the `-beta` suffix beta. Always soft-wrap `RELEASE_NOTES.md` - each paragraph or bullet on one line, no matter how long, letting the renderer wrap it - never hard-wrap with manual line breaks partway through a paragraph. GitHub's release view renders single trailing newlines as literal breaks, so a hard-wrapped paragraph shows up as a jagged staircase instead of a normal paragraph.
 
 ```
-git tag v1.2.3
-git push origin v1.2.3
+git tag v0.9
+git push origin v0.9
+```
+
+or for a development beta:
+
+```
+git tag v0.9.1-beta
+git push origin v0.9.1-beta
 ```
 
 Two GitHub Actions workflows watch for tags matching `v*.*.*`: `.github/workflows/release.yml` cross-compiles Linux targets in `scripts/build-release.sh` (glibc-linked binaries for amd64/arm64/arm/386) and publishes them as a GitHub release using `RELEASE_NOTES.md` as the release notes, and `.github/workflows/docker.yml` builds a multi-arch (amd64/arm64) image and pushes it to `ghcr.io/tweedge/keep-at` tagged with the version, the `major.minor`, and `latest`. Neither needs any repo secrets - both run entirely on the `GITHUB_TOKEN` Actions provides automatically.

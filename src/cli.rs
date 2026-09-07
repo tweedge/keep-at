@@ -182,7 +182,7 @@ pub struct NetworkStatusArgs {
 
 #[derive(Debug, Args)]
 pub struct SelfUpdateArgs {
-    /// Allow prerelease/beta builds
+    /// Track development builds (x.y.z-beta) instead of stable releases (x.y)
     #[arg(long, default_value_t = false)]
     pub beta: bool,
 }
