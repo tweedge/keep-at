@@ -1,5 +1,17 @@
 # keep-at release notes
 
+## v0.8.9-beta - world-readable snapshots, stable/beta versioning scheme
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### `status` and `hosted-torrents` work for any local user
+
+A daemon running as root (e.g. the systemd service) used to leave its data dir and snapshots owner-only under a restrictive umask, so `keep-at status` or `hosted-torrents` as a normal user died on permissions. All shared files (snapshots, state, caches, PID file, daemon log, `database.xml`, torrent-cache) are now written world-readable (`0o644`, umask-independent via explicit `set_permissions` after write) with `0o755` directory creation, and the daemon plus the read commands mask `0o755` back into the data-dir chain on startup (best effort, never fatal), so a root-owned dir created under umask `077` still lets any user traverse to the snapshots. Configs stay owner-only (`0o600`) since they may carry the API key. Pinned by tests that force umask `077` and assert the modes, and verified live (a `700` dir repaired to `755` by `status`; daemon-written `network-stats.json` landing `644`).
+
+### Releases are now `x.y` stable, `x.y.z-beta` development
+
+Stable releases are two components (`v0.9`), development builds are three components plus the `-beta` suffix (`v0.9.1-beta`, suffix kept so the GitHub release list reads clearly at a glance). The updater classifies by tag shape (`updater::channel_of`): a `-beta`/`-rc`/`-alpha` suffix means beta (covering all existing `v0.8.x-beta` tags), two components with no suffix means stable, and anything else (bare three-component tags, unknown suffixes) is neither — failing closed so an unknown shape can never leak across channels. The beta channel takes the newest beta-classified non-draft release and ignores GitHub prerelease flags (tag shape is the source of truth, so a mis-flagged release can't cross channels); the stable channel still resolves via `/releases/latest`, which skips prereleases. `release.yml` documents the scheme and still marks suffixed tags `--prerelease`; `--beta` help and the README's Releasing section describe the numbering. `install.sh` is unchanged (it resolves latest stable, unaffected).
+
 ## v0.8.8-beta - interactive sudo fallback for elevation, CI least privilege
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
