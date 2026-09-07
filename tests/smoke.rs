@@ -148,6 +148,7 @@ async fn smoke_real_academictorrents() {
         keep_at::engine::EngineOptions {
             catalog_url: Some(format!("{base}/database.xml")),
             at_base_url: None,
+            scrape_backoff: None,
         },
     )
     .await
@@ -259,6 +260,7 @@ async fn smoke_real_catalog_subset() {
         keep_at::engine::EngineOptions {
             catalog_url: Some(format!("{base}/database.xml")),
             at_base_url: None,
+            scrape_backoff: None,
         },
     )
     .await

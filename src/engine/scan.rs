@@ -56,6 +56,10 @@ pub struct Engine {
     /// (positive favors larger torrents in ties, negative smaller ones).
     /// Computed once at startup; disk limits are static per install.
     size_bias: f64,
+    /// How long to wait after a tracker 429 before failing the candidate
+    /// fast (production 60s). From Options; injectable so the backoff path
+    /// runs fast in tests.
+    scrape_backoff: Duration,
     started_at: std::time::Instant,
     rate: Arc<tokio::sync::Mutex<RateLimiter>>,
     evaluated_counts: tokio::sync::Mutex<Vec<u32>>,
@@ -340,6 +344,9 @@ struct EvalCtx {
     user_agent: String,
     rate: Arc<tokio::sync::Mutex<RateLimiter>>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    /// 429 backoff (production 60s; ~0s in tests). Stored here so spawned
+    /// evaluation workers see the same value as held-refresh.
+    scrape_backoff: Duration,
 }
 
 fn eval_torrent_cache_path(data_dir: &Path, info_hash_hex: &str) -> PathBuf {
@@ -415,8 +422,9 @@ async fn eval_scrape_swarm(
                     // Nothing is cached; the next scan retries these.
                     tracing::warn!("tracker rate-limited, backing off: {e:#}");
                     let mut sd = ctx.shutdown.clone();
+                    let backoff = ctx.scrape_backoff;
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                        _ = tokio::time::sleep(backoff) => {}
                         _ = sd.changed() => {
                             anyhow::bail!("scan interrupted by shutdown");
                         }
@@ -511,6 +519,11 @@ async fn evaluate_one_item(
 pub struct Options {
     pub catalog_url: Option<String>,
     pub at_base_url: Option<String>,
+    /// How long evaluation and held-refresh wait after a tracker 429 before
+    /// failing the candidate fast. Production default 60s; tests set ~0s so
+    /// the backoff path runs fast instead of being skipped or slow.
+    /// None means the 60s production default.
+    pub scrape_backoff: Option<Duration>,
 }
 
 impl Engine {
@@ -619,6 +632,7 @@ impl Engine {
             max_torrents,
             ram_budget: budget,
             size_bias,
+            scrape_backoff: opts.scrape_backoff.unwrap_or(Duration::from_secs(60)),
             started_at: std::time::Instant::now(),
             rate: Arc::new(tokio::sync::Mutex::new(RateLimiter {
                 per_second: 0.5,
@@ -946,7 +960,16 @@ impl Engine {
 
         let counts: Vec<u32> = floor_accum.lock().await.clone();
         *self.evaluated_counts.lock().await = counts.clone();
-        let floor = selector::seeder_floor(&counts);
+        // The floor anchors the NEXT scan's seed-scarcity gate. A scan that
+        // evaluated nothing new (everything already held, all skipped) has
+        // no fresh seeder data: keep the persisted floor instead of
+        // clobbering it with 0, which would silently turn the next scan's
+        // gate conservative (floor 0 behaves as floor 1).
+        let floor = if counts.is_empty() {
+            seeder_floor
+        } else {
+            selector::seeder_floor(&counts)
+        };
         tracing::info!(
             "scrape complete: available={} processed={} total={} elapsed={} library={} fetched={} cached-meta={} scrapes={} cached-scrapes={} eligible={} seeder-floor={}",
             batch.len(), processed, total_candidates,
@@ -1023,6 +1046,7 @@ impl Engine {
                 user_agent: buildinfo::user_agent(),
                 rate: self.rate.clone(),
                 shutdown: shutdown.clone(),
+                scrape_backoff: self.scrape_backoff,
             }),
             shutdown: shutdown.clone(),
             items,
@@ -1101,8 +1125,9 @@ impl Engine {
                             "tracker rate-limited during held refresh, backing off: {e:#}"
                         );
                         let mut sd = shutdown.clone();
+                        let backoff = self.scrape_backoff;
                         tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                            _ = tokio::time::sleep(backoff) => {}
                             _ = sd.changed() => {
                                 anyhow::bail!("scan interrupted by shutdown");
                             }

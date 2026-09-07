@@ -78,13 +78,28 @@ impl Fetcher {
 // bencode parser returns the raw span, which for some AT .torrent files
 // leaks trailing bencode into the string (e.g. "...announce.php13:...").
 // Cut at the first interior "<digits>:" run whose prefix is a valid URL
-// (a port like ":1337" is kept: its digit run is preceded by host chars
-// with no '/' before it), then validate the result.
+// and whose digit run is NOT part of the URL's own authority section
+// (host, or host:port). A port like ":1337" is kept, as is a dotted-quad
+// host ("127.0.0.1:42315": the run before the port colon is preceded by a
+// dot/digit inside the authority, so it is never treated as a leak).
 fn trunc_url(raw: &[u8]) -> &[u8] {
     let mut end = raw
         .iter()
         .position(|&b| !(0x21..=0x7e).contains(&b))
         .unwrap_or(raw.len());
+    // Authority section = bytes between "://" and the next '/'. Digit runs
+    // inside it (octets, ports) are URL structure, never bencode leaks.
+    let auth_end = raw
+        .windows(3)
+        .position(|w| w == b"://")
+        .map(|p| {
+            raw[p + 3..]
+                .iter()
+                .position(|&b| b == b'/')
+                .map(|q| p + 3 + q)
+                .unwrap_or(raw.len())
+        })
+        .unwrap_or(0);
     let mut i = 0;
     while i < end {
         if raw[i].is_ascii_digit() {
@@ -92,10 +107,8 @@ fn trunc_url(raw: &[u8]) -> &[u8] {
             while j < end && raw[j].is_ascii_digit() {
                 j += 1;
             }
-            if j < end && raw[j] == b':' && j > i {
-                let prev_is_host =
-                    i > 0 && raw[i - 1].is_ascii_alphanumeric() && !raw[..i].contains(&b'/');
-                if is_url(&raw[..i]) && !prev_is_host {
+            if j < end && raw[j] == b':' && j > i && i >= auth_end {
+                if is_url(&raw[..i]) {
                     end = i;
                     break;
                 }
@@ -296,6 +309,18 @@ mod tests {
         assert_eq!(
             t(b"http://jmlr.org/papers/v14/x13a.pdf"),
             "http://jmlr.org/papers/v14/x13a.pdf"
+        );
+        // dotted-quad host + port untouched (regression: the old heuristic
+        // cut "http://127.0.0.1" at the port colon, breaking every
+        // 127.0.0.1-based test stub and any real dotted-quad tracker).
+        assert_eq!(
+            t(b"http://127.0.0.1:42315/announce"),
+            "http://127.0.0.1:42315/announce"
+        );
+        // leak after a dotted-quad URL still cut
+        assert_eq!(
+            t(b"http://127.0.0.1:42315/announce13:announce-listll41:http://x"),
+            "http://127.0.0.1:42315/announce"
         );
     }
 

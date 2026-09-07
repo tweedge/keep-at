@@ -1,8 +1,8 @@
 name: ci
 
 # Fast checks on every push and pull request: formatting, lints, and the
-# offline unit tests. Live smoke tests (KEEPAT_SMOKE_*) stay opt-in - they
-# need real network access to Academic Torrents.
+# full hermetic suite (unit + integration). Live smoke tests (KEEPAT_SMOKE_*)
+# stay opt-in - they need real network access to Academic Torrents.
 on:
   push:
   pull_request:
@@ -23,5 +23,5 @@ jobs:
       - name: Lints
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Unit tests (offline)
-        run: cargo test --locked --lib
+      - name: Tests (unit + hermetic integration)
+        run: cargo test --locked
