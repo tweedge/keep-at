@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.4-beta - dualstack sockets with IPv4 fallback (restart fix, final)
+
+This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
+
+### IPv6 stays; restarts survive socket residue either way
+
+v0.8.2/v0.8.3 pinned IPv4-only sockets to dodge a restart bind failure - reverted per review: keep-at supports IPv6 fully. Session creation now tries dualstack first (attempt 1), falls back to IPv4-only on bind failure (attempt 2, with a warning), and tries dualstack once more (attempt 3) in case the collision was transient residue from the just-stopped instance. The production host that motivated this binds dualstack fine ~20 minutes after a stop; the fallback exists for the fast-restart window (watchdog, crash loops) where the lingering socket collides. Includes the v0.8.1 decision-gate debug tracing.
+
 ## v0.8.3-beta - IPv4-only TCP listener (restart fix, part 2)
 
 This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.

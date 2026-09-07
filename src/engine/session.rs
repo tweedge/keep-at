@@ -30,18 +30,19 @@ pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Ses
     // Default output folder is unused (every torrent passes output_folder
     // explicitly); point it at the data dir so nothing lands somewhere odd.
     //
-    // Session creation binds listen + DHT sockets, which can transiently
-    // collide right after a previous instance released them. Retry a few
-    // times with gaps before giving up, so a watchdog restart (or a fast
-    // manual stop/start) doesn't die on TIME_WAIT-style residue.
+    // Socket strategy: dualstack first (IPv6 + IPv4 on `[::]`), IPv4-only
+    // fallback when the dualstack bind collides. On some hosts (observed:
+    // shared-seedbox Gentoo) a just-released dualstack socket lingers and
+    // re-binding `[::]` fails with EADDRINUSE while 0.0.0.0 succeeds - so a
+    // watchdog restart right after a stop would die without the fallback.
+    // IPv6 stays fully supported: the fallback only triggers when dualstack
+    // actually fails, and session creation retries either way (below), so a
+    // transient collision resolves on the next attempt.
     // (SessionOptions isn't Clone, so this is a small closure rebuild.)
-    let build_opts = || SessionOptions {
+    let build_opts = |ipv4_only: bool| SessionOptions {
         listen: Some(ListenerOptions {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], cfg.port)),
-            // Match the session-level ipv4_only below: the TCP listener
-            // defaults to dualstack `[::]`, which collides the same way
-            // DHT's UDP bind did on hosts with sticky IPv6 sockets.
-            ipv4_only: true,
+            ipv4_only,
             ..ListenerOptions::default()
         }),
         connect: Some(ConnectionOptions {
@@ -53,20 +54,35 @@ pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Ses
         disable_local_service_discovery: true,
         client_name_and_version: Some(buildinfo::seeder_user_agent()),
         peer_id: Some(peer_id_from_prefix()),
-        // IPv4-only sockets: on some hosts (observed: shared-seedbox
-        // Gentoo) the dualstack `[::]` UDP bind for DHT collides with a
-        // just-released socket and restart dies with EADDRINUSE, while a
-        // plain 0.0.0.0 bind succeeds. DHT over IPv4 loses no AT
-        // connectivity (trackers + IPv4 peers dominate).
-        ipv4_only: true,
+        ipv4_only,
         ..Default::default()
     };
     let mut last_err = anyhow::anyhow!("session creation never attempted");
-    for attempt in 1..=3 {
-        match Session::new_with_opts(cfg.data_dir.clone(), build_opts()).await {
-            Ok(session) => return Ok(session),
+    // Attempt 1: dualstack. Attempts 2-3: IPv4-only fallback, then one more
+    // dualstack try in case the residue cleared (preserves IPv6 whenever the
+    // collision was transient).
+    for (attempt, (ipv4_only, mode)) in [
+        (false, "dualstack"),
+        (true, "ipv4-only"),
+        (false, "dualstack"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, pair)| (i + 1, pair))
+    {
+        match Session::new_with_opts(cfg.data_dir.clone(), build_opts(ipv4_only)).await {
+            Ok(session) => {
+                if ipv4_only {
+                    tracing::warn!(
+                        "dualstack socket bind failed; running IPv4-only this boot (retry dualstack on next restart)"
+                    );
+                }
+                return Ok(session);
+            }
             Err(e) => {
-                last_err = e.context(format!("creating rqbit session (attempt {attempt}/3)"));
+                last_err = e.context(format!(
+                    "creating rqbit session (attempt {attempt}/3, {mode})"
+                ));
                 if attempt < 3 {
                     tracing::warn!("{last_err:#}; retrying in 10s");
                     tokio::time::sleep(Duration::from_secs(10)).await;
