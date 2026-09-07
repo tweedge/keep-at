@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.2-beta - restart reliably: IPv4 sockets + session retry
+
+This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
+
+### Restarts no longer die on DHT socket residue
+
+A month-long production test caught this on day one: after a clean stop, an immediate restart died creating the rqbit session - DHT's UDP `[::]:0` bind failed with `EADDRINUSE` while a plain IPv4 bind on the same host succeeded (shared-seedbox Gentoo; the just-released dualstack socket collides). The seeder session now uses IPv4-only sockets throughout (TCP listen + DHT; no connectivity loss for Academic Torrents content, whose trackers and peers are overwhelmingly IPv4), and session creation retries 3x with 10s gaps so watchdog restarts and fast manual stop/starts survive transient socket residue instead of exiting. Without this fix, any crash or host reboot could have left the node down until an operator intervened - exactly what the watchdog is for.
+
 ## v0.8.1-beta - decision-gate debug tracing
 
 This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
