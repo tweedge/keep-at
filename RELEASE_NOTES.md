@@ -1,5 +1,17 @@
 # keep-at release notes
 
+## v0.8.8-beta - interactive sudo fallback for elevation, CI least privilege
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### Terminal installs prompt for a password instead of dying
+
+v0.8.7's no-sudo elevation only tried `sudo -n`, so on a terminal with no cached credentials `service install` died with sudo's "interactive authentication is required" and exit 1. Elevation now probes `sudo -n true` first (no side effects): when passwordless sudo works the plan is just `sudo -n`; otherwise it falls through to interactive `sudo` on a terminal (the operator sees the normal password prompt, verified live) and then `pkexec`. Non-terminal contexts are unchanged — plain `sudo` is skipped without a TTY so scripts and CI can never hang on a prompt. A review of the ecosystem (`runas`, `sudo2`, `sudo-proxy`) found no crate worth adopting: `runas` forces `-k` prompts, `sudo2` is always-interactive plus extra dependencies, `sudo-proxy` is an MCP approval product — the ~100 lines in `service.rs` stay, with the fallback matrix pinned by unit tests.
+
+### CI runs least-privilege
+
+The CI workflow now declares `permissions: contents: read` (resolving code-scanning alert #4); the release workflow keeps `contents: write` since it publishes releases.
+
 ## v0.8.7-beta - no-sudo elevation, grouped help, max keyword, byte-size linting, updater fixes
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
