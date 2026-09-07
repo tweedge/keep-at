@@ -133,4 +133,32 @@ mod tests {
         assert_eq!(st2.all().len(), 1);
         assert_eq!(st2.bytes_used(Path::new("/x")), 10);
     }
+
+    #[test]
+    fn bytes_used_is_nominal_not_on_disk() {
+        // Regression test for the production over-commit defect: free-space
+        // accounting must price held NOMINAL sizes (what downloads will
+        // eventually occupy), never on-disk actuals (sparse files lag by
+        // orders of magnitude). bytes_used sums size_bytes verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut st = State::load(&path).unwrap();
+        for (ih, size) in [("aa", 100u64), ("bb", 200u64)] {
+            st.put(Torrent {
+                info_hash: ih.to_string(),
+                title: "t".to_string(),
+                size_bytes: size,
+                storage_location: PathBuf::from("/loc"),
+                added_at: Utc::now(),
+                piece_count: 0,
+                last_known_seeders: 0,
+                completed_pieces: 0,
+                last_progress_at: None,
+            })
+            .unwrap();
+        }
+        // 300 nominal regardless of what exists on disk (nothing does).
+        assert_eq!(st.bytes_used(Path::new("/loc")), 300);
+        assert_eq!(st.bytes_used(Path::new("/other")), 0);
+    }
 }

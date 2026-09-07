@@ -1118,8 +1118,24 @@ impl Engine {
     }
 
     fn free_bytes(&self, loc: &crate::config::StorageLocation) -> u64 {
-        let on_disk = dir_size_bytes(&loc.path);
-        let mut free = loc.limit_bytes().saturating_sub(on_disk);
+        // Nominal-plus-buffer accounting: price what's HELD (state nominal +
+        // per-torrent buffer), not what's on disk. Downloads land sparse, so
+        // on-disk actuals lag nominal by orders of magnitude early on; pricing
+        // actuals would let the node over-commit the location many times over
+        // (observed live: 4.17 TB nominal held against a 3.8 TB limit while
+        // actual disk sat at 277 GB). A partially-downloaded torrent reserves
+        // its full eventual footprint.
+        let held_nominal = self.state.bytes_used(&loc.path);
+        let held_buffers = self
+            .state
+            .all()
+            .iter()
+            .filter(|t| t.storage_location == loc.path)
+            .count() as u64
+            * PER_TORRENT_SIZE_BUFFER;
+        let mut free = loc
+            .limit_bytes()
+            .saturating_sub(held_nominal.saturating_add(held_buffers));
         if let Ok(dev_free) = storage::device_free_bytes(&loc.path) {
             free = free.min(dev_free);
         }

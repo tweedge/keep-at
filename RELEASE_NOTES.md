@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.6-beta - fix storage over-commit: price held nominal, not on-disk actuals
+
+This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
+
+### Free-space accounting no longer trusts sparse files
+
+The month-long production test caught a real over-commit bug: free space per location was computed as limit minus on-disk bytes, but downloads land as sparse files whose actuals lag nominal sizes by orders of magnitude early on. The node held 4.17 TB nominal against a 3.8 TB limit while the disk showed only 277 GB - and would have kept adding unboundedly, blowing the RAM budget downstream (per-torrent bookkeeping follows count, not bytes). Free space is now limit minus held nominal sizes plus per-torrent buffers, exactly as documented; a partially-downloaded torrent reserves its full eventual footprint from the moment it is added. Includes v0.8.5's streaming acting, v0.8.1's decision-gate tracing, and the v0.8.4 dualstack-with-fallback sockets.
+
 ## v0.8.5-beta - truly incremental acting (first seeds in minutes, not hours)
 
 This is a beta release for field validation of production-test findings; the next stable cut will be identical apart from the version tag.
