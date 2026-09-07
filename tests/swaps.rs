@@ -40,12 +40,12 @@ fn setup(fixtures: &[Fixture]) -> (Stub, String, Vec<String>) {
 #[tokio::test(flavor = "multi_thread")]
 async fn swap_beats_margin_and_covers_cost() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    // Held: one 10-seeder, 1 MB torrent (1 piece). Candidate: 5-seeder,
-    // 512 KB (1 piece). Margin 2: 5 <= 10-2 passes. Disk: 512 KB fits in
-    // the 1 MB location only by displacing (1 MB held + 512 KB > 1 MB...
-    // actually 1.5 MB > 1 MB: must displace). RAM: trivially covered.
-    let held_fx = Fixture::new("held-big", 1_000_000, 10);
-    let cand_fx = Fixture::new("cand-small", 512_000, 5);
+    // Held: one 10-seeder, 100 MB torrent (1 piece). Candidate: 5-seeder,
+    // 51.2 MB (1 piece). Margin 2: 5 <= 10-2 passes. Disk: the candidate
+    // fits in the 150 MB location only by displacing (100 + 51.2 MB +
+    // buffers > 150 MB). RAM: trivially covered.
+    let held_fx = Fixture::new("held-big", 100_000_000, 10);
+    let cand_fx = Fixture::new("cand-small", 51_200_000, 5);
     let (stub, _catalog_base, hexes) = setup(&[held_fx.clone(), cand_fx.clone()]);
     assert_eq!(hexes.len(), 2);
     let (held_hex, cand_hex) = (hexes[0].clone(), hexes[1].clone());
@@ -64,7 +64,7 @@ async fn swap_beats_margin_and_covers_cost() {
         data_dir.clone(),
         storage_dir.clone(),
         test_port(21),
-        1_500_000,
+        150_000_000,
     );
     cfg.scan.min_seed_margin = 2;
     let mut engine = with_timeout(
@@ -103,7 +103,7 @@ async fn swap_beats_margin_and_covers_cost() {
             data_dir.clone(),
             storage_dir.clone(),
             test_port(22),
-            1_500_000,
+            150_000_000,
         );
         c.scan.min_seed_margin = 2;
         c
@@ -154,15 +154,15 @@ async fn margin_blocks_weak_candidate() {
     // gate is forced open and free-space... note free-space fill does NOT
     // check the margin (nothing displaced). To isolate the margin, the
     // location must be FULL: held torrent exactly fills it.
-    let held_fx = Fixture::new("held-full", 1_000_000, 10);
-    let cand_fx = Fixture::new("cand-weak", 100_000, 9);
+    let held_fx = Fixture::new("held-full", 100_000_000, 10);
+    let cand_fx = Fixture::new("cand-weak", 10_000_000, 9);
     let (stub, _catalog_base, hexes) = setup(&[held_fx.clone(), cand_fx.clone()]);
     let (held_hex, cand_hex) = (hexes[0].clone(), hexes[1].clone());
 
     let data_dir = tempfile::tempdir().unwrap().keep();
     let storage_dir = tempfile::tempdir().unwrap().keep();
 
-    // Phase 1 holds the 1 MB torrent in a 1 MB location (full).
+    // Phase 1 holds the 100 MB torrent in a ~100.3 MB location (full: no room for even the buffer of another).
     let (cat1, _s1) = common::serve_catalog(Stub::catalog_xml(&[(
         held_fx.title.clone(),
         held_hex.clone(),
@@ -173,7 +173,7 @@ async fn margin_blocks_weak_candidate() {
         data_dir.clone(),
         storage_dir.clone(),
         test_port(23),
-        1_500_000,
+        105_000_000,
     );
     cfg.scan.min_seed_margin = 2;
     let mut engine = with_timeout(
@@ -190,7 +190,7 @@ async fn margin_blocks_weak_candidate() {
     engine.close().await;
 
     // Phase 2: weak candidate cannot displace (margin), cannot fit
-    // free-space (location full: 1 MB held + 100 KB > 1 MB limit).
+    // free-space (location full: 100 MB held + 10 MB > ~100.3 MB limit).
     let (cat2, _s2) = common::serve_catalog(Stub::catalog_xml(&[
         (held_fx.title.clone(), held_hex.clone(), held_fx.size),
         (cand_fx.title.clone(), cand_hex.clone(), cand_fx.size),
@@ -200,7 +200,7 @@ async fn margin_blocks_weak_candidate() {
         data_dir.clone(),
         storage_dir.clone(),
         test_port(24),
-        1_500_000,
+        105_000_000,
     );
     cfg2.scan.min_seed_margin = 2;
     let mut engine2 = with_timeout(

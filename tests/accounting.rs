@@ -15,14 +15,14 @@ use common::{test_config, test_options, test_port, with_timeout, Fixture, Stub, 
 #[tokio::test(flavor = "multi_thread")]
 async fn free_space_prices_nominal_not_actual() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    // Two 600 KB torrents, 1 MB location (+256 KiB buffer each):
-    // first fits (600K+256K < 1MB), second needs 600K+256K > ~200K free.
+    // Two 60 MB torrents, 110 MB location (+256 KiB buffer each):
+    // first fits (60M+256K < 110M), second needs 60M+256K > ~50M free.
     // On-disk actuals are ~zero (sparse, nothing downloaded yet) — an
     // actuals-pricing implementation would hold both; nominal pricing
     // holds exactly one.
     let fixtures = vec![
-        Fixture::new("first-600k", 600_000, 1),
-        Fixture::new("second-600k", 600_000, 1),
+        Fixture::new("first-60m", 60_000_000, 1),
+        Fixture::new("second-60m", 60_000_000, 1),
     ];
     let state = Arc::new(Mutex::new(StubState::default()));
     let mut raws = Vec::new();
@@ -47,7 +47,7 @@ async fn free_space_prices_nominal_not_actual() {
 
     let data_dir = tempfile::tempdir().unwrap().keep();
     let storage_dir = tempfile::tempdir().unwrap().keep();
-    let cfg = test_config(data_dir.clone(), storage_dir, test_port(31), 1_000_000);
+    let cfg = test_config(data_dir.clone(), storage_dir, test_port(31), 110_000_000);
     let mut engine = with_timeout(
         60,
         "engine new",
@@ -68,5 +68,5 @@ async fn free_space_prices_nominal_not_actual() {
     );
     // And the survivor fully covers its nominal: state nominal <= limit.
     let nominal: u64 = held.iter().map(|t| t.size_bytes).sum();
-    assert!(nominal <= 1_000_000, "held nominal within limit");
+    assert!(nominal <= 110_000_000, "held nominal within limit");
 }
