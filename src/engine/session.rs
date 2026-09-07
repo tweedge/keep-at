@@ -22,37 +22,55 @@ use crate::config::Config;
 /// peer buffers are the dominant per-torrent RAM term, so small hosts trade
 /// per-torrent swarm speed for more held torrents.
 pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Session>> {
-    let listen = ListenerOptions {
-        listen_addr: SocketAddr::from(([0, 0, 0, 0], cfg.port)),
-        ..ListenerOptions::default()
-    };
-
-    let connect = ConnectionOptions {
-        enable_tcp: true,
-        ..ConnectionOptions::default()
-    };
-
     let ratelimits = LimitsConfig {
         upload_bps: nonzero_u32(cfg.upload_rate_limit),
         download_bps: nonzero_u32(cfg.download_rate_limit),
     };
 
-    let opts = SessionOptions {
-        listen: Some(listen),
-        connect: Some(connect),
+    // Default output folder is unused (every torrent passes output_folder
+    // explicitly); point it at the data dir so nothing lands somewhere odd.
+    //
+    // Session creation binds listen + DHT sockets, which can transiently
+    // collide right after a previous instance released them. Retry a few
+    // times with gaps before giving up, so a watchdog restart (or a fast
+    // manual stop/start) doesn't die on TIME_WAIT-style residue.
+    // (SessionOptions isn't Clone, so this is a small closure rebuild.)
+    let build_opts = || SessionOptions {
+        listen: Some(ListenerOptions {
+            listen_addr: SocketAddr::from(([0, 0, 0, 0], cfg.port)),
+            ..ListenerOptions::default()
+        }),
+        connect: Some(ConnectionOptions {
+            enable_tcp: true,
+            ..ConnectionOptions::default()
+        }),
         ratelimits,
         peer_limit: Some(crate::engine::ram::peer_limit_for_budget(ram_budget)),
         disable_local_service_discovery: true,
         client_name_and_version: Some(buildinfo::seeder_user_agent()),
         peer_id: Some(peer_id_from_prefix()),
+        // IPv4-only sockets: on some hosts (observed: shared-seedbox
+        // Gentoo) the dualstack `[::]` UDP bind for DHT collides with a
+        // just-released socket and restart dies with EADDRINUSE, while a
+        // plain 0.0.0.0 bind succeeds. DHT over IPv4 loses no AT
+        // connectivity (trackers + IPv4 peers dominate).
+        ipv4_only: true,
         ..Default::default()
     };
-
-    // Default output folder is unused (every torrent passes output_folder
-    // explicitly); point it at the data dir so nothing lands somewhere odd.
-    Session::new_with_opts(cfg.data_dir.clone(), opts)
-        .await
-        .context("creating rqbit session")
+    let mut last_err = anyhow::anyhow!("session creation never attempted");
+    for attempt in 1..=3 {
+        match Session::new_with_opts(cfg.data_dir.clone(), build_opts()).await {
+            Ok(session) => return Ok(session),
+            Err(e) => {
+                last_err = e.context(format!("creating rqbit session (attempt {attempt}/3)"));
+                if attempt < 3 {
+                    tracing::warn!("{last_err:#}; retrying in 10s");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Build a short-lived census probe session with the scraper identity,
