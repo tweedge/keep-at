@@ -1252,6 +1252,24 @@ impl Engine {
         let mut c = c.clone();
         c.piece_count = md.piece_count;
 
+        // FD-aware admission: rqbit opens one fd per non-padding file at add
+        // time and holds it for the torrent's lifetime. A many-file candidate
+        // that would push the process past RLIMIT_NOFILE is skipped here —
+        // before opening anything, before rolling, before touching state —
+        // so fd exhaustion is orderly selection (this candidate waits for a
+        // roomier scan), not a hard "Too many open files" add failure. The
+        // guard reads the live headroom per candidate (cheap: one getrlimit
+        // + one /proc readdir); unknown headroom admits.
+        if !crate::fdlimit::fits_in_headroom(md.file_count as u64, crate::fdlimit::fd_headroom()) {
+            tracing::info!(
+                "skipping candidate: needs {} file fds but only {} free (title={})",
+                md.file_count,
+                crate::fdlimit::fd_headroom().unwrap_or(u64::MAX),
+                c.title
+            );
+            return;
+        }
+
         let mut decision = selector::SwapDecision {
             should_swap: false,
             chance: 0.0,

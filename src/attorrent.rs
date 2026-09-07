@@ -23,6 +23,12 @@ pub struct TorrentMeta {
     /// bookkeeping scales ~32 B/piece (measured), so piece count - not byte
     /// size - is what makes one torrent cost more RAM than another.
     pub piece_count: u32,
+    /// Number of non-padding files rqbit will open and hold for this
+    /// torrent's lifetime (one fd each, opened at add time). Feeds the
+    /// fd-aware admission guard: a many-file candidate that would push the
+    /// process past RLIMIT_NOFILE is skipped before opening anything, so a
+    /// hard "Too many open files" add failure becomes orderly selection.
+    pub file_count: u32,
     pub name: String,
 }
 
@@ -169,6 +175,15 @@ pub fn parse_torrent_bytes(body: &[u8]) -> Result<TorrentMeta> {
         .context("validating torrent info")?;
     let total_length = validated.lengths().total_length();
     let piece_count = validated.lengths().total_pieces();
+    // Same fd model as rqbit's FilesystemStorage::init: one open fd per
+    // non-padding file (padding entries get dummy handles, no fd). Padding
+    // rarely appears in AT content; counting it would only make the guard
+    // conservative, never unsound.
+    let file_count = validated
+        .iter_file_details()
+        .filter(|d| !d.attrs().padding)
+        .count()
+        .min(u32::MAX as usize) as u32;
     let name: String = validated
         .name()
         .map(|n| n.into_owned())
@@ -181,6 +196,7 @@ pub fn parse_torrent_bytes(body: &[u8]) -> Result<TorrentMeta> {
         created_at,
         total_length,
         piece_count,
+        file_count,
         name,
     })
 }
@@ -328,5 +344,86 @@ mod tests {
             Some("udp://tracker:80/scrape".to_string())
         );
         assert_eq!(derive_http_scrape_url("https://example.com/track"), None);
+    }
+
+    #[test]
+    fn file_count_single_and_multi() {
+        // Single-file metainfo: 1 fd. Multi-file: one fd per file. Both go
+        // through the real parser (same bencode shapes the harness emits).
+        let single = harness_single("count-one", 1000);
+        let md = parse_torrent_bytes(&single).expect("single parses");
+        assert_eq!(md.file_count, 1);
+        let multi = harness_multi("count-many", &[400, 300, 300]);
+        let md = parse_torrent_bytes(&multi).expect("multi parses");
+        assert_eq!(md.file_count, 3);
+        assert_eq!(md.total_length, 1000);
+    }
+
+    // Minimal local bencode helpers (mirrors of tests/common builders, kept
+    // here so the unit test needs no harness dependency).
+    fn bstr(b: &[u8]) -> Vec<u8> {
+        let mut o = format!("{}:", b.len()).into_bytes();
+        o.extend_from_slice(b);
+        o
+    }
+
+    fn bint(v: i64) -> Vec<u8> {
+        format!("i{v}e").into_bytes()
+    }
+
+    fn bdict(entries: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
+        let mut o = vec![b'd'];
+        for (k, v) in entries {
+            o.extend_from_slice(&bstr(k));
+            o.extend_from_slice(v);
+        }
+        o.push(b'e');
+        o
+    }
+
+    fn harness_single(name: &str, len: u64) -> Vec<u8> {
+        let pieces = vec![0u8; 20];
+        let info = bdict(&[
+            (b"length".as_slice(), bint(len as i64)),
+            (b"name".as_slice(), bstr(name.as_bytes())),
+            (b"piece length".as_slice(), bint(16384)),
+            (b"pieces".as_slice(), bstr(&pieces)),
+        ]);
+        let mut top = vec![b'd'];
+        top.extend_from_slice(&bstr(b"announce"));
+        top.extend_from_slice(&bstr(b"http"));
+        top.extend_from_slice(&bstr(b"info"));
+        top.extend_from_slice(&info);
+        top.push(b'e');
+        top
+    }
+
+    fn harness_multi(name: &str, lens: &[u64]) -> Vec<u8> {
+        let pieces = vec![0u8; 20];
+        let mut files = vec![b'l'];
+        for (i, len) in lens.iter().enumerate() {
+            let fname = format!("f{i}.bin");
+            let mut path = vec![b'l'];
+            path.extend_from_slice(&bstr(fname.as_bytes()));
+            path.push(b'e');
+            files.extend_from_slice(&bdict(&[
+                (b"length".as_slice(), bint(*len as i64)),
+                (b"path".as_slice(), path),
+            ]));
+        }
+        files.push(b'e');
+        let info = bdict(&[
+            (b"files".as_slice(), files),
+            (b"name".as_slice(), bstr(name.as_bytes())),
+            (b"piece length".as_slice(), bint(16384)),
+            (b"pieces".as_slice(), bstr(&pieces)),
+        ]);
+        let mut top = vec![b'd'];
+        top.extend_from_slice(&bstr(b"announce"));
+        top.extend_from_slice(&bstr(b"http"));
+        top.extend_from_slice(&bstr(b"info"));
+        top.extend_from_slice(&info);
+        top.push(b'e');
+        top
     }
 }

@@ -142,6 +142,7 @@ async fn two_session_byte_transfer() {
         title: "transfer".to_string(),
         size: 64 * 1024,
         piece_len: 16 * 1024,
+        file_count: 1,
         seeders: 0,
         leechers: 0,
         age: None,

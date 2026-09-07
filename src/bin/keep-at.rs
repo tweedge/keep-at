@@ -80,6 +80,10 @@ async fn main() -> Result<()> {
 async fn cmd_run(cfg: Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("creating data dir {}", cfg.data_dir.display()))?;
+    // Raise the fd soft limit before the session opens anything: a few
+    // hundred held torrents (one fd per file each) plus peer sockets
+    // otherwise exhaust low defaults (systemd's 1024 without LimitNOFILE).
+    keep_at::fdlimit::raise_soft_limit();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     {

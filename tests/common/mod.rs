@@ -24,9 +24,9 @@ use std::time::Duration;
 
 use keep_at::config::{Config, StorageLimit, StorageLocation};
 
-/// One synthetic catalog entry: content size, piece length, seeder/leecher
-/// counts served by the stub scrape, and a creation date old enough to pass
-/// the moderation gate unless the test says otherwise.
+/// One synthetic catalog entry: content size, piece length, file count,
+/// seeder/leecher counts served by the stub scrape, and a creation date old
+/// enough to pass the moderation gate unless the test says otherwise.
 #[derive(Debug, Clone)]
 pub struct Fixture {
     pub title: String,
@@ -34,6 +34,11 @@ pub struct Fixture {
     pub size: u64,
     /// Piece length in bytes. 1 piece keeps the RAM model trivial.
     pub piece_len: u32,
+    /// Number of files in the torrent. 1 (single-file) by default; >1
+    /// builds a multi-file info dict (each file an equal share of `size`).
+    /// Each file costs one fd at add time, so this drives the fd-aware
+    /// admission guard.
+    pub file_count: usize,
     pub seeders: u32,
     pub leechers: u32,
     /// Creation-date offset from now. Default: 30 days ago (passes the
@@ -48,19 +53,28 @@ impl Fixture {
             title: title.to_string(),
             size,
             piece_len: size.max(1) as u32,
+            file_count: 1,
             seeders,
             leechers: 0,
             age: Some(Duration::from_secs(30 * 24 * 3600)),
         }
     }
+
+    /// Multi-file variant: same content size split across `files` files.
+    pub fn multi_file(title: &str, size: u64, seeders: u32, files: usize) -> Fixture {
+        let mut f = Fixture::new(title, size, seeders);
+        f.file_count = files.max(1);
+        f
+    }
 }
 
-/// Build minimal single-file `.torrent` bytes with correct bencode and
-/// length prefixes, a `creation date`, one announce tracker pointing at the
-/// stub, and `pieces` of zero bytes. The file name embeds the fixture title,
-/// so distinct fixtures hash distinctly (the infohash covers the info dict
-/// only — same size + same name would collide). Callers learn the hash via
-/// [`torrent_info_hash`].
+/// Build `.torrent` bytes with correct bencode and length prefixes, a
+/// `creation date`, one announce tracker pointing at the stub, and `pieces`
+/// of zero bytes. Single-file when `fixture.file_count == 1`, else a
+/// multi-file info dict with the content split across files. The file name(s)
+/// embed the fixture title, so distinct fixtures hash distinctly (the
+/// infohash covers the info dict only — same size + same name would
+/// collide). Callers learn the hash via [`torrent_info_hash`].
 pub fn torrent_bytes(fixture: &Fixture, tracker_url: &str) -> Vec<u8> {
     let piece_count = fixture
         .size
@@ -81,15 +95,52 @@ pub fn torrent_bytes(fixture: &Fixture, tracker_url: &str) -> Vec<u8> {
         })
         .collect();
     let name = format!("{safe_title}.bin");
-    let info = bencode_dict(&[
-        (b"length".as_slice(), bencode_int(fixture.size as i64)),
-        (b"name".as_slice(), bencode_str(name.as_bytes())),
-        (
-            b"piece length".as_slice(),
-            bencode_int(fixture.piece_len.max(1) as i64),
-        ),
-        (b"pieces".as_slice(), bencode_raw(&vec![0u8; pieces_len])),
-    ]);
+    let files = fixture.file_count.max(1);
+    let info = if files == 1 {
+        bencode_dict(&[
+            (b"length".as_slice(), bencode_int(fixture.size as i64)),
+            (b"name".as_slice(), bencode_str(name.as_bytes())),
+            (
+                b"piece length".as_slice(),
+                bencode_int(fixture.piece_len.max(1) as i64),
+            ),
+            (b"pieces".as_slice(), bencode_raw(&vec![0u8; pieces_len])),
+        ])
+    } else {
+        // Multi-file: split content across `files` files (last takes the
+        // remainder). Piece count stays driven by piece_len; fds scale with
+        // file count, which is what this exercises.
+        let per = fixture.size / files as u64;
+        let mut rem = fixture.size;
+        let mut entries = Vec::new();
+        for i in 0..files {
+            let len = if i + 1 == files { rem } else { per };
+            rem = rem.saturating_sub(len);
+            let fname = format!("{safe_title}-{i}.bin");
+            let entry = bencode_dict(&[
+                (b"length".as_slice(), bencode_int(len as i64)),
+                (
+                    b"path".as_slice(),
+                    bencode_list(&[bencode_str(fname.as_bytes())]),
+                ),
+            ]);
+            entries.push(entry);
+        }
+        let mut files_list = vec![b'l'];
+        for e in &entries {
+            files_list.extend_from_slice(e);
+        }
+        files_list.push(b'e');
+        bencode_dict(&[
+            (b"files".as_slice(), files_list),
+            (b"name".as_slice(), bencode_str(name.as_bytes())),
+            (
+                b"piece length".as_slice(),
+                bencode_int(fixture.piece_len.max(1) as i64),
+            ),
+            (b"pieces".as_slice(), bencode_raw(&vec![0u8; pieces_len])),
+        ])
+    };
     let mut top = Vec::new();
     top.extend_from_slice(b"d");
     top.extend_from_slice(&bencode_str(b"announce"));
@@ -131,6 +182,15 @@ fn bencode_raw(s: &[u8]) -> Vec<u8> {
     // double-prefix; pieces are raw bytes, so prefix them once.
     let mut out = format!("{}:", s.len()).into_bytes();
     out.extend_from_slice(s);
+    out
+}
+
+fn bencode_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = vec![b'l'];
+    for item in items {
+        out.extend_from_slice(item);
+    }
+    out.push(b'e');
     out
 }
 

@@ -39,6 +39,12 @@ User=__USER__
 # this caps how long systemd waits before force-killing it if something ever
 # hangs, so 'systemctl stop keep-at' can't block forever on a stuck process.
 TimeoutStopSec=30
+# keep-at holds one fd per file of every held torrent (rqbit opens all files
+# at add time and keeps them open), plus one fd per live peer connection —
+# so a few hundred torrents easily exceed systemd's 1024 default. The daemon
+# also raises its own soft limit toward the hard limit at startup (see
+# fdlimit), so manual `run` invocations get the same headroom.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
