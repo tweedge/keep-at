@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.13-beta - periodic stats survive the inter-scan sleep
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### Field validation on a sleeping node surfaced a stats blackout
+
+A host whose last scan completed recently (scan-interval 168h, next scan days away) spent its entire wait without a single periodic stats pass: the periodic ticker was created *after* the next-scan delay wait, so the sleep's select loop never armed it - `runtime-stats.json` went stale for days, the daemon log went quiet between the boot line and the next scan, and the rolling bandwidth history behind `status`'s hour/day rates was only fed when someone queried the socket. The ticker is now created before the wait and armed in both select loops (delay wait and the main loop), so periodic passes and tracker feeds continue on cadence regardless of scan timing. Boot output is unchanged: the immediate first tick is consumed (the startup pass already logged its line), and the first periodic pass lands one interval in.
+
 ## v0.8.12-beta - bandwidth since boot, live hour/day rates
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
