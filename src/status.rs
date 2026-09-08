@@ -84,10 +84,18 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
 }
 
 fn print_live(v: &live::RuntimeView) {
-    println!(
-        "runtime stats (live, uptime {}):",
-        humanize::human_duration(std::time::Duration::from_secs(v.uptime_seconds))
-    );
+    if v.booting {
+        println!(
+            "runtime stats (live, starting up, uptime {}):",
+            humanize::human_duration(std::time::Duration::from_secs(v.uptime_seconds))
+        );
+    } else {
+        println!(
+            "runtime stats (live, uptime {}):",
+            humanize::human_duration(std::time::Duration::from_secs(v.uptime_seconds))
+        );
+    }
+    print_state(v);
     print_numbers(
         v.held_torrents,
         v.seeding_torrents,
@@ -99,16 +107,42 @@ fn print_live(v: &live::RuntimeView) {
         v.active_peers,
         v.process_rss_bytes,
     );
-    println!(
-        "  upload rate: {} past hour, {} past day",
-        humanize::human_bytes_per_sec(v.upload_bps_hour),
-        humanize::human_bytes_per_sec(v.upload_bps_day)
-    );
-    println!(
-        "  download rate: {} past hour, {} past day",
-        humanize::human_bytes_per_sec(v.download_bps_hour),
-        humanize::human_bytes_per_sec(v.download_bps_day)
-    );
+    if !v.booting {
+        println!(
+            "  upload rate: {} past hour, {} past day",
+            humanize::human_bytes_per_sec(v.upload_bps_hour),
+            humanize::human_bytes_per_sec(v.upload_bps_day)
+        );
+        println!(
+            "  download rate: {} past hour, {} past day",
+            humanize::human_bytes_per_sec(v.download_bps_hour),
+            humanize::human_bytes_per_sec(v.download_bps_day)
+        );
+    }
+}
+
+/// The "what is it doing right now" line: booting vs seeding vs scanning,
+/// plus how many integrity checks are in flight. This is what makes a
+/// booting node readable instead of "135 torrents downloading" (during
+/// boot those are being verified, not downloaded).
+fn print_state(v: &live::RuntimeView) {
+    use crate::live::Activity;
+    let base = match v.activity {
+        Activity::Booting => format!("starting up: resuming {} held torrents", v.held_torrents),
+        Activity::Scanning => {
+            "scanning the Academic Torrents catalog (fetch, scrape, evaluate)".to_string()
+        }
+        Activity::Seeding => "seeding normally".to_string(),
+    };
+    if v.checks_in_progress > 0 {
+        let plural = if v.checks_in_progress == 1 { "" } else { "s" };
+        println!(
+            "  state: {} — {} integrity check{} running (downloads shown below are unverified torrents, not active transfers)",
+            base, v.checks_in_progress, plural
+        );
+    } else {
+        println!("  state: {base}");
+    }
 }
 
 fn print_snapshot(rs: &netstats::RuntimeStats) {

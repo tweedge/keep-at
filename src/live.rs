@@ -3,9 +3,8 @@
 //! `status` and `hosted-torrents` used to read periodic snapshot files
 //! (`runtime-stats.json`) plus on-disk dir sizes. Snapshots go stale between
 //! writes (up to `stats_interval`), and the dir-size heuristic misreports a
-//! just-added sparse torrent as fully downloaded. The running Engine already
-//! holds the truth in-process (session handles + state), so it serves it
-//! directly here instead.
+//! just-added sparse torrent as fully downloaded. The running Engine serves
+//! the truth here instead.
 //!
 //! Transport: `<data_dir>/keep-at.sock`, mode 0o666 (any local user can
 //! query; same-host-only by construction — no TCP port, no auth problem).
@@ -14,10 +13,19 @@
 //! - `{"op":"runtime"}` -> [`RuntimeView`] (instantaneous counters)
 //! - `{"op":"held"}` -> [`HeldView`] (per-torrent live progress)
 //!
+//! The handle is TWO-PHASE: `LiveHandle::booting` binds the socket at the
+//! very start of `run` — before `Engine::new` finishes resuming torrents,
+//! which on slow hosts takes minutes — and serves a booting view built from
+//! `state.json`. `activate` promotes it to the live engine once the session
+//! exists. Without this, `status` reported "may need a restart" for the
+//! whole boot window: the pid file existed while the socket didn't.
+//!
 //! Clients connect with a short timeout; any failure means "not running"
 //! and the caller falls back to the file path unchanged.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -40,8 +48,42 @@ pub enum Request {
     Held,
 }
 
+/// What the Engine is doing right now. Surfaced by `status` as a
+/// human-readable state line so a booting node isn't mistaken for a broken
+/// one and 135 "downloading" torrents aren't mistaken for actual transfers
+/// (during boot they are being integrity-checked, not downloaded).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Activity {
+    /// Engine::new is still resuming held torrents (socket serves booting
+    /// views built from state.json).
+    Booting,
+    /// Inter-scan sleep: holding and seeding, nothing else running.
+    Seeding,
+    /// A catalog scan is in progress (fetch/scrape/evaluate/refresh).
+    Scanning,
+}
+
+impl Activity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Activity::Booting => "booting",
+            Activity::Seeding => "seeding",
+            Activity::Scanning => "scanning",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeView {
+    /// True while the Engine is still resuming torrents (socket bound, but
+    /// the session isn't serving yet). `status` shows a starting-up line
+    /// instead of implying a stale or broken daemon.
+    pub booting: bool,
+    pub activity: Activity,
+    /// Torrents currently running an initial integrity check (rqbit
+    /// Initializing state). High during boot, 0 in steady state.
+    pub checks_in_progress: usize,
     pub uptime_seconds: u64,
     pub held_torrents: usize,
     pub seeding_torrents: usize,
@@ -69,11 +111,19 @@ pub struct HeldTorrentView {
     pub progress_bytes: u64,
     /// True when the session reports the torrent complete.
     pub finished: bool,
+    /// True while the torrent's initial integrity check is running
+    /// (rqbit Initializing state) or the daemon is still booting — the
+    /// display should say "verifying", not "downloading".
+    pub verifying: bool,
     pub last_known_seeders: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeldView {
+    /// True while the daemon is booting: per-torrent progress is not yet
+    /// known (sessions still initializing), every unfinished torrent shows
+    /// as verifying.
+    pub booting: bool,
     pub torrents: Vec<HeldTorrentView>,
 }
 
@@ -175,28 +225,343 @@ async fn serve_one(stream: tokio::net::UnixStream, handle: &LiveHandle) -> Resul
     Ok(())
 }
 
-/// Read-only view into the running Engine, shared with the socket server
-/// task. The Engine pushes a fresh snapshot after every state mutation
-/// (put/update/remove); the server reads it without touching the scan.
-/// Session/API stay behind their original Arcs (both Clone + Send + Sync).
-#[derive(Clone)]
-pub struct LiveHandle {
-    session: std::sync::Arc<librqbit::Session>,
+/// Everything the live (post-boot) view needs from the Engine.
+struct LiveState {
+    session: Arc<librqbit::Session>,
     api: librqbit::Api,
-    state: std::sync::Arc<parking_lot::RwLock<StateSnapshot>>,
-    started_at: std::time::Instant,
+    tracker: Arc<std::sync::Mutex<crate::bandwidth::RateTracker>>,
+    started_at: Instant,
     storage: Vec<(PathBuf, u64)>,
-    /// Rolling bandwidth history (hour/day rates). Shared with the socket
-    /// server clones; internal Mutex, sub-microsecond critical sections.
-    tracker: std::sync::Arc<std::sync::Mutex<crate::bandwidth::RateTracker>>,
+    /// Held-torrent snapshot pushed by the Engine after every mutation.
+    held: std::sync::Mutex<Vec<StateEntry>>,
 }
 
-/// State snapshot pushed by the Engine after every mutation. Plain data:
-/// no locks held across await points on the Engine side, no scan blocking
-/// on the server side.
-#[derive(Debug, Clone, Default)]
-pub struct StateSnapshot {
-    pub torrents: Vec<StateEntry>,
+/// Read-only view into the running Engine, shared with the socket server
+/// task. Two-phase: Booting from `LiveHandle::booting` (socket bound before
+/// the Engine exists), promoted by `activate` once the session is up.
+#[derive(Clone)]
+pub struct LiveHandle {
+    inner: Arc<parking_lot::RwLock<HandleInner>>,
+    activity: Arc<std::sync::Mutex<Activity>>,
+}
+
+enum HandleInner {
+    Booting {
+        started_at: Instant,
+        storage: Vec<(PathBuf, u64)>,
+        held: Vec<HeldTorrentView>,
+    },
+    Live(Box<LiveState>),
+}
+
+impl LiveHandle {
+    /// Booting-phase handle: binds immediately, serves held-torrent truth
+    /// from `state.json` (progress unknown, everything verifying) until
+    /// `activate` promotes the view.
+    pub fn booting(
+        started_at: Instant,
+        storage: Vec<(PathBuf, u64)>,
+        held: Vec<HeldTorrentView>,
+    ) -> LiveHandle {
+        LiveHandle {
+            inner: Arc::new(parking_lot::RwLock::new(HandleInner::Booting {
+                started_at,
+                storage,
+                held,
+            })),
+            activity: Arc::new(std::sync::Mutex::new(Activity::Booting)),
+        }
+    }
+
+    /// Live-phase handle directly (seam used by Engine fallbacks and tests):
+    /// same as booting + activate.
+    pub fn for_tests(
+        session: Arc<librqbit::Session>,
+        api: librqbit::Api,
+        torrents: Vec<StateEntry>,
+        started_at: Instant,
+        storage: Vec<(PathBuf, u64)>,
+    ) -> LiveHandle {
+        let h = LiveHandle::booting(started_at, storage, Vec::new());
+        h.activate(session, api, torrents);
+        h
+    }
+
+    /// Promote to the live engine view. Called once, after the session
+    /// exists; later queries serve real per-torrent progress.
+    pub fn activate(
+        &self,
+        session: Arc<librqbit::Session>,
+        api: librqbit::Api,
+        torrents: Vec<StateEntry>,
+    ) {
+        let (started_at, storage) = {
+            let inner = self.inner.write();
+            match &*inner {
+                HandleInner::Booting {
+                    started_at,
+                    storage,
+                    ..
+                } => (*started_at, storage.clone()),
+                HandleInner::Live(_) => return, // already live
+            }
+        };
+        // Baseline counters now (session counters are cumulative since
+        // session creation; the tracker only needs deltas from here on).
+        let snap = api.api_session_stats();
+        let tracker = Arc::new(std::sync::Mutex::new(crate::bandwidth::RateTracker::new(
+            started_at,
+            snap.counters.uploaded_bytes,
+            snap.counters.fetched_bytes,
+        )));
+        *self.inner.write() = HandleInner::Live(Box::new(LiveState {
+            session,
+            api,
+            tracker,
+            started_at,
+            storage,
+            held: std::sync::Mutex::new(torrents),
+        }));
+        self.set_activity(Activity::Seeding);
+    }
+
+    /// Replace the held-torrent snapshot (called by the Engine after every
+    /// state mutation). During booting the list is static; refresh still
+    /// merges (keeping verifying=true) in case state changes early.
+    pub fn refresh(&self, torrents: Vec<StateEntry>) {
+        let mut inner = self.inner.write();
+        match &mut *inner {
+            HandleInner::Booting { held, .. } => {
+                *held = torrents
+                    .into_iter()
+                    .map(|t| HeldTorrentView {
+                        title: t.title,
+                        info_hash: t.info_hash,
+                        size_bytes: t.size_bytes,
+                        progress_bytes: 0,
+                        finished: false,
+                        verifying: true,
+                        last_known_seeders: t.last_known_seeders,
+                    })
+                    .collect();
+            }
+            HandleInner::Live(live) => {
+                *live.held.lock().unwrap() = torrents;
+            }
+        }
+    }
+
+    /// Set what the Engine is doing (Booting/Seeding/Scanning).
+    pub fn set_activity(&self, a: Activity) {
+        *self.activity.lock().unwrap() = a;
+    }
+
+    /// Advance the bandwidth history with the current session counters.
+    /// Called on the periodic stats cadence and from every runtime query —
+    /// the event log is exact under any cadence. No-op while booting.
+    pub fn tick_tracker(&self) {
+        let (api, tracker) = {
+            let inner = self.inner.read();
+            match &*inner {
+                HandleInner::Live(live) => (live.api.clone(), live.tracker.clone()),
+                HandleInner::Booting { .. } => return,
+            }
+        };
+        let sess = api.api_session_stats();
+        let now = Instant::now();
+        let Ok(mut tr) = tracker.try_lock() else {
+            return;
+        };
+        tr.tick(
+            now,
+            sess.counters.uploaded_bytes,
+            sess.counters.fetched_bytes,
+        );
+    }
+
+    fn runtime_view(&self) -> RuntimeView {
+        let activity = *self.activity.lock().unwrap();
+        // Snapshot what's needed, then drop the inner lock.
+        enum Phase {
+            Booting {
+                held_len: usize,
+                storage: Vec<(PathBuf, u64)>,
+            },
+            Live {
+                session: Arc<librqbit::Session>,
+                api: librqbit::Api,
+                tracker: Arc<std::sync::Mutex<crate::bandwidth::RateTracker>>,
+                storage: Vec<(PathBuf, u64)>,
+                held_len: usize,
+            },
+        }
+        let (phase, started_at) = {
+            let inner = self.inner.read();
+            let started = match &*inner {
+                HandleInner::Booting { started_at, .. } => *started_at,
+                HandleInner::Live(live) => live.started_at,
+            };
+            let phase = match &*inner {
+                HandleInner::Booting { held, storage, .. } => Phase::Booting {
+                    held_len: held.len(),
+                    storage: storage.clone(),
+                },
+                HandleInner::Live(live) => Phase::Live {
+                    held_len: live.held.lock().unwrap().len(),
+                    session: live.session.clone(),
+                    api: live.api.clone(),
+                    tracker: live.tracker.clone(),
+                    storage: live.storage.clone(),
+                },
+            };
+            (phase, started)
+        };
+
+        let (seeding, downloading, checks, totals, peers) = match &phase {
+            Phase::Live { session, api, .. } => {
+                let seeding = std::cell::Cell::new(0usize);
+                let checks = std::cell::Cell::new(0usize);
+                let downloading = std::cell::Cell::new(0usize);
+                session.with_torrents(|it| {
+                    for (_, h) in it {
+                        let finished = h.stats().finished;
+                        let initializing = h.with_state(|s| {
+                            matches!(s, librqbit::ManagedTorrentState::Initializing(_))
+                        });
+                        if finished {
+                            seeding.set(seeding.get() + 1);
+                        } else if initializing {
+                            checks.set(checks.get() + 1);
+                        } else {
+                            downloading.set(downloading.get() + 1);
+                        }
+                    }
+                });
+                let sess = api.api_session_stats();
+                (
+                    seeding.get(),
+                    downloading.get(),
+                    checks.get(),
+                    Some((sess.counters.uploaded_bytes, sess.counters.fetched_bytes)),
+                    sess.peers.live as usize,
+                )
+            }
+            Phase::Booting { held_len, .. } => (0, *held_len, 0, None, 0),
+        };
+
+        // Tick before reading: this query is also a sample point.
+        self.tick_tracker();
+        let (up_hour, down_hour, up_day, down_day) = match &phase {
+            Phase::Live { tracker, .. } => {
+                let now = Instant::now();
+                match tracker.try_lock() {
+                    Ok(tr) => (
+                        tr.rate_up(now, Duration::from_secs(3600)),
+                        tr.rate_down(now, Duration::from_secs(3600)),
+                        tr.rate_up(now, Duration::from_secs(86_400)),
+                        tr.rate_down(now, Duration::from_secs(86_400)),
+                    ),
+                    Err(_) => (0.0, 0.0, 0.0, 0.0),
+                }
+            }
+            Phase::Booting { .. } => (0.0, 0.0, 0.0, 0.0),
+        };
+
+        let (up_total, down_total) = totals.unwrap_or((0, 0));
+        let (used, limit) = match &phase {
+            Phase::Live { storage, .. } => crate::engine::stats::disk_usage(storage),
+            Phase::Booting { storage, .. } => crate::engine::stats::disk_usage(storage),
+        };
+        let booting = matches!(phase, Phase::Booting { .. });
+        let held_len = match &phase {
+            Phase::Booting { held_len, .. } => *held_len,
+            Phase::Live { held_len, .. } => *held_len,
+        };
+        RuntimeView {
+            booting,
+            activity,
+            checks_in_progress: checks,
+            uptime_seconds: started_at.elapsed().as_secs(),
+            held_torrents: held_len,
+            seeding_torrents: seeding,
+            downloading_torrents: downloading,
+            disk_used_bytes: used,
+            disk_limit_bytes: limit,
+            total_bytes_uploaded: up_total,
+            total_bytes_downloaded: down_total,
+            upload_bps_hour: up_hour,
+            download_bps_hour: down_hour,
+            upload_bps_day: up_day,
+            download_bps_day: down_day,
+            active_peers: peers,
+            process_rss_bytes: crate::engine::stats::process_rss_bytes(),
+        }
+    }
+
+    fn held_view(&self) -> HeldView {
+        let inner = self.inner.read();
+        match &*inner {
+            HandleInner::Booting { held, .. } => HeldView {
+                booting: true,
+                torrents: held.clone(),
+            },
+            HandleInner::Live(live) => {
+                // Live progress + per-torrent state, keyed by infohash.
+                let live_map = std::cell::RefCell::new(std::collections::HashMap::new());
+                live.session.with_torrents(|it| {
+                    for (_, h) in it {
+                        let st = h.stats();
+                        let verifying = h.with_state(|s| {
+                            matches!(s, librqbit::ManagedTorrentState::Initializing(_))
+                        });
+                        live_map.borrow_mut().insert(
+                            h.info_hash().as_string(),
+                            (st.progress_bytes, st.finished, verifying),
+                        );
+                    }
+                });
+                let live_map = live_map.borrow();
+                let held = live.held.lock().unwrap();
+                let mut torrents: Vec<HeldTorrentView> = held
+                    .iter()
+                    .map(|t| {
+                        let (progress, finished, verifying) = live_map
+                            .get(&t.info_hash)
+                            .copied()
+                            .unwrap_or((0, false, false));
+                        HeldTorrentView {
+                            title: t.title.clone(),
+                            info_hash: t.info_hash.clone(),
+                            size_bytes: t.size_bytes,
+                            progress_bytes: progress,
+                            finished,
+                            verifying,
+                            last_known_seeders: t.last_known_seeders,
+                        }
+                    })
+                    .collect();
+                torrents.sort_by(|a, b| a.title.cmp(&b.title));
+                HeldView {
+                    booting: false,
+                    torrents,
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot the held set into live-query entries (title/hash/size/seeders).
+pub fn snapshot_entries(state: &crate::state::State) -> Vec<StateEntry> {
+    state
+        .all()
+        .into_iter()
+        .map(|t| StateEntry {
+            title: t.title,
+            info_hash: t.info_hash,
+            size_bytes: t.size_bytes,
+            last_known_seeders: t.last_known_seeders,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -205,128 +570,4 @@ pub struct StateEntry {
     pub info_hash: String,
     pub size_bytes: u64,
     pub last_known_seeders: u32,
-}
-
-impl LiveHandle {
-    pub fn new(
-        session: std::sync::Arc<librqbit::Session>,
-        api: librqbit::Api,
-        torrents: Vec<StateEntry>,
-        started_at: std::time::Instant,
-        storage: Vec<(PathBuf, u64)>,
-    ) -> LiveHandle {
-        // Baseline counters at handle creation (session near-zero at boot).
-        let snap = api.api_session_stats();
-        let tracker = crate::bandwidth::RateTracker::new(
-            started_at,
-            snap.counters.uploaded_bytes,
-            snap.counters.fetched_bytes,
-        );
-        LiveHandle {
-            session,
-            api,
-            state: std::sync::Arc::new(parking_lot::RwLock::new(StateSnapshot { torrents })),
-            started_at,
-            storage,
-            tracker: std::sync::Arc::new(std::sync::Mutex::new(tracker)),
-        }
-    }
-
-    /// Advance the bandwidth history with the current session counters.
-    /// Called on the periodic stats cadence and from every runtime query —
-    /// the event log is exact under any cadence.
-    pub fn tick_tracker(&self) {
-        let sess = self.api.api_session_stats();
-        let now = std::time::Instant::now();
-        if let Ok(mut tr) = self.tracker.try_lock() {
-            tr.tick(
-                now,
-                sess.counters.uploaded_bytes,
-                sess.counters.fetched_bytes,
-            );
-        }
-    }
-
-    /// Refresh after a state mutation. Called by the Engine (the sole
-    /// writer); cheap clone of the held list.
-    pub fn refresh(&self, torrents: Vec<StateEntry>) {
-        *self.state.write() = StateSnapshot { torrents };
-    }
-
-    fn runtime_view(&self) -> RuntimeView {
-        let snap = self.state.read();
-        let held = snap.torrents.len();
-        let seeding = std::cell::Cell::new(0usize);
-        self.session.with_torrents(|it| {
-            for (_, h) in it {
-                if h.stats().finished {
-                    seeding.set(seeding.get() + 1);
-                }
-            }
-        });
-        let seeding = seeding.get().min(held);
-        let (used, limit) = crate::engine::stats::disk_usage(&self.storage);
-        // Tick before reading: this query is also a sample point.
-        self.tick_tracker();
-        let (up_hour, down_hour, up_day, down_day) = {
-            let now = std::time::Instant::now();
-            match self.tracker.try_lock() {
-                Ok(tr) => (
-                    tr.rate_up(now, std::time::Duration::from_secs(3600)),
-                    tr.rate_down(now, std::time::Duration::from_secs(3600)),
-                    tr.rate_up(now, std::time::Duration::from_secs(86_400)),
-                    tr.rate_down(now, std::time::Duration::from_secs(86_400)),
-                ),
-                Err(_) => (0.0, 0.0, 0.0, 0.0),
-            }
-        };
-        let sess = self.api.api_session_stats();
-        RuntimeView {
-            uptime_seconds: self.started_at.elapsed().as_secs(),
-            held_torrents: held,
-            seeding_torrents: seeding,
-            downloading_torrents: held.saturating_sub(seeding),
-            disk_used_bytes: used,
-            disk_limit_bytes: limit,
-            total_bytes_uploaded: sess.counters.uploaded_bytes,
-            total_bytes_downloaded: sess.counters.fetched_bytes,
-            upload_bps_hour: up_hour,
-            download_bps_hour: down_hour,
-            upload_bps_day: up_day,
-            download_bps_day: down_day,
-            active_peers: sess.peers.live as usize,
-            process_rss_bytes: crate::engine::stats::process_rss_bytes(),
-        }
-    }
-
-    fn held_view(&self) -> HeldView {
-        let snap = self.state.read();
-        // Live progress per managed handle, keyed by infohash.
-        let live = std::cell::RefCell::new(std::collections::HashMap::new());
-        self.session.with_torrents(|it| {
-            for (_, h) in it {
-                let st = h.stats();
-                live.borrow_mut()
-                    .insert(h.info_hash().as_string(), (st.progress_bytes, st.finished));
-            }
-        });
-        let live = live.borrow();
-        let mut torrents: Vec<HeldTorrentView> = snap
-            .torrents
-            .iter()
-            .map(|t| {
-                let (progress, finished) = live.get(&t.info_hash).copied().unwrap_or((0, false));
-                HeldTorrentView {
-                    title: t.title.clone(),
-                    info_hash: t.info_hash.clone(),
-                    size_bytes: t.size_bytes,
-                    progress_bytes: progress,
-                    finished,
-                    last_known_seeders: t.last_known_seeders,
-                }
-            })
-            .collect();
-        torrents.sort_by(|a, b| a.title.cmp(&b.title));
-        HeldView { torrents }
-    }
 }

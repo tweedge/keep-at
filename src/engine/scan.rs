@@ -670,22 +670,12 @@ impl Engine {
     /// socket server. Idempotent: a second call replaces the handle and
     /// re-binds (the old server task exits when its listener is gone —
     /// actually it keeps serving the same handle contents; rebinding fails
-    /// gracefully with a warn since the first server still owns the path).
-    /// In practice called once from `run`; tests never call it (live: None).
+    /// Fallback socket startup for direct `run()` calls without an attached
+    /// booting handle (tests): creates a live handle from the existing
+    /// session and serves. The production path binds earlier via
+    /// `attach_live` (see cmd_run) so the socket exists during boot.
     fn start_live_server(&mut self) {
-        let storage: Vec<(PathBuf, u64)> = self
-            .cfg
-            .storage
-            .iter()
-            .map(|l| (l.path.clone(), l.limit_bytes()))
-            .collect();
-        let handle = crate::live::LiveHandle::new(
-            self.session.clone(),
-            self.api.clone(),
-            snapshot_entries(&self.state),
-            self.started_at,
-            storage,
-        );
+        let handle = self.test_live_handle();
         self.live = Some(handle.clone());
         let data_dir = self.cfg.data_dir.clone();
         tokio::spawn(async move {
@@ -693,10 +683,28 @@ impl Engine {
         });
     }
 
+    /// Attach the booting-phase live handle created by cmd_run and promote
+    /// it to the live engine view (session + held snapshot + Seeding).
+    pub fn attach_live(&mut self, handle: crate::live::LiveHandle) {
+        handle.activate(
+            self.session.clone(),
+            self.api.clone(),
+            snapshot_entries(&self.state),
+        );
+        self.live = Some(handle);
+    }
+
     /// Push current state to the live handle (no-op when no server).
     fn push_live(&self) {
         if let Some(live) = &self.live {
             live.refresh(snapshot_entries(&self.state));
+        }
+    }
+
+    /// Report what the Engine is doing to the live handle (no-op when none).
+    fn set_activity(&self, a: crate::live::Activity) {
+        if let Some(live) = &self.live {
+            live.set_activity(a);
         }
     }
 
@@ -780,9 +788,12 @@ impl Engine {
     }
 
     async fn run_scan_logged(&mut self, kind: &str, shutdown: tokio::sync::watch::Receiver<bool>) {
+        self.set_activity(crate::live::Activity::Scanning);
         tracing::info!("scan starting (kind={kind})");
         let start = std::time::Instant::now();
-        match self.scan_once_shutdown(shutdown).await {
+        let result = self.scan_once_shutdown(shutdown).await;
+        self.set_activity(crate::live::Activity::Seeding);
+        match result {
             Ok(()) => tracing::info!(
                 "scan completed (kind={kind}, duration={:?})",
                 start.elapsed()
@@ -791,7 +802,7 @@ impl Engine {
                 "scan failed (kind={kind}, duration={:?}): {e:#}",
                 start.elapsed()
             ),
-        }
+        };
     }
 
     fn delay_until_next_scan(&self) -> Duration {
@@ -1082,10 +1093,12 @@ impl Engine {
             .iter()
             .map(|l| (l.path.clone(), l.limit_bytes()))
             .collect();
-        crate::live::LiveHandle::new(
+        let snap = snapshot_entries(&self.state);
+        eprintln!("DEBUG test_live_handle: snapshot len={}", snap.len());
+        crate::live::LiveHandle::for_tests(
             self.session.clone(),
             self.api.clone(),
-            snapshot_entries(&self.state),
+            snap,
             self.started_at,
             storage,
         )

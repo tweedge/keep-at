@@ -40,6 +40,12 @@ pub fn cmd_hosted(args: &CommonArgs) -> Result<()> {
             println!("keep-at is not holding any torrents");
             return Ok(());
         }
+        if view.booting {
+            println!(
+                "starting up: resuming {} held torrents (integrity checks run before each one seeds)",
+                view.torrents.len()
+            );
+        }
         for t in &view.torrents {
             println!("{}", t.title);
             println!(
@@ -48,7 +54,13 @@ pub fn cmd_hosted(args: &CommonArgs) -> Result<()> {
             );
             println!(
                 "  status:      {}",
-                if t.finished { "seeding" } else { "downloading" }
+                if t.finished {
+                    "seeding"
+                } else if t.verifying {
+                    "verifying (integrity check)"
+                } else {
+                    "downloading"
+                }
             );
             println!(
                 "  space:       {} present (torrent is {})",

@@ -161,6 +161,7 @@ and `keep-at status` prints the same picture (with a `live` marker when the numb
 ```
 keep-at is running (pid 12345)
 runtime stats (live, uptime 2h0m0s):
+  state: seeding normally
   torrents: 12 held, 10 seeding, 2 downloading
   disk: 50.0 GiB used of 100.0 GiB configured (50.0%)
   bandwidth since boot: sent 5.2 GiB, received 1.4 GiB
@@ -169,6 +170,8 @@ runtime stats (live, uptime 2h0m0s):
   active peers: 24
   memory: 300.0 MiB RSS
 ```
+
+The `state:` line explains what the daemon is doing right now: `seeding normally` between scans, `scanning the Academic Torrents catalog` while a scan runs, or `starting up: resuming N held torrents` while booting. When integrity checks are in flight it appends the count (`— 40 integrity checks running`), because during boot the per-torrent list shows many "downloading" torrents that are actually being verified, not transferring. `hosted-torrents` labels those same torrents `verifying (integrity check)`. The query socket binds within milliseconds of process start (serving the booting view), so `status` never shows a "may need a restart" warning while the daemon is merely starting up - that warning now only appears against a genuinely old pre-socket daemon.
 
 Bandwidth is reported once (the Rust port's counters are already payload-only, so the old useful-vs-total split carried no information) as bytes moved since this process started, plus **live per-second rates over the past hour and past day** - rolling windows computed by the daemon from an in-memory event log, exact however rarely the numbers are sampled, at negligible CPU and memory cost (the daemon records one small entry per stats interval; a day's history is a few kilobytes). Rates are live-only: they reset on restart along with the since-boot counters. The snapshot fallback shows since-boot totals without rate lines (the history lives in the running daemon's memory).
 

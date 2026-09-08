@@ -143,8 +143,45 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
         });
     }
 
+    // Bind the query socket IMMEDIATELY in a booting state: `status` and
+    // `hosted-torrents` answer truthfully from the first millisecond
+    // ("starting up: resuming N held torrents") instead of reporting a
+    // stale snapshot with a "may need a restart" warning for the whole
+    // Engine::new window (minutes on slow hosts, 144-torrent resumes).
+    let started_at = std::time::Instant::now();
+    let storage: Vec<(std::path::PathBuf, u64)> = cfg
+        .storage
+        .iter()
+        .map(|l| (l.path.clone(), l.limit_bytes()))
+        .collect();
+    let held = keep_at::state::State::load(&cfg.data_dir.join("state.json"))
+        .map(|st| {
+            st.all()
+                .into_iter()
+                .map(|t| keep_at::live::HeldTorrentView {
+                    title: t.title,
+                    info_hash: t.info_hash,
+                    size_bytes: t.size_bytes,
+                    progress_bytes: 0,
+                    finished: false,
+                    verifying: true,
+                    last_known_seeders: t.last_known_seeders,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let live = keep_at::live::LiveHandle::booting(started_at, storage, held);
+    {
+        let h = live.clone();
+        let dir = cfg.data_dir.clone();
+        tokio::spawn(async move {
+            keep_at::live::serve(dir, h).await;
+        });
+    }
+
     let started = std::time::Instant::now();
     let mut engine = keep_at::engine::Engine::new(cfg.clone()).await?;
+    engine.attach_live(live);
     tracing::info!(
         "keep-at started (port={} data_dir={} startup_time={:?})",
         cfg.port,
