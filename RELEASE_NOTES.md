@@ -1,5 +1,17 @@
 # keep-at release notes
 
+## v0.8.14-beta - honest startup status, activity line, verifying labels
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### `status` no longer lies during startup
+
+Field validation on a slower host reproduced it: right after a daemon restart, `status` printed "may need a restart" over stale snapshot data for the whole boot window. Cause: the query socket only bound after `Engine::new` finished resuming torrents (44 s on the test host, minutes on slower ones), while the pid file existed from the first millisecond. The socket now binds within milliseconds of process start in a booting state - serving the held-torrent truth from `state.json` (everything verifying) plus a booting marker - and is promoted to the live engine once the session exists. `status` shows `state: starting up: resuming N held torrents` instead of implying a broken daemon; the "may need a restart" warning is reserved for genuinely old pre-socket daemons.
+
+### New `state:` line explains what the daemon is doing
+
+`status` gains a state line: `seeding normally` between scans, `scanning the Academic Torrents catalog (fetch, scrape, evaluate)` while a scan runs, `starting up: resuming N held torrents` while booting - plus `N integrity checks running` whenever rqbit is verifying pieces, because during boot the per-torrent list shows many "downloading" torrents that are actually being verified, not transferring. `hosted-torrents` labels those same torrents `verifying (integrity check)`. Verified by restart-polling the production test host every 3 seconds: the flaky window is gone.
+
 ## v0.8.13-beta - periodic stats survive the inter-scan sleep
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
