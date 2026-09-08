@@ -53,8 +53,11 @@ async fn main() -> Result<()> {
     // `keep-at hosted-torrents | head` dies with a "failed printing to
     // stdout: Broken pipe" panic instead of exiting cleanly like a normal
     // filter. Default disposition = process killed by SIGPIPE, as usual.
+    // Default disposition = process killed by SIGPIPE, as usual.
+    // SIG_DFL is 0 (SIG_IGN is 1 - which makes writes return EPIPE and
+    // println! panic; that was tried and is wrong).
     #[cfg(unix)]
-    libc_signal(13, 1); // SIGPIPE -> SIG_DFL
+    libc_signal(13, 0); // SIGPIPE -> SIG_DFL
     let cli = Cli::parse();
     match cli.cmd {
         Command::Run(a) => {
