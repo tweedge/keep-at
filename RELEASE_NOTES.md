@@ -1,5 +1,17 @@
 # keep-at release notes
 
+## v0.8.11-beta - world-readable config, API key moved out
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### Config files no longer hold secrets, and are no longer locked down
+
+The config file used to be owner-only (`0o600`) because it could carry the Academic Torrents API key - which made every read-only command fail with "permission denied" for non-root users against a root-owned install (`status` couldn't even find the data dir without reading the config). The key now lives in `<data_dir>/api_key`, owner-only (`0o600`), and the config file itself is world-readable (`0o644`) with the key never written into it. `Config::load` merges the key file back (key file wins over a legacy inline `api_key:` field, which still parses for compatibility; an unreadable key file just means anonymous seeding, never an error), and any start with `--api-key` set - flag runs included - persists the file so restarts via the same config keep attribution.
+
+Existing installs migrate on the daemon's first start after upgrading: as the file's owner it rewrites the config world-readable and extracts the inline key to the data dir. No manual `chmod` or `service install` re-run is required (though the latter works too). On top of that, `service install` and daemon startup write a world-readable one-line pointer, `/etc/keep-at/data_dir`, which `status`/`hosted-torrents`/`stop` check *before* the config - so they resolve the running instance without reading any config at all. If neither pointer nor readable config exists (old install, daemon not yet restarted), the error now says exactly what to do.
+
+`status` also stops presenting fallback data ambiguously: when a daemon is detected running but doesn't answer the live query socket (typically: upgraded binary, daemon not yet restarted), it prints "(live stats unavailable - daemon may need a restart after upgrading; showing the last persisted snapshot)" and labels the snapshot with its collection timestamp, so a stale file can't masquerade as live data.
+
 ## v0.8.10-beta - live status socket, EMFILE prevention
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
