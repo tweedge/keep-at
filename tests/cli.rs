@@ -252,6 +252,11 @@ fn max_limit_keyword_accepted() {
 fn starter_config_generated_for_missing_file() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("sub").join("keep-at.yaml");
+    // Guard against the observed CI flake where a pre-existing starter at
+    // the fresh tempdir path made the run report "parsing config ... empty
+    // byte size" instead of writing one. Fail HERE (with the file present)
+    // so a recurrence points at a concurrent writer, not at stderr wording.
+    assert!(!cfg.exists(), "config path must start empty");
     keep_at()
         .args(["run", "--config", cfg.to_str().unwrap()])
         .assert()
