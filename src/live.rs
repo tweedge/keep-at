@@ -48,10 +48,14 @@ pub struct RuntimeView {
     pub downloading_torrents: usize,
     pub disk_used_bytes: u64,
     pub disk_limit_bytes: u64,
-    pub useful_bytes_uploaded: u64,
-    pub useful_bytes_downloaded: u64,
     pub total_bytes_uploaded: u64,
     pub total_bytes_downloaded: u64,
+    /// Bytes per second over the past hour (rolling, live-only).
+    pub upload_bps_hour: f64,
+    pub download_bps_hour: f64,
+    /// Bytes per second over the past day (rolling, live-only).
+    pub upload_bps_day: f64,
+    pub download_bps_day: f64,
     pub active_peers: usize,
     pub process_rss_bytes: u64,
 }
@@ -182,6 +186,9 @@ pub struct LiveHandle {
     state: std::sync::Arc<parking_lot::RwLock<StateSnapshot>>,
     started_at: std::time::Instant,
     storage: Vec<(PathBuf, u64)>,
+    /// Rolling bandwidth history (hour/day rates). Shared with the socket
+    /// server clones; internal Mutex, sub-microsecond critical sections.
+    tracker: std::sync::Arc<std::sync::Mutex<crate::bandwidth::RateTracker>>,
 }
 
 /// State snapshot pushed by the Engine after every mutation. Plain data:
@@ -208,12 +215,35 @@ impl LiveHandle {
         started_at: std::time::Instant,
         storage: Vec<(PathBuf, u64)>,
     ) -> LiveHandle {
+        // Baseline counters at handle creation (session near-zero at boot).
+        let snap = api.api_session_stats();
+        let tracker = crate::bandwidth::RateTracker::new(
+            started_at,
+            snap.counters.uploaded_bytes,
+            snap.counters.fetched_bytes,
+        );
         LiveHandle {
             session,
             api,
             state: std::sync::Arc::new(parking_lot::RwLock::new(StateSnapshot { torrents })),
             started_at,
             storage,
+            tracker: std::sync::Arc::new(std::sync::Mutex::new(tracker)),
+        }
+    }
+
+    /// Advance the bandwidth history with the current session counters.
+    /// Called on the periodic stats cadence and from every runtime query —
+    /// the event log is exact under any cadence.
+    pub fn tick_tracker(&self) {
+        let sess = self.api.api_session_stats();
+        let now = std::time::Instant::now();
+        if let Ok(mut tr) = self.tracker.try_lock() {
+            tr.tick(
+                now,
+                sess.counters.uploaded_bytes,
+                sess.counters.fetched_bytes,
+            );
         }
     }
 
@@ -236,6 +266,20 @@ impl LiveHandle {
         });
         let seeding = seeding.get().min(held);
         let (used, limit) = crate::engine::stats::disk_usage(&self.storage);
+        // Tick before reading: this query is also a sample point.
+        self.tick_tracker();
+        let (up_hour, down_hour, up_day, down_day) = {
+            let now = std::time::Instant::now();
+            match self.tracker.try_lock() {
+                Ok(tr) => (
+                    tr.rate_up(now, std::time::Duration::from_secs(3600)),
+                    tr.rate_down(now, std::time::Duration::from_secs(3600)),
+                    tr.rate_up(now, std::time::Duration::from_secs(86_400)),
+                    tr.rate_down(now, std::time::Duration::from_secs(86_400)),
+                ),
+                Err(_) => (0.0, 0.0, 0.0, 0.0),
+            }
+        };
         let sess = self.api.api_session_stats();
         RuntimeView {
             uptime_seconds: self.started_at.elapsed().as_secs(),
@@ -244,10 +288,12 @@ impl LiveHandle {
             downloading_torrents: held.saturating_sub(seeding),
             disk_used_bytes: used,
             disk_limit_bytes: limit,
-            useful_bytes_uploaded: sess.counters.uploaded_bytes,
-            useful_bytes_downloaded: sess.counters.fetched_bytes,
             total_bytes_uploaded: sess.counters.uploaded_bytes,
             total_bytes_downloaded: sess.counters.fetched_bytes,
+            upload_bps_hour: up_hour,
+            download_bps_hour: down_hour,
+            upload_bps_day: up_day,
+            download_bps_day: down_day,
             active_peers: sess.peers.live as usize,
             process_rss_bytes: crate::engine::stats::process_rss_bytes(),
         }

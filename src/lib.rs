@@ -1,6 +1,7 @@
 pub mod atcatalog;
 pub mod atkey;
 pub mod attorrent;
+pub mod bandwidth;
 pub mod buildinfo;
 pub mod census;
 pub mod cli;

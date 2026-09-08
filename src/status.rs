@@ -94,13 +94,20 @@ fn print_live(v: &live::RuntimeView) {
         v.downloading_torrents,
         v.disk_used_bytes,
         v.disk_limit_bytes,
-        v.useful_bytes_uploaded,
         v.total_bytes_uploaded,
-        v.useful_bytes_downloaded,
         v.total_bytes_downloaded,
-        v.uptime_seconds,
         v.active_peers,
         v.process_rss_bytes,
+    );
+    println!(
+        "  upload rate: {} past hour, {} past day",
+        humanize::human_bytes_per_sec(v.upload_bps_hour),
+        humanize::human_bytes_per_sec(v.upload_bps_day)
+    );
+    println!(
+        "  download rate: {} past hour, {} past day",
+        humanize::human_bytes_per_sec(v.download_bps_hour),
+        humanize::human_bytes_per_sec(v.download_bps_day)
     );
 }
 
@@ -119,14 +126,13 @@ fn print_snapshot(rs: &netstats::RuntimeStats) {
         rs.downloading_torrents,
         rs.disk_used_bytes,
         rs.disk_limit_bytes,
-        rs.useful_bytes_uploaded,
         rs.total_bytes_uploaded,
-        rs.useful_bytes_downloaded,
         rs.total_bytes_downloaded,
-        rs.uptime_seconds,
         rs.active_peers,
         rs.process_rss_bytes,
     );
+    // Rates are live-only (the rolling history lives in the daemon's
+    // memory); the snapshot shows since-boot totals.
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -136,11 +142,8 @@ fn print_numbers(
     downloading: usize,
     disk_used: u64,
     disk_limit: u64,
-    up_useful: u64,
-    up_total: u64,
-    down_useful: u64,
-    down_total: u64,
-    uptime_secs: u64,
+    sent_total: u64,
+    recv_total: u64,
     peers: usize,
     rss: u64,
 ) {
@@ -159,34 +162,14 @@ fn print_numbers(
         );
     }
     println!(
-        "  useful upload since boot: {} (total network {})",
-        humanize::human_bytes(up_useful as i64),
-        humanize::human_bytes(up_total as i64)
-    );
-    println!(
-        "  useful download since boot: {} (total network {})",
-        humanize::human_bytes(down_useful as i64),
-        humanize::human_bytes(down_total as i64)
-    );
-    println!(
-        "  avg upload since boot: {}",
-        humanize::human_bits_per_sec(bits_per_sec(up_total, uptime_secs))
-    );
-    println!(
-        "  avg download since boot: {}",
-        humanize::human_bits_per_sec(bits_per_sec(down_total, uptime_secs))
+        "  bandwidth since boot: sent {}, received {}",
+        humanize::human_bytes(sent_total as i64),
+        humanize::human_bytes(recv_total as i64)
     );
     println!("  active peers: {peers}");
     if rss > 0 {
         println!("  memory: {} RSS", humanize::human_bytes(rss as i64));
     }
-}
-
-fn bits_per_sec(total_bytes: u64, uptime_secs: u64) -> f64 {
-    if uptime_secs == 0 {
-        return 0.0;
-    }
-    total_bytes as f64 * 8.0 / uptime_secs as f64
 }
 
 fn format_time(t: chrono::DateTime<chrono::Utc>) -> String {

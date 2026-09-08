@@ -150,7 +150,7 @@ download_rate_limit: 20M
 
 ### `stats_interval` / `--stats-interval`
 
-*Default: `30m`.* How often keep-at logs a brief summary of what it's doing - torrents held/seeding/downloading, disk utilization, transfer since boot (both useful payload and total network traffic, with average rates), active peers, process RSS, and uptime - and refreshes the persisted snapshot in `data_dir/runtime-stats.json` (the offline fallback `status` reads when no daemon is running). A summary is always written once at startup and once after every scan; `stats_interval: 0` disables the periodic ones. When the daemon is running, `keep-at status` reads live numbers straight from it over the query socket instead (instantaneous, never stale). The log line looks like:
+*Default: `30m`.* How often keep-at logs a brief summary of what it's doing - torrents held/seeding/downloading, disk utilization, bandwidth since boot, active peers, process RSS, and uptime - and refreshes the persisted snapshot in `data_dir/runtime-stats.json` (the offline fallback `status` reads when no daemon is running). A summary is always written once at startup and once after every scan; `stats_interval: 0` disables the periodic ones. These ticks also advance the rolling bandwidth history behind `status`'s hour/day rates, so they stay exact even when nobody queries the daemon for hours. When the daemon is running, `keep-at status` reads live numbers straight from it over the query socket instead (instantaneous, never stale). The log line looks like:
 
 ```
 runtime stats (kind=periodic held=12 seeding=10 downloading=2 disk=50.0 GiB/100.0 GiB up=5.0 GiB down=1.0 GiB peers=24 rss=300.0 MiB uptime=7200s)
@@ -160,18 +160,17 @@ and `keep-at status` prints the same picture (with a `live` marker when the numb
 
 ```
 keep-at is running (pid 12345)
-runtime stats (2026-08-08 20:55:00 UTC uptime, uptime 2h0m0s):
+runtime stats (live, uptime 2h0m0s):
   torrents: 12 held, 10 seeding, 2 downloading
   disk: 50.0 GiB used of 100.0 GiB configured (50.0%)
-  useful upload since boot: 5.0 GiB (total network 5.2 GiB)
-  useful download since boot: 1.0 GiB (total network 1.4 GiB)
-  avg upload since boot: 500.0 Kbit/s
-  avg download since boot: 100.0 Kbit/s
+  bandwidth since boot: sent 5.2 GiB, received 1.4 GiB
+  upload rate: 500.0 KiB/s past hour, 730.0 KiB/s past day
+  download rate: 100.0 KiB/s past hour, 150.0 KiB/s past day
   active peers: 24
   memory: 300.0 MiB RSS
 ```
 
-**Useful** transfer is the piece data that actually mattered: bytes sent to peers that requested them, and bytes received that keep-at needed. **Total network** is everything that moved over peer connections since boot - useful payload plus protocol overhead, handshakes, and duplicate/wasted chunks received from the swarm. The gap between the two is the cost of swarming, which is why a naive "downloaded" figure can far exceed what actually ended up on disk. The average rates are total-network bytes since boot divided by uptime, in bits per second.
+Bandwidth is reported once (the Rust port's counters are already payload-only, so the old useful-vs-total split carried no information) as bytes moved since this process started, plus **live per-second rates over the past hour and past day** - rolling windows computed by the daemon from an in-memory event log, exact however rarely the numbers are sampled, at negligible CPU and memory cost (the daemon records one small entry per stats interval; a day's history is a few kilobytes). Rates are live-only: they reset on restart along with the since-boot counters. The snapshot fallback shows since-boot totals without rate lines (the history lives in the running daemon's memory).
 
 Disk utilization is measured against keep-at's **configured storage limits** (the `storage`/`--storage-limit` totals), not raw filesystem usage - 100% means keep-at has reached the limit it was given. Disk *used* is actual on-disk bytes under each location. Torrents are stored as plain sparse files, so reported usage tracks nominal sizes closely (unallocated sparse regions cost nothing). "Since boot" means since this keep-at process started.
 

@@ -1788,6 +1788,11 @@ impl Engine {
     /// socket serves live numbers from the same inputs; the file stays as
     /// the offline fallback `status` reads when no daemon is running.
     fn log_and_save_runtime(&self, kind: &str) {
+        // Advance the bandwidth history on the stats cadence so hour/day
+        // rates stay exact even when nobody queries the socket for hours.
+        if let Some(live) = &self.live {
+            live.tick_tracker();
+        }
         let held = self.state.all();
         let by_hash: std::collections::HashMap<String, &state::Torrent> =
             held.iter().map(|t| (t.info_hash.clone(), t)).collect();

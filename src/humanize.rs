@@ -20,16 +20,10 @@ pub fn human_bytes(n: i64) -> String {
     }
 }
 
-/// Format bits-per-second like "12.3 Mbit/s".
-pub fn human_bits_per_sec(bps: f64) -> String {
-    const UNITS: [&str; 5] = ["bit/s", "Kbit/s", "Mbit/s", "Gbit/s", "Tbit/s"];
-    let mut v = bps;
-    let mut u = 0;
-    while v >= 1000.0 && u + 1 < UNITS.len() {
-        v /= 1000.0;
-        u += 1;
-    }
-    format!("{v:.1} {}", UNITS[u])
+/// Format bytes-per-second like "1.4 MiB/s" (binary units, like byte
+/// counts elsewhere; sub-byte rates floor to "0 B/s").
+pub fn human_bytes_per_sec(bps: f64) -> String {
+    format!("{}/s", human_bytes(bps as i64))
 }
 
 /// Compact duration like "4h19m", "90s", "3d2h".
