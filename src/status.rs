@@ -20,17 +20,23 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
     crate::config::ensure_shared_dirs(&dir);
 
     let st = daemonctl::status(&dir);
+    // Ask the daemon once: the answer reconciles the running line below
+    // (socket works => daemon lives, even if pid-file/proc detection failed)
+    // and decides live-vs-fallback stats.
+    let live = live::query(&dir, &live::Request::Runtime);
     if st.running {
         match st.pid {
             Some(pid) => println!("keep-at is running (pid {pid})"),
             None => println!("keep-at is running in the foreground, not as a service"),
         }
+    } else if live.is_some() {
+        println!("keep-at is running (pid file missing or stale; live socket answered)");
     } else {
         println!("keep-at is not running");
     }
 
     // Live daemon answers from in-process state; files are the offline path.
-    if let Some(live::Response::Runtime(v)) = live::query(&dir, &live::Request::Runtime) {
+    if let Some(live::Response::Runtime(v)) = live {
         print_live(&v);
         return Ok(());
     }

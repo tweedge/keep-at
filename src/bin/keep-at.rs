@@ -80,6 +80,12 @@ async fn main() -> Result<()> {
 async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("creating data dir {}", cfg.data_dir.display()))?;
+    // Record OUR pid (world-readable): status/stop work for flag-run,
+    // systemd, and start-launched daemons alike. Previously only `start`
+    // wrote a pid file — and wrote the parent's, stale from birth — so a
+    // flag-run daemon reported "not running" whenever the /proc fallback
+    // scan failed to reach it.
+    keep_at::daemonctl::write_pid(&cfg.data_dir)?;
     // Split-secret migration (pre-0.8.11 configs): API key inline in an
     // owner-only config file. As the daemon user (the owner) rewrite the
     // config world-readable; the key lands in <data_dir>/api_key below.
@@ -154,6 +160,9 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
         }
     };
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine.close()).await;
+    // Clean shutdown: drop our pid file so status doesn't report a dead
+    // pid (SIGKILL'd daemons leave the liveness check to handle it).
+    keep_at::daemonctl::remove_pid(&cfg.data_dir);
     tracing::info!("keep-at stopped");
     r
 }
@@ -185,8 +194,8 @@ async fn cmd_start(cfg: Config, foreground: bool) -> Result<()> {
             tmp_path.to_string_lossy().into_owned(),
         ],
     )?;
-    // Record the daemon PID for stop/status (world-readable: any user).
-    keep_at::daemonctl::write_pid(&data_dir)?;
+    // The daemon records its own pid on boot (see cmd_run): this parent
+    // exits in a moment, so writing here would leave a stale file.
     println!("keep-at started in the background (pid {pid})");
     Ok(())
 }

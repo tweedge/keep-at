@@ -12,6 +12,10 @@ Existing installs migrate on the daemon's first start after upgrading: as the fi
 
 `status` also stops presenting fallback data ambiguously: when a daemon is detected running but doesn't answer the live query socket (typically: upgraded binary, daemon not yet restarted), it prints "(live stats unavailable - daemon may need a restart after upgrading; showing the last persisted snapshot)" and labels the snapshot with its collection timestamp, so a stale file can't masquerade as live data.
 
+### `status` finds flag-run daemons reliably again
+
+Field validation of v0.8.10 surfaced the inverse of the stale-stats problem: "keep-at is not running" printed above live stats. Two defects in process detection: the `/proc` foreground scan aborted on the first non-numeric `/proc` entry (an early `?` on the pid parse - readdir order is arbitrary, so the scan usually died before reaching any real pid), and the pid file was only ever written by `start` - which wrote the *parent's* pid, stale from birth. Now the daemon records its own pid at boot (covering flag-run, systemd, and `start`-launched daemons alike) and removes it on clean shutdown, the `/proc` scan skips non-numeric entries instead of aborting, and `status` reconciles the running line with the live socket: if the socket answers but detection failed, it prints "keep-at is running (pid file missing or stale; live socket answered)" instead of contradicting itself. Both regressions are pinned by injected-proc-dir tests.
+
 ## v0.8.10-beta - live status socket, EMFILE prevention
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
