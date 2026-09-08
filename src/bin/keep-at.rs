@@ -49,6 +49,12 @@ fn init_logging_to(debug: bool, log_file: Option<&std::path::Path>) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Restore default SIGPIPE: Rust's runtime ignores it, so any
+    // `keep-at hosted-torrents | head` dies with a "failed printing to
+    // stdout: Broken pipe" panic instead of exiting cleanly like a normal
+    // filter. Default disposition = process killed by SIGPIPE, as usual.
+    #[cfg(unix)]
+    libc_signal(13, 1); // SIGPIPE -> SIG_DFL
     let cli = Cli::parse();
     match cli.cmd {
         Command::Run(a) => {
@@ -263,6 +269,12 @@ fn send_sigterm(pid: u32) -> Result<()> {
 #[cfg(unix)]
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+#[cfg(unix)]
+fn libc_signal(signum: i32, handler: usize) -> usize {
+    unsafe { signal(signum, handler) }
 }
 
 #[cfg(unix)]
