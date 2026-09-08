@@ -25,7 +25,8 @@ pub fn cmd_hosted(args: &CommonArgs) -> Result<()> {
     // fallback as status).
     let mut view_dir = dir.clone();
     let mut live = live::query(&dir, &live::Request::Held);
-    if live.is_none() {
+    let explicit = args.data_dir.is_some() || args.config.is_some();
+    if live.is_none() && !explicit {
         if let Some((pid, other)) = crate::daemonctl::find_any_daemon() {
             if crate::daemonctl::pid_alive(pid) {
                 if let Some(l2) = live::query(&other, &live::Request::Held) {

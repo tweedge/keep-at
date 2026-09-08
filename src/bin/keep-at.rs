@@ -249,9 +249,12 @@ async fn cmd_start(cfg: Config, foreground: bool) -> Result<()> {
 fn cmd_stop(args: &keep_at::cli::CommonArgs) -> Result<()> {
     let dir = cli::resolve_data_dir(args)?;
     let mut st = keep_at::daemonctl::status(&dir);
-    if !st.running {
-        // Nothing at the resolved dir: same discovery fallback as status —
-        // a flag-run daemon with a non-default data dir is still stoppable.
+    let explicit = args.data_dir.is_some() || args.config.is_some();
+    if !st.running && !explicit {
+        // Nothing at the resolved dir: same discovery fallback as bare
+        // status — a flag-run daemon with a non-default data dir is still
+        // stoppable, but ONLY for bare `stop` (an explicitly targeted stop
+        // must never kill someone else's instance).
         if let Some((pid, other)) = keep_at::daemonctl::find_any_daemon() {
             if keep_at::daemonctl::pid_alive(pid) {
                 st = keep_at::daemonctl::Status {

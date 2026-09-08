@@ -27,7 +27,13 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
     let mut view_dir = dir.clone();
     let mut foreign_pid: Option<u32> = None;
     let mut foreign = false;
-    if !st.running && live.is_none() {
+    // Discovery only for BARE invocations: bare `status` means "what is
+    // keep-at doing on this host", so finding a flag-run daemon with a
+    // non-default data dir is the answer. With an explicit --data-dir or
+    // --config the user targeted one instance - reporting a different one
+    // would be wrong (and on multi-instance hosts, someone else's).
+    let explicit = args.data_dir.is_some() || args.config.is_some();
+    if !st.running && live.is_none() && !explicit {
         // Nothing at the resolved dir: maybe an instance runs with a
         // non-default data dir (flag-run, no config file to read). Find any
         // live daemon via /proc and query ITS dir instead.
