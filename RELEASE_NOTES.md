@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.12-beta - bandwidth since boot, live hour/day rates
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### `status` shows bandwidth once, plus rolling hour/day rates
+
+The old display reported "useful" and "total network" transfer as separate lines - but in the Rust port both counters were literally set to the same session values, so the distinction carried no information. `status` now shows one line, `bandwidth since boot: sent X, received Y`, plus **live per-second upload/download rates over the past hour and past day**: rolling windows computed by the daemon from an in-memory event log (`src/bandwidth.rs`). The log records one small entry per sampling tick covering its exact time span with the byte delta between cumulative session counters - exact however rarely the daemon is sampled (sparse 30-min stats passes, bursty queries, anything in between), with proportional attribution when a window edge cuts through a long span, day-window pruning, and a 1500-entry hard cap. Resource cost is negligible and bounded: about 2 KB per day at the default cadence (48 KB absolute worst case), no background timer - the log advances only on the periodic stats pass and when someone queries the socket. Rates are live-only and reset on restart along with the since-boot counters; the offline snapshot fallback shows since-boot totals without rate lines. The average-since-boot bits/s lines are gone (the hour/day rates supersede them), and the unused `human_bits_per_sec` helper was removed.
+
 ## v0.8.11-beta - world-readable config, API key moved out
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
