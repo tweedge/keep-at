@@ -14,6 +14,11 @@ pub type ManagedTorrentHandle = Arc<librqbit::ManagedTorrent>;
 /// AT-only tracker filtering + keyed announce URLs are applied before adding.
 /// Raw bytes are read from the torrent-cache file at add time and dropped
 /// right after, so callers never hold bulk metainfo in memory.
+/// When `wait_init` is set, briefly awaits initialization so early errors
+/// surface at the call site (candidate adds). Resume passes `false`: with
+/// 144 held torrents, awaiting each one's initial checksum validation
+/// serialized ~20-60s per torrent and delayed the live query socket by
+/// most of an hour — validation keeps running in the background either way.
 /// Returns the info-hash hex.
 pub async fn add_torrent_bytes(
     session: &Arc<Session>,
@@ -22,6 +27,7 @@ pub async fn add_torrent_bytes(
     output_dir: &Path,
     trackers: Vec<Vec<String>>,
     cache_path: &Path,
+    wait_init: bool,
 ) -> Result<String> {
     let raw = std::fs::read(cache_path)
         .with_context(|| format!("loading cached .torrent for {info_hash_hex}"))?;
@@ -48,12 +54,14 @@ pub async fn add_torrent_bytes(
     let handle = resp
         .into_handle()
         .context("torrent added list-only, expected managed")?;
-    // Wait briefly for initialization so early errors surface here, not later.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        handle.wait_until_initialized(),
-    )
-    .await;
+    if wait_init {
+        // Wait briefly for initialization so early errors surface here, not later.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            handle.wait_until_initialized(),
+        )
+        .await;
+    }
     Ok(handle.info_hash().as_string())
 }
 

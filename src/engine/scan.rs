@@ -1484,6 +1484,7 @@ impl Engine {
             &out_dir,
             keyed,
             &self.torrent_cache_path(&hex_str),
+            true,
         )
         .await
         {
@@ -1773,6 +1774,7 @@ impl Engine {
                 &out_dir,
                 keyed,
                 &self.torrent_cache_path(&h.info_hash),
+                false,
             )
             .await
             {
