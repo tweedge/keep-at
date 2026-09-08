@@ -23,16 +23,44 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
     // Ask the daemon once: the answer reconciles the running line below
     // (socket works => daemon lives, even if pid-file/proc detection failed)
     // and decides live-vs-fallback stats.
-    let live = live::query(&dir, &live::Request::Runtime);
+    let mut live = live::query(&dir, &live::Request::Runtime);
+    let mut view_dir = dir.clone();
+    let mut foreign_pid: Option<u32> = None;
+    let mut foreign = false;
+    if !st.running && live.is_none() {
+        // Nothing at the resolved dir: maybe an instance runs with a
+        // non-default data dir (flag-run, no config file to read). Find any
+        // live daemon via /proc and query ITS dir instead.
+        if let Some((pid, other)) = daemonctl::find_any_daemon() {
+            if daemonctl::pid_alive(pid) {
+                if let Some(l2) = live::query(&other, &live::Request::Runtime) {
+                    foreign = other != dir;
+                    live = Some(l2);
+                    view_dir = other;
+                    foreign_pid = Some(pid);
+                }
+            }
+        }
+    }
     if st.running {
         match st.pid {
             Some(pid) => println!("keep-at is running (pid {pid})"),
             None => println!("keep-at is running in the foreground, not as a service"),
         }
+    } else if let Some(pid) = foreign_pid {
+        println!("keep-at is running (pid {pid}, discovered via /proc)");
     } else if live.is_some() {
         println!("keep-at is running (pid file missing or stale; live socket answered)");
     } else {
         println!("keep-at is not running");
+    }
+    if foreign {
+        println!(
+            "note: resolved data dir is {}, but the running daemon uses {} — pass --data-dir {} to target it directly",
+            dir.display(),
+            view_dir.display(),
+            view_dir.display()
+        );
     }
 
     // Live daemon answers from in-process state; files are the offline path.
@@ -49,7 +77,9 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
             "  (live stats unavailable — daemon may need a restart after upgrading; showing the last persisted snapshot)"
         );
     }
-    print_snapshot(&netstats::load_runtime(&dir.join("runtime-stats.json"))?);
+    print_snapshot(&netstats::load_runtime(
+        &view_dir.join("runtime-stats.json"),
+    )?);
     Ok(())
 }
 

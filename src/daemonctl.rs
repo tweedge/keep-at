@@ -140,6 +140,66 @@ fn find_foreground_in(proc_dir: &Path, want: &str) -> Option<Option<u32>> {
     None
 }
 
+/// Find ANY running keep-at run/start daemon and its data dir, regardless
+/// of which data dir the caller resolved. Lets read-only commands
+/// (`status`, `hosted-torrents`) and `stop` find a flag-run instance whose
+/// data dir is non-default and which has no config file to read.
+pub fn find_any_daemon() -> Option<(u32, PathBuf)> {
+    find_any_daemon_in(Path::new("/proc"))
+}
+
+fn find_any_daemon_in(proc_dir: &Path) -> Option<(u32, PathBuf)> {
+    let procs = std::fs::read_dir(proc_dir).ok()?;
+    for entry in procs.flatten() {
+        let name = entry.file_name();
+        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        if cmdline.is_empty() {
+            continue;
+        }
+        let parts: Vec<String> = cmdline
+            .split(|&b| b == 0)
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        if parts.len() < 2 || !parts[0].ends_with("keep-at") {
+            continue;
+        }
+        if !matches!(parts[1].as_str(), "run" | "start") {
+            continue;
+        }
+        let mut dir_arg: Option<String> = None;
+        let mut config_arg: Option<String> = None;
+        let mut iter = parts[2..].iter();
+        while let Some(a) = iter.next() {
+            if a == "--data-dir" {
+                dir_arg = iter.next().cloned();
+            } else if let Some(v) = a.strip_prefix("--data-dir=") {
+                dir_arg = Some(v.to_string());
+            } else if a == "--config" {
+                config_arg = iter.next().cloned();
+            } else if let Some(v) = a.strip_prefix("--config=") {
+                config_arg = Some(v.to_string());
+            }
+        }
+        if let Some(d) = dir_arg {
+            return Some((pid, PathBuf::from(d)));
+        }
+        if let Some(c) = config_arg {
+            if let Ok(cfg) = crate::config::Config::load(std::path::Path::new(&c)) {
+                return Some((pid, cfg.data_dir));
+            }
+            continue;
+        }
+        return Some((pid, crate::config::default_data_dir()));
+    }
+    None
+}
+
 /// Container detection: /.dockerenv or container= env (podman/docker/systemd-nspawn).
 pub fn is_containerized() -> bool {
     if Path::new("/.dockerenv").exists() {
@@ -268,5 +328,24 @@ mod tests {
         assert_eq!(find_foreground_in(&dir, &want), Some(Some(777)));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&cfg_dir);
+    }
+
+    #[test]
+    fn any_daemon_scan_finds_flag_run_instance() {
+        let dir = std::env::temp_dir().join(format!("keep-at-anyd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmdline = "keep-at\u{0}run\u{0}--data-dir\u{0}/srv/keep-at/data\u{0}";
+        let p = dir.join("4242");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("cmdline"), cmdline.as_bytes()).unwrap();
+        std::fs::write(dir.join("cpuinfo"), b"").unwrap();
+        let found = find_any_daemon_in(&dir);
+        assert_eq!(
+            found,
+            Some((4242, PathBuf::from("/srv/keep-at/data"))),
+            "non-default flag-run daemon discoverable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

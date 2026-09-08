@@ -20,8 +20,22 @@ pub fn cmd_hosted(args: &CommonArgs) -> Result<()> {
     // Same traversal repair as status (read-only op, any user).
     crate::config::ensure_shared_dirs(&dir);
 
-    // Live daemon: authoritative per-torrent progress.
-    if let Some(live::Response::Held(view)) = live::query(&dir, &live::Request::Held) {
+    // Live daemon: authoritative per-torrent progress. Nothing at the
+    // resolved dir => look for a daemon with a non-default data dir (same
+    // fallback as status).
+    let mut view_dir = dir.clone();
+    let mut live = live::query(&dir, &live::Request::Held);
+    if live.is_none() {
+        if let Some((pid, other)) = crate::daemonctl::find_any_daemon() {
+            if crate::daemonctl::pid_alive(pid) {
+                if let Some(l2) = live::query(&other, &live::Request::Held) {
+                    live = Some(l2);
+                    view_dir = other;
+                }
+            }
+        }
+    }
+    if let Some(live::Response::Held(view)) = live {
         if view.torrents.is_empty() {
             println!("keep-at is not holding any torrents");
             return Ok(());
@@ -47,7 +61,7 @@ pub fn cmd_hosted(args: &CommonArgs) -> Result<()> {
     }
 
     // Offline fallback: state + on-disk heuristic (unchanged).
-    let st = State::load(&dir.join("state.json"))?;
+    let st = State::load(&view_dir.join("state.json"))?;
     let held = st.all();
     if held.is_empty() {
         println!("keep-at is not holding any torrents");
