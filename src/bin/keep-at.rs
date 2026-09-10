@@ -79,6 +79,11 @@ async fn main() -> Result<()> {
             keep_at::census::cmd_network_status(&a).await
         }
         Command::HostedTorrents(a) => keep_at::hosted::cmd_hosted(&a),
+        Command::DeathEvidence(a) => {
+            let dir = cli::resolve_data_dir(&a)?;
+            keep_at::forensics::print_death_evidence(&dir);
+            Ok(())
+        }
         Command::SelfUpdate(a) => cmd_self_update(a.beta).await,
         Command::Version => {
             println!("keep-at {}", keep_at::buildinfo::VERSION);
@@ -179,6 +184,19 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
             keep_at::live::serve(dir, h).await;
         });
     }
+
+    // Kill forensics: catchable-signal death marks go to the log file
+    // (SIGKILL can't be logged - that silence is itself the diagnostic);
+    // the heartbeat task records RSS + cgroup state every 60s, and the
+    // cgroup memory.events oom_kill counter is readable post-mortem.
+    // Debug-kill-forensics build: shipped to find what is killing the
+    // daemon on shared hosts.
+    let log_path = cfg
+        .log_file
+        .clone()
+        .unwrap_or_else(|| cfg.data_dir.join("keep-at.log"));
+    keep_at::forensics::install_signal_death_marks(&log_path);
+    keep_at::forensics::heartbeat_task(cfg.data_dir.clone(), std::time::Instant::now());
 
     let started = std::time::Instant::now();
     let mut engine = keep_at::engine::Engine::new(cfg.clone()).await?;

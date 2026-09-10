@@ -40,6 +40,8 @@ pub enum Command {
     HostedTorrents(CommonArgs),
     /// Update to the latest release
     SelfUpdate(SelfUpdateArgs),
+    /// Print kill-forensics evidence (called by the host watchdog on death)
+    DeathEvidence(CommonArgs),
     /// Print the version and exit
     Version,
 }
