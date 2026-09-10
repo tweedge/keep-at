@@ -62,9 +62,12 @@ keep-at stop
 keep-at status
 keep-at network-status
 keep-at hosted-torrents
+keep-at logs
 ```
 
 `hosted-torrents` lists everything this host currently holds and seeds: title, verified bytes present, seeding/downloading status, last-scrape seeder counts, and a link to each torrent's Academic Torrents page. When the daemon is running both it and `status` read live numbers straight from it (never stale); when it isn't, they fall back to the persisted files.
+
+`logs` prints the daemon's log. It follows by default (like `tail -f`, starting from the last 20 lines) so you can watch a scan or boot live; `--all` prints the whole log and exits, and `--lines N` changes how many lines precede the follow.
 
 `start` and `run` take the exact same flags as `service install` - `start` just forks `run` into the background for you (or runs it in the foreground directly, inside a container). None of these commands need `--config` once keep-at is installed as a service; pass it explicitly only if you're managing a non-service instance, or one installed somewhere unusual.
 

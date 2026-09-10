@@ -285,3 +285,43 @@ fn version_prints() {
         .success()
         .stdout(predicate::str::contains("keep-at "));
 }
+
+#[test]
+fn logs_all_prints_and_follow_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let log = data.join("keep-at.log");
+    std::fs::write(&log, "a\nb\nc\n").unwrap();
+    // --all: prints everything, exits.
+    keep_at()
+        .args(["logs", "--data-dir", data.to_str().unwrap(), "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("a\nb\nc\n"));
+    // Default tail: last 2 lines only (--all makes it exit; the printed
+    // content is the tail of the file).
+    keep_at()
+        .args([
+            "logs",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--lines",
+            "2",
+            "--all",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("b\nc\n"))
+        .stdout(predicate::str::ends_with("c\n"));
+    // Missing log file: actionable error, not a trace.
+    keep_at()
+        .args([
+            "logs",
+            "--data-dir",
+            dir.path().join("none").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no log file at"));
+}

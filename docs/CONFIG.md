@@ -42,7 +42,7 @@ If no storage flag is passed, keep-at uses `~/.local/share/keep-at/storage` (`/v
 
 ### `data_dir` / `--data-dir`
 
-Where keep-at keeps its own bookkeeping: persisted state (what it's currently holding), the PID/log files `start`/`stop`/`status` use, cached `.torrent` files and catalog data, network-status snapshots, and the live query socket (`keep-at.sock`, created while the daemon runs). This is separate from `storage`, which is only for the torrent data itself.
+Where keep-at keeps its own bookkeeping: persisted state (what it's currently holding), the PID/log files `start`/`stop`/`status` use (the log is `<data_dir>/keep-at.log` by default, overridable with `--log-file`; `keep-at logs` reads it - following by default, `--all` to print everything), cached `.torrent` files and catalog data, network-status snapshots, and the live query socket (`keep-at.sock`, created while the daemon runs). This is separate from `storage`, which is only for the torrent data itself.
 
 Defaults to `~/.local/share/keep-at` (`/var/lib/keep-at` when `HOME` is unset).
 
@@ -182,7 +182,7 @@ Disk utilization is measured against keep-at's **configured storage limits** (th
 A few flags control CLI behavior rather than keep-at's own settings, and don't have a YAML equivalent:
 
 * `--config PATH` - use a config file (see precedence above).
-* `--data-dir PATH` - override the data directory for this invocation (on `run`/`start`/`stop`/`status`/`hosted-torrents`; wins over the config file).
+* `--data-dir PATH` - override the data directory for this invocation (on `run`/`start`/`stop`/`status`/`hosted-torrents`/`logs`; wins over the config file).
 * `--foreground` (`start` only) - run attached instead of daemonizing. Implied automatically inside a container.
 * `--user` (`service install` only) - which user the systemd unit runs as (default `root`).
 * `--probe-timeout` (`network-status` only) - how long to wait per torrent for peers while probing its swarm (default `10s`).

@@ -30,6 +30,8 @@ pub enum Command {
     Stop(CommonArgs),
     /// Report whether keep-at is running
     Status(CommonArgs),
+    /// Print keep-at's logs (follows by default; --all prints and exits)
+    Logs(LogsArgs),
     /// Install/remove a systemd service (elevates automatically when needed)
     Service(ServiceArgs),
     /// Census the keep-at network (RAM/time-heavy, on demand)
@@ -50,6 +52,18 @@ pub struct CommonArgs {
     /// Directory for keep-at's own state (defaults to the config's or OS default)
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Print the whole log and exit instead of following
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
+    /// How many lines to show before following (default: 50)
+    #[arg(long, default_value_t = 20)]
+    pub lines: usize,
 }
 
 #[derive(Debug, Args)]
@@ -187,7 +201,9 @@ pub struct SelfUpdateArgs {
     pub beta: bool,
 }
 
-fn service_config_if_present() -> Option<PathBuf> {
+/// Service config path when installed (pub for read-only commands' config
+/// fallbacks; internal callers use it via this module).
+pub fn service_config_if_present() -> Option<PathBuf> {
     let p = PathBuf::from(crate::service::CONFIG_PATH);
     if p.exists() {
         Some(p)
