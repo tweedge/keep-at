@@ -77,6 +77,7 @@ extern "C" fn death_mark_handler(sig: i32) {
 pub fn install_signal_death_marks(log_path: &Path) {
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new()
+        .create(true)
         .append(true)
         .mode(0o644)
         .open(log_path);
@@ -123,7 +124,11 @@ fn rss_bytes() -> u64 {
 fn cgroup_v2_root() -> Option<PathBuf> {
     let data = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let line = data.lines().find(|l| l.starts_with("0::"))?;
-    Some(Path::new("/sys/fs/cgroup").join(line["0::".len()..].trim()))
+    // Strip the leading '/': Path::join with an absolute segment would
+    // REPLACE the base (Path::new("/sys/fs/cgroup").join("/tweedge") is
+    // "/tweedge", which doesn't exist - observed live as all-zero reads).
+    let rel = line["0::".len()..].trim().trim_start_matches('/');
+    Some(Path::new("/sys/fs/cgroup").join(rel))
 }
 
 /// cgroup v2 memory forensics: (current, max, oom_kill counter, peak).
