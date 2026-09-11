@@ -37,13 +37,17 @@ const STATM_PATH: &str = "/proc/self/statm";
 static DEATH_FD: AtomicI32 = AtomicI32::new(-1);
 
 #[cfg(target_os = "linux")]
-const SIG_NAMES: [(i32, &[u8]); 6] = [
-    (4, b"death-mark: SIGSEGV (4) received\n"),
+const SIG_NAMES: [(i32, &[u8]); 7] = [
+    (11, b"death-mark: SIGSEGV (11) received\n"),
     (6, b"death-mark: SIGABRT (6) received\n"),
     (7, b"death-mark: SIGBUS (7) received\n"),
     (24, b"death-mark: SIGXCPU (24) received - cpu limit hit\n"),
     (1, b"death-mark: SIGHUP (1) received\n"),
     (3, b"death-mark: SIGQUIT (3) received\n"),
+    (
+        13,
+        b"death-mark: SIGPIPE (13) received - write to closed pipe/fd\n",
+    ),
 ];
 
 unsafe extern "C" {

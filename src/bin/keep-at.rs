@@ -49,16 +49,22 @@ fn init_logging_to(debug: bool, log_file: Option<&std::path::Path>) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Restore default SIGPIPE: Rust's runtime ignores it, so any
-    // `keep-at hosted-torrents | head` dies with a "failed printing to
-    // stdout: Broken pipe" panic instead of exiting cleanly like a normal
-    // filter. Default disposition = process killed by SIGPIPE, as usual.
-    // Default disposition = process killed by SIGPIPE, as usual.
+    let cli = Cli::parse();
+    // Restore default SIGPIPE (Rust's runtime ignores it) ONLY for short-lived
+    // print-style commands, so `keep-at hosted-torrents | head` exits cleanly.
+    // The daemon arms (run/start/service) must NEVER see SIG_DFL: every write
+    // to a broken pipe or a closed stdout/stderr (systemd gives the daemon
+    // journald stream sockets; journald restarts break them) would kill the
+    // daemon instantly with SIGPIPE — silent, unloggable, and historically
+    // indistinguishable from SIGKILL in the journal. Measured on mercury
+    // 2026-09-11: std socket writes use MSG_NOSIGNAL (immune), but raw
+    // pipe/journal-fd writes with SIG_DFL die with exit 141.
     // SIG_DFL is 0 (SIG_IGN is 1 - which makes writes return EPIPE and
     // println! panic; that was tried and is wrong).
     #[cfg(unix)]
-    libc_signal(13, 0); // SIGPIPE -> SIG_DFL
-    let cli = Cli::parse();
+    if restores_sigpipe_default(&cli.cmd) {
+        libc_signal(13, 0); // SIGPIPE -> SIG_DFL
+    }
     match cli.cmd {
         Command::Run(a) => {
             let cfg = cli::resolve(&a.common, &a.cfg)?;
@@ -195,9 +201,32 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
         .log_file
         .clone()
         .unwrap_or_else(|| cfg.data_dir.join("keep-at.log"));
+    // Belt and braces against SIGPIPE deaths (measured 2026-09-11, see main()):
+    // whatever our ancestors set, the daemon itself pins SIGPIPE to ignored.
+    // Socket writes are already immune (std sends with MSG_NOSIGNAL); this
+    // covers pipes and inherited stderr/stdout fds.
+    #[cfg(unix)]
+    libc_signal(13, 1); // SIGPIPE -> SIG_IGN (broken-pipe writes return EPIPE)
+                        // Redirect stdout+stderr into the log file: the daemon must never hold a
+                        // pipe or journald stream fd (systemd hands out journal sockets; journald
+                        // restarts break them, and ANY later write would EPIPE/SIGPIPE). Panic
+                        // messages land in keep-at.log instead of vanishing with the process.
+    #[cfg(unix)]
+    redirect_stdio_to(&log_path);
     keep_at::forensics::install_signal_death_marks(&log_path);
     keep_at::forensics::install_panic_hook(&log_path);
     keep_at::forensics::heartbeat_task(cfg.data_dir.clone(), std::time::Instant::now());
+    // Debug knob: KEEPAT_DEBUG_PANIC=1 schedules an intentional panic in a
+    // background thread 20s after boot. Used to measure death handling
+    // (panic hook -> log file, daemon must survive).
+    #[cfg(unix)]
+    if std::env::var_os("KEEPAT_DEBUG_PANIC").is_some() {
+        tracing::info!("KEEPAT_DEBUG_PANIC: intentional panic scheduled in 20s");
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            panic!("KEEPAT_DEBUG_PANIC: intentional test panic");
+        });
+    }
 
     let started = std::time::Instant::now();
     let mut engine = keep_at::engine::Engine::new(cfg.clone()).await?;
@@ -333,11 +362,60 @@ fn send_sigterm(pid: u32) -> Result<()> {
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
     fn signal(signum: i32, handler: usize) -> usize;
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
 }
 
 #[cfg(unix)]
 fn libc_signal(signum: i32, handler: usize) -> usize {
     unsafe { signal(signum, handler) }
+}
+
+/// True for short-lived print-style commands where dying by SIGPIPE on a
+/// closed downstream pipe (`... | head`) is the normal, expected behavior.
+/// Never true for the daemon arms — their children inherit the disposition,
+/// and a daemon with SIGPIPE at SIG_DFL dies silently on any write to a
+/// broken pipe or closed journal stream (measured 2026-09-11).
+#[cfg(unix)]
+fn restores_sigpipe_default(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Status(_)
+            | Command::Logs(_)
+            | Command::HostedTorrents(_)
+            | Command::NetworkStatus(_)
+            | Command::Version
+            | Command::DeathEvidence(_)
+            | Command::Stop(_)
+    )
+}
+
+/// Point fds 1 and 2 at `log_path` (append). The daemon then has no pipe or
+/// journal-stream fds on its stdout/stderr, so no write anywhere can hit a
+/// closed reader. Best effort: on failure the original fds stay (harmless —
+/// SIGPIPE is already pinned to SIG_IGN above).
+#[cfg(unix)]
+fn redirect_stdio_to(log_path: &std::path::Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o644)
+        .open(log_path);
+    if let Ok(fd) = f {
+        let fd = std::os::unix::io::IntoRawFd::into_raw_fd(fd);
+        unsafe {
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if fd > 2 {
+                close(fd);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn close(fd: i32) -> i32;
 }
 
 #[cfg(unix)]
@@ -477,5 +555,41 @@ mod self_update_tests {
         assert!(!version_older_or_equal("0.8.6", "v0.7.2"));
         assert!(!version_older_or_equal("v0.9.0", "0.8.6"));
         assert!(version_older_or_equal("1.2", "1.2.0"));
+    }
+}
+
+#[cfg(test)]
+mod sigpipe_disposition_tests {
+    use super::{restores_sigpipe_default, Cli};
+    use clap::Parser;
+
+    fn cmd(argv: &[&str]) -> super::Command {
+        Cli::try_parse_from(argv).unwrap().cmd
+    }
+
+    #[test]
+    fn daemon_arms_never_restore_sigpipe_default() {
+        assert!(!restores_sigpipe_default(&cmd(&[
+            "keep-at",
+            "run",
+            "--storage-location",
+            "/tmp/x",
+        ])));
+        assert!(!restores_sigpipe_default(&cmd(&["keep-at", "start"])));
+        assert!(!restores_sigpipe_default(&cmd(&[
+            "keep-at", "service", "install"
+        ])));
+    }
+
+    #[test]
+    fn print_arms_restore_sigpipe_default() {
+        assert!(restores_sigpipe_default(&cmd(&["keep-at", "version"])));
+        assert!(restores_sigpipe_default(&cmd(&["keep-at", "status"])));
+        assert!(restores_sigpipe_default(&cmd(&["keep-at", "logs"])));
+        assert!(restores_sigpipe_default(&cmd(&[
+            "keep-at",
+            "hosted-torrents"
+        ])));
+        assert!(restores_sigpipe_default(&cmd(&["keep-at", "stop"])));
     }
 }

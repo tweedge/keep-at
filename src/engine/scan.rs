@@ -1094,7 +1094,6 @@ impl Engine {
             .map(|l| (l.path.clone(), l.limit_bytes()))
             .collect();
         let snap = snapshot_entries(&self.state);
-        eprintln!("DEBUG test_live_handle: snapshot len={}", snap.len());
         crate::live::LiveHandle::for_tests(
             self.session.clone(),
             self.api.clone(),
