@@ -196,6 +196,7 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
         .clone()
         .unwrap_or_else(|| cfg.data_dir.join("keep-at.log"));
     keep_at::forensics::install_signal_death_marks(&log_path);
+    keep_at::forensics::install_panic_hook(&log_path);
     keep_at::forensics::heartbeat_task(cfg.data_dir.clone(), std::time::Instant::now());
 
     let started = std::time::Instant::now();

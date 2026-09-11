@@ -288,3 +288,64 @@ pub fn print_death_evidence(data_dir: &Path) {
     }
     print!("{out}");
 }
+
+/// Route panic messages into the log file. Without this, a panic on a host
+/// that doesn't redirect stderr is silently lost - indistinguishable from a
+/// SIGKILL, and the single biggest gap in classifying a silent death. The
+/// hook writes the message + location with plain write(2)-style I/O to the
+/// O_APPEND log (append semantics make concurrent writers safe), then
+/// chains to the previous hook so stderr output is preserved too.
+pub fn install_panic_hook(log_path: &Path) {
+    let prev = std::panic::take_hook();
+    let path = log_path.to_path_buf();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "?".to_string());
+        let line = format!("death-mark: PANIC at {loc}: {msg}\n",);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+        prev(info);
+    }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_hook_writes_mark_to_log() {
+        let dir = std::env::temp_dir().join(format!("keep-at-panic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("keep-at.log");
+        std::fs::write(&log, b"boot line\n").unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            install_panic_hook(&log);
+            panic!("forensics-probe");
+        });
+        assert!(result.is_err(), "panic propagates through catch_unwind");
+
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            body.contains("death-mark: PANIC") && body.contains("forensics-probe"),
+            "panic mark written to log, got: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
