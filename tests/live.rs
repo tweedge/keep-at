@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use common::{test_config, test_options, test_port, with_timeout, Fixture, Stub, StubState};
 
+use std::io::Write;
+
 #[test]
 fn protocol_shapes() {
     // Request serializes as the documented one-line verbs.
@@ -36,6 +38,52 @@ fn offline_query_is_none() {
     let dir = tempfile::tempdir().unwrap().keep();
     assert!(keep_at::live::query(&dir, &keep_at::live::Request::Runtime).is_none());
     assert!(keep_at::live::query(&dir, &keep_at::live::Request::Held).is_none());
+}
+
+/// Regression for the status flakiness (2026-09-12): a client that connects
+/// and only WRITES its request a moment later. The daemon used to serve
+/// accepted connections with a std socket still in O_NONBLOCK mode, so the
+/// first read returned EAGAIN before the request bytes arrived and the
+/// connection was dropped instantly (client saw EPIPE/EOF). The serve loop
+/// must wait for the request within its timeout instead.
+#[test]
+fn delayed_request_is_served_not_dropped() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let handle = keep_at::live::LiveHandle::booting(
+        std::time::Instant::now(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let dir2 = dir.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(keep_at::live::serve(dir2, handle));
+    });
+    let sock = keep_at::live::socket_path(&dir);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !sock.exists() {
+        assert!(std::time::Instant::now() < deadline, "socket never appeared");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    // Simulate the losing side of the write-vs-read race: connect, pause
+    // long enough for the server's first read to run, then write.
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    s.write_all(b"{\"op\":\"runtime\"}\n").unwrap();
+    s.flush().unwrap();
+    let mut resp = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(&s), &mut resp)
+        .expect("server must wait for a late request, not drop the connection");
+    assert!(resp.contains("\"runtime\""), "got: {resp}");
+
+    // And the plain fast path still works after it.
+    let r = keep_at::live::query(&dir, &keep_at::live::Request::Runtime).expect("fast path");
+    assert!(matches!(r, keep_at::live::Response::Runtime(_)));
 }
 
 #[tokio::test(flavor = "multi_thread")]

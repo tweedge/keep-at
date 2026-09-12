@@ -49,20 +49,38 @@ jobs:
         run: |
           set -x
           ls -la dist/
+          # Extract ONLY this tag's section from RELEASE_NOTES.md (the
+          # section headed by an exact "## <tag>" match, up to the next
+          # "## " heading or EOF). Notes must never accumulate past
+          # releases: publishing stale or rolled-up history is a bug, so a
+          # missing section fails the release instead of falling back to
+          # the whole file. See the Releasing section in README.md.
+          tag="${{ github.ref_name }}"
           notes_file="RELEASE_NOTES.md"
           if [ ! -f "$notes_file" ]; then
-            notes_file=/dev/null
+            echo "RELEASE_NOTES.md missing: add it with a '## $tag' section" >&2
+            exit 1
           fi
+          section=$(awk -v t="$tag" '
+            /^## / { if (hit) exit; if ($0 ~ "^## " t "( |$)") { hit=1; next } }
+            hit { print }
+          ' "$notes_file")
+          if [ -z "$section" ]; then
+            echo "RELEASE_NOTES.md has no '## $tag' section - add one describing only this release" >&2
+            exit 1
+          fi
+          printf "%s\n" "$section" > release-notes-extracted.md
+          notes_file="release-notes-extracted.md"
           args=()
           # Development builds (x.y.z-beta) publish as GitHub prereleases
           # so plain `keep-at self-update` never pulls them; stable x.y
           # tags publish as full releases. The tag shape is the source of
           # truth (mirrors updater::channel_of), not a suffix allowlist.
-          case "${{ github.ref_name }}" in
+          case "$tag" in
             *-beta|*-rc|*-alpha) args+=(--prerelease) ;;
           esac
-          gh release create "${{ github.ref_name }}" dist/*.tar.gz \
+          gh release create "$tag" dist/*.tar.gz \
             -R "${{ github.repository }}" \
-            --title "${{ github.ref_name }}" \
+            --title "$tag" \
             --notes-file "$notes_file" \
             "${args[@]}"

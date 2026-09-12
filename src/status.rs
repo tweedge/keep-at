@@ -80,7 +80,7 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
         // Say so explicitly — silently showing a stale snapshot reads as
         // live data and has confused operators before.
         println!(
-            "  (live stats unavailable — daemon may need a restart after upgrading; showing the last persisted snapshot)"
+            "  (live stats unavailable)"
         );
     }
     print_snapshot(&netstats::load_runtime(
@@ -143,7 +143,7 @@ fn print_state(v: &live::RuntimeView) {
     if v.checks_in_progress > 0 {
         let plural = if v.checks_in_progress == 1 { "" } else { "s" };
         println!(
-            "  state: {} — {} integrity check{} running (downloads shown below are unverified torrents, not active transfers)",
+            "  state: {} — {} integrity check{} running",
             base, v.checks_in_progress, plural
         );
     } else {

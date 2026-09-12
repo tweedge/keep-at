@@ -140,46 +140,113 @@ pub enum Response {
 
 /// Query the running daemon. Ok(None) = no live daemon (socket absent,
 /// refused, wedged, or garbage) — caller falls back to files.
+///
+/// Absent/refused connections are the normal not-running case and stay
+/// silent; anything else (connected but the write/read/parse failed) is
+/// logged at warn, because a running daemon that doesn't answer is exactly
+/// what used to hide as silent fallbacks.
 pub fn query(data_dir: &Path, req: &Request) -> Option<Response> {
     let path = socket_path(data_dir);
-    let mut stream = std::os::unix::net::UnixStream::connect(&path).ok()?;
-    stream
+    let mut stream = match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(s) => s,
+        // The daemon genuinely isn't there: normal, never logged.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+        {
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("live query: connect to {} failed: {e}", path.display());
+            return None;
+        }
+    };
+    if stream
         .set_read_timeout(Some(QUERY_TIMEOUT))
         .and_then(|_| stream.set_write_timeout(Some(QUERY_TIMEOUT)))
-        .ok()?;
-    let mut line = serde_json::to_string(req).ok()?;
-    line.push('\n');
-    use std::io::Write;
-    stream.write_all(line.as_bytes()).ok()?;
-    stream.flush().ok()?;
-    let mut reader = std::io::BufReader::new(&stream);
-    use std::io::BufRead;
-    let mut resp = String::new();
-    reader.read_line(&mut resp).ok()?;
-    if resp.trim().is_empty() {
+        .is_err()
+    {
+        tracing::warn!("live query: could not set timeouts on {}", path.display());
         return None;
     }
-    serde_json::from_str(&resp).ok()
+    let mut line = serde_json::to_string(req).ok()?;
+    line.push('\n');
+    use std::io::{BufRead, Write};
+    if let Err(e) = stream.write_all(line.as_bytes()).and_then(|_| stream.flush()) {
+        tracing::warn!(
+            "live query: {} accepted the connection but the write failed: {e}",
+            path.display()
+        );
+        return None;
+    }
+    let mut reader = std::io::BufReader::new(&stream);
+    let mut resp = String::new();
+    if let Err(e) = reader.read_line(&mut resp) {
+        tracing::warn!("live query: {} read failed: {e}", path.display());
+        return None;
+    }
+    if resp.trim().is_empty() {
+        // EOF or blank line: the daemon closed the connection without
+        // answering — the signature of a server-side query bug.
+        tracing::warn!(
+            "live query: {} closed the connection without answering",
+            path.display()
+        );
+        return None;
+    }
+    match serde_json::from_str(&resp) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(
+                "live query: {} returned unparseable data: {e} (line: {:.200})",
+                path.display(),
+                resp.trim()
+            );
+            None
+        }
+    }
 }
+
+/// How long `serve` keeps retrying the bind before giving up (transient
+/// races with a dying previous generation; the serve task also runs on the
+/// shared runtime and can be starved until well after boot).
+const BIND_RETRY_WINDOW: Duration = Duration::from_secs(30);
+/// Sleep between bind attempts. One connect+bind syscall pair per attempt.
+const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Serve forever on `data_dir/keep-at.sock`, answering from `handle`.
 /// Runs until the process exits (spawned task, never joined). A stale
 /// socket file from a dead daemon is unlinked first (liveness is checked
-/// by attempting a connect: refusal = stale).
+/// by attempting a connect: refusal = stale). Bind failures are retried
+/// for [`BIND_RETRY_WINDOW`]: a single failure used to permanently disable
+/// live queries for the whole daemon lifetime (observed once — the bind
+/// lost a race around a previous generation's socket).
 pub async fn serve(data_dir: PathBuf, handle: LiveHandle) {
     let path = socket_path(&data_dir);
     // Stale socket: connect fails => previous owner dead => unlink.
     if path.exists() && std::os::unix::net::UnixStream::connect(&path).is_err() {
         let _ = std::fs::remove_file(&path);
     }
-    let listener = match tokio::net::UnixListener::bind(&path) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(
-                "live query socket unavailable ({}): {e:#}; status/hosted-torrents fall back to files",
-                path.display()
-            );
-            return;
+    let deadline = Instant::now() + BIND_RETRY_WINDOW;
+    let listener = loop {
+        match tokio::net::UnixListener::bind(&path) {
+            Ok(l) => break l,
+            Err(e) if Instant::now() < deadline => {
+                // Present-but-unowned socket (previous owner died since the
+                // probe above, or lost the unlink race): unlink and retry.
+                if std::os::unix::net::UnixStream::connect(&path).is_err() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                tracing::debug!("live query socket bind retry ({}): {e:#}", path.display());
+                tokio::time::sleep(BIND_RETRY_INTERVAL).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "live query socket unavailable ({}): {e:#}; status/hosted-torrents fall back to files",
+                    path.display()
+                );
+                return;
+            }
         }
     };
     // Any local user queries (status/hosted-torrents run as anyone).
@@ -204,13 +271,23 @@ pub async fn serve(data_dir: PathBuf, handle: LiveHandle) {
 }
 
 async fn serve_one(stream: tokio::net::UnixStream, handle: &LiveHandle) -> Result<()> {
-    let stream = stream.into_std().context("into std stream")?;
-    stream.set_read_timeout(Some(QUERY_TIMEOUT))?;
-    stream.set_write_timeout(Some(QUERY_TIMEOUT))?;
-    let mut reader = std::io::BufReader::new(&stream);
-    use std::io::{BufRead, Write};
+    // Async I/O with a real timeout. Do NOT convert to a std socket and
+    // block: into_std() hands back an fd still in O_NONBLOCK mode, so a
+    // std read issued before the client's request bytes arrive returns
+    // EAGAIN (not "wait") and the connection is dropped instantly — every
+    // query that lost the write-vs-read race failed at ~0s with EPIPE/EOF
+    // on the client side (observed ~50% of status calls on a
+    // CPU-constrained host). Blocking I/O would also hold a runtime worker
+    // for up to the full timeout on a slow client, stalling the daemon.
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut stream = stream;
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    reader.read_line(&mut line).context("reading request")?;
+    tokio::time::timeout(QUERY_TIMEOUT, reader.read_line(&mut line))
+        .await
+        .context("reading request (client timed out)")?
+        .context("reading request")?;
     let req: Request = serde_json::from_str(line.trim()).context("parsing request")?;
     let resp: Response = match req {
         Request::Runtime => Response::Runtime(handle.runtime_view()),
@@ -218,10 +295,10 @@ async fn serve_one(stream: tokio::net::UnixStream, handle: &LiveHandle) -> Resul
     };
     let mut out = serde_json::to_string(&resp).context("marshalling response")?;
     out.push('\n');
-    (&stream)
-        .write_all(out.as_bytes())
-        .context("writing response")?;
-    (&stream).flush().context("flushing response")?;
+    tokio::time::timeout(QUERY_TIMEOUT, writer.write_all(out.as_bytes()))
+        .await
+        .context("writing response (client timed out)")??;
+    writer.flush().await.context("flushing response")?;
     Ok(())
 }
 
