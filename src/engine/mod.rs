@@ -1,6 +1,7 @@
 //! Engine: scan loop, rqbit session management, storage accounting,
 //! stall eviction, and plain on-disk storage.
 
+pub mod pool_storage;
 pub mod ram;
 pub mod scan;
 pub mod session;
