@@ -2,13 +2,19 @@
 //! Linux-only (statvfs via libc): the migration targets Linux exclusively.
 
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::config::{Config, StorageLimit, ALL_LIMIT_FRACTION};
 
-/// Sum of regular file sizes under dir (recursively). Symlinks not followed.
+/// Sum of on-disk (allocated) bytes under dir, recursively. Symlinks not
+/// followed. Allocated means the blocks the filesystem actually assigned
+/// (`st_blocks` × 512) — for plain sparse files that is what the host's
+/// quota charges, and it lags nominal size while pieces are still missing.
+/// Use state nominal sums when eventual-footprint accounting is wanted
+/// (committed storage); see `state::State::bytes_used`.
 pub fn dir_size_bytes(dir: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
@@ -23,7 +29,13 @@ pub fn dir_size_bytes(dir: &Path) -> u64 {
                 Ok(ft) if ft.is_dir() => stack.push(p),
                 Ok(ft) if ft.is_file() => {
                     if let Ok(m) = e.metadata() {
-                        total = total.saturating_add(m.len());
+                        // Apparent size (m.len()) counts sparse holes the
+                        // device never allocated — on a partially-downloaded
+                        // torrent that reported ~1.4 TiB of holes as "used"
+                        // (4.18 TB apparent vs 2.78 TB allocated vs the
+                        // host's quota view). blocks()*512 is what du -s and
+                        // every quota meter report.
+                        total = total.saturating_add(m.blocks().saturating_mul(512));
                     }
                 }
                 _ => {}
@@ -109,4 +121,58 @@ pub fn resolve_all_limits(cfg: &Config) -> Result<Config> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::{Seek as _, Write as _};
+
+    /// dir_size_bytes must report ALLOCATED bytes, not apparent size: keep-at
+    /// writes sparse (rqbit truncates files to full length and fills pieces
+    /// as they download), and a partially-downloaded torrent's apparent size
+    /// is its full nominal footprint. Reporting apparent size made `used`
+    /// equal `committed` (both nominal), hiding quota consumption — observed
+    /// on mercury: 4.18 TB apparent vs 2.78 TB allocated vs the host's quota
+    /// view (3.90 TB − 1.12 TB free = 2.78 TB).
+    #[test]
+    fn dir_size_is_allocated_not_apparent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("storage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sparse.bin");
+
+        // One sparse file: length 1_000_000 bytes with only the final byte
+        // written (everything before it is an unallocated hole).
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&file)
+            .unwrap();
+        f.set_len(1_000_000).unwrap();
+        f.seek(std::io::SeekFrom::End(-1)).unwrap();
+        f.write_all(&[0xAA]).unwrap();
+        drop(f);
+
+        let apparent = std::fs::metadata(&file).unwrap().len();
+        assert_eq!(apparent, 1_000_000, "apparent size covers the hole");
+        let on_disk = dir_size_bytes(&dir);
+        assert!(
+            on_disk < apparent / 100,
+            "allocated ({on_disk}) must exclude the sparse hole (apparent {apparent})"
+        );
+        assert!(on_disk > 0, "the written byte's block must count");
+
+        // A fully-written file: allocated >= nominal (block rounding up).
+        let full = dir.join("full.bin");
+        std::fs::write(&full, vec![0xBB; 100_000]).unwrap();
+        let on_disk = dir_size_bytes(&dir);
+        assert!(
+            on_disk >= 100_000,
+            "a fully-written file's allocation must cover its nominal size ({on_disk})"
+        );
+    }
 }

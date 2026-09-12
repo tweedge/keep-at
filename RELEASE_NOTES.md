@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.20-beta - disk used now reports allocated bytes, not apparent size
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### `used` no longer counts sparse holes, so it matches what the host charges
+
+keep-at writes sparse files (rqbit truncates a torrent's files to full length and fills pieces in as they download), and the disk walk summed *apparent* file sizes - so a partially-downloaded library reported its full eventual footprint as "used", making `used` identical to `committed` and hiding real quota consumption. Observed on a 3.8 TiB node: status claimed 3.8 TiB used while the host's quota meter showed 2.78 TB. `dir_size_bytes` now sums allocated blocks (`st_blocks` × 512, what `du` and every quota meter report), so the disk line finally shows both truths: `2.53 TiB used (66%)` of what is physically on disk next to `3.8 TiB committed (100%)` of reservation, with the gap being data still to materialize. The seeding heuristic in `hosted-torrents` and the download-completion checks are unaffected (a fully-downloaded torrent's allocation covers its nominal size). Pinned by a sparse-file regression test.
+
 ## v0.8.19-beta - committed storage tracking in status
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
