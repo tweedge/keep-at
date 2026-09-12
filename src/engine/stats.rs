@@ -24,6 +24,7 @@ pub fn collect(
     seeding: usize,
     disk_used: u64,
     disk_limit: u64,
+    disk_committed: u64,
 ) -> RuntimeStats {
     let snap = api.api_session_stats();
     let rss = process_rss_bytes();
@@ -35,6 +36,7 @@ pub fn collect(
         downloading_torrents: held.saturating_sub(seeding),
         disk_used_bytes: disk_used,
         disk_limit_bytes: disk_limit,
+        disk_committed_bytes: disk_committed,
         useful_bytes_uploaded: snap.counters.uploaded_bytes,
         useful_bytes_downloaded: snap.counters.fetched_bytes,
         total_bytes_uploaded: snap.counters.uploaded_bytes,

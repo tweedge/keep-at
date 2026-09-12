@@ -90,6 +90,13 @@ pub struct RuntimeView {
     pub downloading_torrents: usize,
     pub disk_used_bytes: u64,
     pub disk_limit_bytes: u64,
+    /// Storage reserved by held torrents (sum of their nominal sizes) out of
+    /// the configured limit — what the node has committed to host, whether
+    /// or not the files exist yet. `used` lags this while torrents are still
+    /// being integrity-checked or downloaded; the gap is exactly the data
+    /// still to materialize on disk.
+    #[serde(default)]
+    pub disk_committed_bytes: u64,
     pub total_bytes_uploaded: u64,
     pub total_bytes_downloaded: u64,
     /// Bytes per second over the past hour (rolling, live-only).
@@ -524,6 +531,7 @@ impl LiveHandle {
         enum Phase {
             Booting {
                 held_len: usize,
+                committed: u64,
                 storage: Vec<(PathBuf, u64)>,
             },
             Live {
@@ -532,6 +540,7 @@ impl LiveHandle {
                 tracker: Arc<std::sync::Mutex<crate::bandwidth::RateTracker>>,
                 storage: Vec<(PathBuf, u64)>,
                 held_len: usize,
+                committed: u64,
             },
         }
         let (phase, started_at) = {
@@ -543,15 +552,20 @@ impl LiveHandle {
             let phase = match &*inner {
                 HandleInner::Booting { held, storage, .. } => Phase::Booting {
                     held_len: held.len(),
+                    committed: held.iter().map(|t| t.size_bytes).sum::<u64>(),
                     storage: storage.clone(),
                 },
-                HandleInner::Live(live) => Phase::Live {
-                    held_len: live.held.lock().unwrap().len(),
-                    session: live.session.clone(),
-                    api: live.api.clone(),
-                    tracker: live.tracker.clone(),
-                    storage: live.storage.clone(),
-                },
+                HandleInner::Live(live) => {
+                    let held = live.held.lock().unwrap();
+                    Phase::Live {
+                        held_len: held.len(),
+                        committed: held.iter().map(|t| t.size_bytes).sum::<u64>(),
+                        session: live.session.clone(),
+                        api: live.api.clone(),
+                        tracker: live.tracker.clone(),
+                        storage: live.storage.clone(),
+                    }
+                }
             };
             (phase, started)
         };
@@ -617,6 +631,10 @@ impl LiveHandle {
             Phase::Booting { held_len, .. } => *held_len,
             Phase::Live { held_len, .. } => *held_len,
         };
+        let committed = match &phase {
+            Phase::Booting { committed, .. } => *committed,
+            Phase::Live { committed, .. } => *committed,
+        };
         RuntimeView {
             booting,
             activity,
@@ -627,6 +645,7 @@ impl LiveHandle {
             downloading_torrents: downloading,
             disk_used_bytes: used,
             disk_limit_bytes: limit,
+            disk_committed_bytes: committed,
             total_bytes_uploaded: up_total,
             total_bytes_downloaded: down_total,
             upload_bps_hour: up_hour,
@@ -715,6 +734,57 @@ pub struct StateEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The booting runtime view reports committed storage straight from the
+    /// held list (state.json truth): the sum of held torrents' nominal
+    /// sizes, available instantly while the on-disk walk is still stale or
+    /// slow. refresh() must keep it current.
+    #[test]
+    fn booting_view_reports_committed_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = vec![(tmp.path().join("storage"), 1_000_000)];
+        let mk = |title: &str, size: u64| HeldTorrentView {
+            title: title.to_string(),
+            info_hash: format!("hash-{title}"),
+            size_bytes: size,
+            progress_bytes: 0,
+            finished: false,
+            verifying: true,
+            last_known_seeders: 0,
+        };
+        let h = LiveHandle::booting(
+            Instant::now(),
+            storage.clone(),
+            vec![mk("a", 100), mk("b", 200), mk("c", 300)],
+        );
+        let v = h.runtime_view();
+        assert!(v.booting);
+        assert_eq!(v.disk_committed_bytes, 600, "sum of held sizes");
+        assert_eq!(v.disk_used_bytes, 0, "nothing on disk yet");
+
+        // A mid-boot mutation (torrent added/removed) updates the view.
+        h.refresh(vec![
+            crate::live::StateEntry {
+                title: "a".to_string(),
+                info_hash: "hash-a".to_string(),
+                size_bytes: 100,
+                last_known_seeders: 0,
+            },
+            crate::live::StateEntry {
+                title: "d".to_string(),
+                info_hash: "hash-d".to_string(),
+                size_bytes: 50_000,
+                last_known_seeders: 0,
+            },
+        ]);
+        let v = h.runtime_view();
+        assert_eq!(v.held_torrents, 2);
+        assert_eq!(v.disk_committed_bytes, 50_100, "committed follows refresh");
+
+        // Empty held list: committed is 0 (line omitted downstream).
+        let empty = LiveHandle::booting(Instant::now(), storage, Vec::new());
+        assert_eq!(empty.runtime_view().disk_committed_bytes, 0);
+    }
 
     /// The disk cache must serve the seeded snapshot value on the first
     /// query (no walk — the walk is what pushed runtime_view over the 5s

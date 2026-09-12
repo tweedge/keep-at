@@ -71,6 +71,8 @@ pub struct RuntimeStats {
     #[serde(default)]
     pub disk_limit_bytes: u64,
     #[serde(default)]
+    pub disk_committed_bytes: u64,
+    #[serde(default)]
     pub useful_bytes_uploaded: u64,
     #[serde(default)]
     pub useful_bytes_downloaded: u64,

@@ -1860,6 +1860,10 @@ impl Engine {
             .map(|l| (l.path.clone(), l.limit_bytes()))
             .collect();
         let (used, limit) = engstats::disk_usage(&locs);
+        // Committed = sum of held torrents' nominal sizes: what the node has
+        // reserved out of the configured limit. Unlike the on-disk walk this
+        // is instant and counts data still being checked/downloaded.
+        let committed: u64 = held.iter().map(|t| t.size_bytes).sum();
         let s = engstats::collect(
             &self.api,
             self.started_at,
@@ -1867,13 +1871,15 @@ impl Engine {
             seeding.min(held.len()),
             used,
             limit,
+            committed,
         );
         tracing::info!(
-            "runtime stats (kind={kind} held={} seeding={} disk={}/{} up={} down={} peers={} rss={} uptime={}s)",
+            "runtime stats (kind={kind} held={} seeding={} disk={}/{} committed={} up={} down={} peers={} rss={} uptime={}s)",
             s.held_torrents,
             s.seeding_torrents,
             crate::humanize::human_bytes(s.disk_used_bytes as i64),
             crate::humanize::human_bytes(s.disk_limit_bytes as i64),
+            crate::humanize::human_bytes(s.disk_committed_bytes as i64),
             crate::humanize::human_bytes(s.useful_bytes_uploaded as i64),
             crate::humanize::human_bytes(s.useful_bytes_downloaded as i64),
             s.active_peers,

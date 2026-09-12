@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.19-beta - committed storage tracking in status
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### `status` shows storage committed vs storage used
+
+The disk line previously showed only actual on-disk usage, which undercounts what the node has reserved: while torrents are being integrity-checked or downloaded their files don't fully exist yet, so a freshly-committed library reported near-0 used with no way to see that the storage was already spoken for. `status` now shows both figures - `disk: 45.0 GiB used of 100.0 GiB configured (45.0%), 50.0 GiB committed (50.0%)` - where committed is the sum of held torrents' nominal sizes, the reservation basis the scanner's free-space decisions budget against (plus a small fixed 256 KiB buffer per torrent). During a boot, committed is exact immediately (from state.json) while used catches up as checks and downloads materialize data on disk; the same numbers flow into the `runtime stats` log line (`committed=...`) and the persisted snapshot, so the offline fallback shows them too.
+
 ## v0.8.18-beta - booting state in status, listener panic fix, disk-usage cache
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.

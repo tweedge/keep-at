@@ -119,6 +119,7 @@ fn print_live(v: &live::RuntimeView) {
         v.downloading_torrents,
         v.disk_used_bytes,
         v.disk_limit_bytes,
+        v.disk_committed_bytes,
         v.total_bytes_uploaded,
         v.total_bytes_downloaded,
         v.active_peers,
@@ -180,6 +181,7 @@ fn print_snapshot(rs: &netstats::RuntimeStats) {
         rs.downloading_torrents,
         rs.disk_used_bytes,
         rs.disk_limit_bytes,
+        rs.disk_committed_bytes,
         rs.total_bytes_uploaded,
         rs.total_bytes_downloaded,
         rs.active_peers,
@@ -189,6 +191,12 @@ fn print_snapshot(rs: &netstats::RuntimeStats) {
     // memory); the snapshot shows since-boot totals.
 }
 
+/// The torrents/disk/bandwidth/peers block, shared by the live and
+/// snapshot paths. Committed = storage reserved by held torrents (their
+/// nominal sizes); used = actual on-disk bytes. The two diverge while
+/// torrents are still being integrity-checked or downloaded — that gap is
+/// data the node has reserved but not yet materialized, which is exactly
+/// what "0 B used" during a boot looks like.
 #[allow(clippy::too_many_arguments)]
 fn print_numbers(
     held: usize,
@@ -196,6 +204,7 @@ fn print_numbers(
     downloading: usize,
     disk_used: u64,
     disk_limit: u64,
+    disk_committed: u64,
     sent_total: u64,
     recv_total: u64,
     peers: usize,
@@ -208,12 +217,21 @@ fn print_numbers(
         } else {
             0.0
         };
-        println!(
+        let mut line = format!(
             "  disk: {} used of {} configured ({:.1}%)",
             humanize::human_bytes(disk_used as i64),
             humanize::human_bytes(disk_limit as i64),
             pct
         );
+        if disk_committed > 0 {
+            let cpct = (disk_committed as f64 / disk_limit as f64 * 100.0).min(100.0);
+            line.push_str(&format!(
+                ", {} committed ({:.1}%)",
+                humanize::human_bytes(disk_committed as i64),
+                cpct
+            ));
+        }
+        println!("{line}");
     }
     println!(
         "  bandwidth since boot: sent {}, received {}",
