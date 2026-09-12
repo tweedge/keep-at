@@ -1,8 +1,12 @@
 # keep-at release notes
 
-## v0.8.21-beta - bounded file-handle pool (EMFILE wedge fix)
+## v0.8.21-beta - bounded file-handle pool (EMFILE wedge fix), reorganized disk line
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### Disk line reads used → committed → configured
+
+`status` now orders the disk line figure-by-figure, each with its own percent of the configured total: `disk: 2.5 TiB used (66.6%), 3.8 TiB committed (100.0%), 3.8 TiB configured`. Previously configured sat in the middle of the used clause, which read as a single comparison; the committed segment still appears only when nonzero (older snapshots without committed tracking omit it).
 
 ### File handles are pooled, not one-per-library-file
 

@@ -163,7 +163,7 @@ keep-at is running (pid 12345)
 runtime stats (live, uptime 2h0m0s):
   state: seeding normally
   torrents: 12 held, 10 seeding, 2 downloading
-  disk: 45.0 GiB used of 100.0 GiB configured (45.0%), 50.0 GiB committed (50.0%)
+  disk: 45.0 GiB used (45.0%), 50.0 GiB committed (50.0%), 100.0 GiB configured
   bandwidth since boot: sent 5.2 GiB, received 1.4 GiB
   upload rate: 500.0 KiB/s past hour, 730.0 KiB/s past day
   download rate: 100.0 KiB/s past hour, 150.0 KiB/s past day

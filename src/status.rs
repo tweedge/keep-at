@@ -218,9 +218,8 @@ fn print_numbers(
             0.0
         };
         let mut line = format!(
-            "  disk: {} used of {} configured ({:.1}%)",
+            "  disk: {} used ({:.1}%)",
             humanize::human_bytes(disk_used as i64),
-            humanize::human_bytes(disk_limit as i64),
             pct
         );
         if disk_committed > 0 {
@@ -231,6 +230,10 @@ fn print_numbers(
                 cpct
             ));
         }
+        line.push_str(&format!(
+            ", {} configured",
+            humanize::human_bytes(disk_limit as i64)
+        ));
         println!("{line}");
     }
     println!(
