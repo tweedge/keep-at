@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use common::{torrent_bytes, torrent_info_hash, Fixture};
+use librqbit::storage::StorageFactoryExt;
 
 fn run_tracker(
     seeder_addr: Arc<Mutex<Option<SocketAddr>>>,
@@ -129,6 +130,12 @@ fn session_options(port: u16) -> librqbit::SessionOptions {
         }),
         dht: None,
         disable_local_service_discovery: true,
+        // Exercise the pooled storage path end to end: real init (sparse
+        // files, no held fds), integrity-check preads and peer pwrites all
+        // route through the bounded pool.
+        default_storage_factory: Some(
+            keep_at::engine::pool_storage::PooledStorageFactory::default().boxed(),
+        ),
         ..Default::default()
     }
 }
@@ -172,6 +179,12 @@ async fn two_session_byte_transfer() {
 
     // Seeder session: add with overwrite=true so it hashes existing files
     // in place (overwrite=false means "create, fail if present" here).
+    // Both sides register their output folders with the pooled-storage
+    // factory (upstream hides output_folder from factories; keep-at's
+    // engine registers before every add).
+    let md = keep_at::attorrent::parse_torrent_bytes(&raw).expect("fixture parses");
+    let seeder_ih = md.info_hash;
+    keep_at::engine::pool_storage::register_torrent(seeder_ih, seed_dir.clone(), true);
     let seeder = librqbit::Session::new_with_opts(base.join("ses-seed"), session_options(0))
         .await
         .expect("seeder session");
@@ -210,6 +223,9 @@ async fn two_session_byte_transfer() {
     );
 
     // Leecher session: empty dir, same torrent, tracker points at seeder.
+    // Same info-hash as the seeder's: registration maps hash → folder, so
+    // it must be re-pointed at the leech dir before this add.
+    keep_at::engine::pool_storage::register_torrent(seeder_ih, leech_dir.clone(), true);
     let leecher = librqbit::Session::new_with_opts(base.join("ses-leech"), session_options(0))
         .await
         .expect("leecher session");

@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.21-beta - bounded file-handle pool (EMFILE wedge fix)
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### File handles are pooled, not one-per-library-file
+
+Stock rqbit opens every file of every torrent in read/write mode at add time and keeps every fd open until removal - one fd per library file, forever. On file-heavy libraries that exhausts the process fd limit and wedges the whole daemon: `too many open files (os error 24)` on everything, dead TCP listener, dead status. A single 29k-file dataset held 44% of a 65,536-fd ceiling on its own. keep-at now installs a bounded LRU file-handle pool through rqbit's public storage-factory hook (the same design libtorrent's `file_pool_size` and Transmission's `tr_open_files` have used for decades): `init` only creates 0-byte files, and every read/write gets its handle from a process-wide pool capped at `min(4096, hard_limit - 2048)` open fds. Position-based IO shares one fd across threads with no per-file locking, in-flight IO survives eviction, and pause/resume is free. A transient fd spike sheds a quarter of the cache and retries; persistent exhaustion surfaces as an orderly per-torrent error instead of a daemon-wide freeze. Pool sizing happens after the rlimit raise and is overridable with `KEEPAT_FD_POOL_CAP` for tuning.
+
 ## v0.8.20-beta - disk used now reports allocated bytes, not apparent size
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.

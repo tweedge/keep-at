@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use librqbit::limits::LimitsConfig;
+use librqbit::storage::StorageFactoryExt;
 use librqbit::{ConnectionOptions, ListenerOptions, Session, SessionOptions};
 
 use crate::buildinfo;
@@ -77,6 +78,13 @@ pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Ses
         client_name_and_version: Some(buildinfo::seeder_user_agent()),
         peer_id: Some(peer_id_from_prefix()),
         ipv4_only,
+        // Bounded file-handle pool instead of stock rqbit's open-everything
+        // storage: a 29k-file dataset was 44% of a 65,536 fd ceiling, and
+        // EMFILE wedged the daemon (dead listener + dead status). See
+        // engine::pool_storage for the design.
+        default_storage_factory: Some(
+            crate::engine::pool_storage::PooledStorageFactory::default().boxed(),
+        ),
         ..Default::default()
     };
     let mut last_err = anyhow::anyhow!("session creation never attempted");

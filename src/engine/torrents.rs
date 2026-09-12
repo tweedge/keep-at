@@ -44,13 +44,21 @@ pub async fn add_torrent_bytes(
         force_tracker_interval: Some(std::time::Duration::from_secs(1800)),
         ..Default::default()
     };
-    let resp = session
+    // Publish the output folder for the pooled storage factory before the
+    // add (upstream hides output_folder from external factories; the
+    // factory resolves paths by info-hash — see engine::pool_storage).
+    let ih = parse_id20(info_hash_hex)?;
+    crate::engine::pool_storage::register_torrent(ih.0, output_dir.to_path_buf(), true);
+    let added = session
         .add_torrent(
             AddTorrent::TorrentFileBytes(raw.to_vec().into()),
             Some(opts),
         )
-        .await
-        .context("adding torrent to session")?;
+        .await;
+    if added.is_err() {
+        crate::engine::pool_storage::unregister_torrent(ih.0);
+    }
+    let resp = added.context("adding torrent to session")?;
     let handle = resp
         .into_handle()
         .context("torrent added list-only, expected managed")?;
@@ -73,7 +81,16 @@ pub async fn remove_torrent(
     output_dir: &Path,
 ) -> Result<()> {
     let id = parse_id20(info_hash_hex)?;
-    let _ = session.delete(TorrentIdOrHash::Hash(id), true).await;
+    // Log (not swallow) delete errors: rqbit's delete removes the torrent
+    // from its db even when file deletion fails, so a silently-swallowed
+    // error would strand files on disk. Ordering matters here: unregister
+    // only AFTER session.delete completes — rqbit's delete fallback for
+    // errored torrents re-creates storage through the pooled factory, which
+    // still needs the registry entry for output_folder.
+    if let Err(e) = session.delete(TorrentIdOrHash::Hash(id), true).await {
+        tracing::warn!("delete({info_hash_hex}) reported an error: {e:#}");
+    }
+    crate::engine::pool_storage::unregister_torrent(id.0);
     // Belt and suspenders: delete(true) removes torrent files; also drop the
     // (now possibly empty) per-torrent dir.
     if output_dir.exists() {
