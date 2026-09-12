@@ -40,8 +40,9 @@ pub enum Command {
     HostedTorrents(CommonArgs),
     /// Update to the latest release
     SelfUpdate(SelfUpdateArgs),
-    /// Print kill-forensics evidence (called by the host watchdog on death)
-    DeathEvidence(CommonArgs),
+    /// Triage a dead daemon: print surviving cgroup state + last heartbeat
+    /// (called by the host watchdog on death, or manually post-mortem)
+    TriageLastExit(CommonArgs),
     /// Print the version and exit
     Version,
 }

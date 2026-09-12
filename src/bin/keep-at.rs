@@ -85,9 +85,9 @@ async fn main() -> Result<()> {
             keep_at::census::cmd_network_status(&a).await
         }
         Command::HostedTorrents(a) => keep_at::hosted::cmd_hosted(&a),
-        Command::DeathEvidence(a) => {
+        Command::TriageLastExit(a) => {
             let dir = cli::resolve_data_dir(&a)?;
-            keep_at::forensics::print_death_evidence(&dir);
+            keep_at::forensics::print_triage_last_exit(&dir);
             Ok(())
         }
         Command::SelfUpdate(a) => cmd_self_update(a.beta).await,
@@ -218,10 +218,14 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
     keep_at::forensics::heartbeat_task(cfg.data_dir.clone(), std::time::Instant::now());
     // Debug knob: KEEPAT_DEBUG_PANIC=1 schedules an intentional panic in a
     // background thread 20s after boot. Used to measure death handling
-    // (panic hook -> log file, daemon must survive).
+    // (panic hook -> log file, daemon must survive). Gated to the exact
+    // value "1" and self-announcing, so it can never fire by accident; see
+    // DEBUGGING.md.
     #[cfg(unix)]
-    if std::env::var_os("KEEPAT_DEBUG_PANIC").is_some() {
-        tracing::info!("KEEPAT_DEBUG_PANIC: intentional panic scheduled in 20s");
+    if std::env::var("KEEPAT_DEBUG_PANIC").as_deref() == Ok("1") {
+        tracing::warn!(
+            "KEEPAT_DEBUG_PANIC=1: DEBUG KNOB ARMED - the daemon will panic intentionally in 20s"
+        );
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(20));
             panic!("KEEPAT_DEBUG_PANIC: intentional test panic");
@@ -384,7 +388,7 @@ fn restores_sigpipe_default(cmd: &Command) -> bool {
             | Command::HostedTorrents(_)
             | Command::NetworkStatus(_)
             | Command::Version
-            | Command::DeathEvidence(_)
+            | Command::TriageLastExit(_)
             | Command::Stop(_)
     )
 }

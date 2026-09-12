@@ -264,10 +264,10 @@ pub fn heartbeat_task(data_dir: PathBuf, started_at: Instant) {
 /// subcommand when it finds the daemon dead. Reads the cgroup memory state
 /// (which survives the process) and the last heartbeat, and appends a
 /// compact evidence block to stdout (the watchdog redirects it to its log).
-pub fn print_death_evidence(data_dir: &Path) {
+pub fn print_triage_last_exit(data_dir: &Path) {
     let mut out = String::new();
     out.push_str(&format!(
-        "death-evidence at={}\n",
+        "triage-last-exit at={}\n",
         chrono::Utc::now().to_rfc3339()
     ));
     #[cfg(target_os = "linux")]
