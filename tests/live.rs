@@ -49,11 +49,8 @@ fn offline_query_is_none() {
 #[test]
 fn delayed_request_is_served_not_dropped() {
     let dir = tempfile::tempdir().unwrap().keep();
-    let handle = keep_at::live::LiveHandle::booting(
-        std::time::Instant::now(),
-        Vec::new(),
-        Vec::new(),
-    );
+    let handle =
+        keep_at::live::LiveHandle::booting(std::time::Instant::now(), Vec::new(), Vec::new());
     let dir2 = dir.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -65,14 +62,18 @@ fn delayed_request_is_served_not_dropped() {
     let sock = keep_at::live::socket_path(&dir);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !sock.exists() {
-        assert!(std::time::Instant::now() < deadline, "socket never appeared");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
     // Simulate the losing side of the write-vs-read race: connect, pause
     // long enough for the server's first read to run, then write.
     let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
-    s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(300));
     s.write_all(b"{\"op\":\"runtime\"}\n").unwrap();
     s.flush().unwrap();

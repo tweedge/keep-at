@@ -79,9 +79,7 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
         // (upgraded keep-at, not yet restarted) or an unreadable socket.
         // Say so explicitly — silently showing a stale snapshot reads as
         // live data and has confused operators before.
-        println!(
-            "  (live stats unavailable)"
-        );
+        println!("  (live stats unavailable)");
     }
     print_snapshot(&netstats::load_runtime(
         &view_dir.join("runtime-stats.json"),

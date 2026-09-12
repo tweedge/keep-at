@@ -172,7 +172,10 @@ pub fn query(data_dir: &Path, req: &Request) -> Option<Response> {
     let mut line = serde_json::to_string(req).ok()?;
     line.push('\n');
     use std::io::{BufRead, Write};
-    if let Err(e) = stream.write_all(line.as_bytes()).and_then(|_| stream.flush()) {
+    if let Err(e) = stream
+        .write_all(line.as_bytes())
+        .and_then(|_| stream.flush())
+    {
         tracing::warn!(
             "live query: {} accepted the connection but the write failed: {e}",
             path.display()
