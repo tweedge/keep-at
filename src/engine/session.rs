@@ -14,6 +14,32 @@ use librqbit::{ConnectionOptions, ListenerOptions, Session, SessionOptions};
 use crate::buildinfo;
 use crate::config::Config;
 
+/// Listener options shared by the seeder and probe sessions: TCP bind on
+/// `addr`, plus the upstream select!-panic workaround (raised pending-
+/// handshake cap — see the comment inside). Factored for the regression test.
+pub fn listener_options(addr: SocketAddr, ipv4_only: bool) -> ListenerOptions {
+    ListenerOptions {
+        listen_addr: addr,
+        ipv4_only,
+        // Upstream bug workaround (observed 2026-09-12, SIGABRT during a
+        // 4TB-library boot): rqbit's listener task select!s between
+        // accept (disabled when pending handshakes >= cap) and handshake
+        // completion matched as `Some(Ok(..))`. A failed handshake check
+        // (torrent still Initializing past the 5s live-wait, routine on
+        // big boots) fails that pattern; if the pending queue is also at
+        // cap at that instant, ALL branches are disabled and the select!
+        // panics — with panic=abort that kills the whole daemon, and the
+        // watchdog restart can re-enter the same window (crash loop).
+        // Still unfixed upstream as of librqbit 9.0.1 / rqbit master
+        // 2026-09. Raising the cap to usize::MAX keeps the accept branch
+        // permanently enabled, so the select! can never go all-disabled;
+        // the queue is bounded in practice by connection rate and each
+        // entry lives at most the 5s handshake-check timeout.
+        max_pending_incoming_handshake_checks: usize::MAX,
+        ..ListenerOptions::default()
+    }
+}
+
 /// Build the node's main rqbit session: TCP-only listener on cfg.port, DHT
 /// on, RAM-scaled per-torrent peer limit, global up/down rate limits,
 /// keep-at seeder identity for tracker User-Agent and extended handshake.
@@ -37,11 +63,10 @@ pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Ses
     // transient collision resolves on the next attempt.
     // (SessionOptions isn't Clone, so this is a small closure rebuild.)
     let build_opts = |ipv4_only: bool| SessionOptions {
-        listen: Some(ListenerOptions {
-            listen_addr: SocketAddr::from(([0, 0, 0, 0], cfg.port)),
+        listen: Some(listener_options(
+            SocketAddr::from(([0, 0, 0, 0], cfg.port)),
             ipv4_only,
-            ..ListenerOptions::default()
-        }),
+        )),
         connect: Some(ConnectionOptions {
             enable_tcp: true,
             ..ConnectionOptions::default()
@@ -94,13 +119,8 @@ pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Ses
 /// ephemeral listen port, DHT off (tracker-only discovery is enough to
 /// answer "who else is in this swarm"), and no rate limits of its own.
 pub async fn new_probe_session(data_dir: PathBuf) -> Result<Arc<Session>> {
-    let listen = ListenerOptions {
-        listen_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
-        ..ListenerOptions::default()
-    };
-
     let opts = SessionOptions {
-        listen: Some(listen),
+        listen: Some(listener_options(SocketAddr::from(([0, 0, 0, 0], 0)), false)),
         dht: None,
         peer_limit: Some(8),
         disable_local_service_discovery: true,
@@ -145,6 +165,24 @@ pub async fn stop_session(session: &Arc<Session>, timeout: Duration) {
 mod tests {
     use super::*;
     use crate::config::{Config, StorageLimit, StorageLocation};
+
+    /// Regression: the pending-handshake cap must be raised above any
+    /// reachable value so rqbit's listener select! (which disables its
+    /// accept branch at the cap and panics when a failed handshake then
+    /// leaves no enabled branch — observed as a SIGABRT daemon death on a
+    /// 4TB-library boot, 2026-09-12) can never go all-disabled. Upstream
+    /// still matches handshake results as `Some(Ok(..))` with no else.
+    #[test]
+    fn listener_pending_cap_never_disables_accept() {
+        let opts = listener_options(SocketAddr::from(([0, 0, 0, 0], 37550)), false);
+        assert_eq!(
+            opts.max_pending_incoming_handshake_checks,
+            usize::MAX,
+            "accept branch must stay enabled at any pending-queue length"
+        );
+        let probe = listener_options(SocketAddr::from(([0, 0, 0, 0], 0)), false);
+        assert_eq!(probe.max_pending_incoming_handshake_checks, usize::MAX);
+    }
 
     fn cfg_with_limits(up: u64, down: u64) -> Config {
         let mut cfg = Config {

@@ -1,5 +1,21 @@
 # keep-at release notes
 
+## v0.8.18-beta - booting state in status, listener panic fix, disk-usage cache
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### Daemon death (SIGABRT) during large-library boots is fixed
+
+Field validation on a 4TB host reproduced a core dump during boot: rqbit's listener task selects between accepting connections (disabled once pending handshake checks reach a cap) and handshake completion pattern-matched as `Some(Ok(..))` - and on a large-library boot, torrents sit in integrity checks past the 5s handshake live-wait, so incoming peers' checks fail en masse; the first failure while the queue is at cap disables every branch and tokio panics. With `panic = "abort"` that killed the whole daemon, and the watchdog restart could re-enter the same window (crash loop). keep-at now raises the pending-handshake cap to unbounded (`listener_options` in `src/engine/session.rs`), which keeps the accept branch permanently enabled so the panic is unreachable; the trade-off and upstream status are documented in docs/DESIGN.md. Pinned by a unit test on the constructed listener options.
+
+### `status` says "booting" while the daemon starts up
+
+During startup the daemon already answered queries with a booting view, but the headline line still read "keep-at is running", which read as ready when the engine was minutes away from serving. `status` now prints `keep-at is booting (pid N)` for that state, the header shows how long it has been booting (`booting for 3m 12s`), and the state line explains what startup does: resuming the held library, verifying existing data, seeding beginning as checks complete.
+
+### Disk usage is cached for live queries, ending boot-window unavailability on huge libraries
+
+Every `status` call made the daemon recursively walk every storage location; on a 4TB library under boot-time hashing load that walk could exceed the 5s query timeout, so the booting window reported `(live stats unavailable)` and fell back to the snapshot even though the daemon was healthy. The disk sum is now cached for 60s and seeded at boot from the last persisted snapshot, so the first query after boot is instant and subsequent queries reuse it - freshness is unchanged from what the offline fallback would have shown anyway (60s stats cadence).
+
 ## v0.8.17-beta - flaky live status fixed, query failures logged
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.

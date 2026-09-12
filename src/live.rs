@@ -316,6 +316,49 @@ struct LiveState {
     held: std::sync::Mutex<Vec<StateEntry>>,
 }
 
+/// How long a computed disk-usage sum is reused by runtime queries. The
+/// recursive walk is O(files) per call; without a cache, every `status`
+/// poll walked every storage location (seconds on multi-TB libraries —
+/// over the 5s query timeout during boot on a 4TB host, which is what
+/// made the booting window report "live stats unavailable"). 60s matches
+/// the periodic stats cadence, so freshness is unchanged from the
+/// snapshot the offline fallback would have shown anyway.
+const DISK_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Cached (collected_at, used, limit) disk usage for runtime queries.
+#[derive(Default)]
+struct DiskCache {
+    inner: std::sync::Mutex<Option<(Instant, u64, u64)>>,
+}
+
+impl DiskCache {
+    /// Seed from the last persisted snapshot so the FIRST query after boot
+    /// is instant even on huge libraries (the walk then happens on the
+    /// first query after the TTL lapses, by which time boot load has
+    /// usually subsided).
+    fn from_snapshot(data_dir: &Path) -> DiskCache {
+        let seeded = crate::netstats::load_runtime(&data_dir.join("runtime-stats.json"))
+            .map(|s| (s.disk_used_bytes, s.disk_limit_bytes))
+            .unwrap_or((0, 0));
+        DiskCache {
+            inner: std::sync::Mutex::new(Some((Instant::now(), seeded.0, seeded.1))),
+        }
+    }
+
+    /// Cached sum when fresh; otherwise compute (the walk), cache, return.
+    fn get(&self, storage: &[(PathBuf, u64)]) -> (u64, u64) {
+        let mut slot = self.inner.lock().unwrap();
+        if let Some((at, used, limit)) = *slot {
+            if at.elapsed() < DISK_CACHE_TTL {
+                return (used, limit);
+            }
+        }
+        let (used, limit) = crate::engine::stats::disk_usage(storage);
+        *slot = Some((Instant::now(), used, limit));
+        (used, limit)
+    }
+}
+
 /// Read-only view into the running Engine, shared with the socket server
 /// task. Two-phase: Booting from `LiveHandle::booting` (socket bound before
 /// the Engine exists), promoted by `activate` once the session is up.
@@ -323,6 +366,7 @@ struct LiveState {
 pub struct LiveHandle {
     inner: Arc<parking_lot::RwLock<HandleInner>>,
     activity: Arc<std::sync::Mutex<Activity>>,
+    disk: Arc<DiskCache>,
 }
 
 enum HandleInner {
@@ -350,7 +394,22 @@ impl LiveHandle {
                 held,
             })),
             activity: Arc::new(std::sync::Mutex::new(Activity::Booting)),
+            disk: Arc::new(DiskCache::default()),
         }
+    }
+
+    /// Booting-phase handle with disk usage pre-seeded from the data dir's
+    /// last persisted snapshot (production path — first queries after boot
+    /// must not pay the multi-TB walk).
+    pub fn booting_with_snapshot(
+        started_at: Instant,
+        storage: Vec<(PathBuf, u64)>,
+        held: Vec<HeldTorrentView>,
+        data_dir: &Path,
+    ) -> LiveHandle {
+        let mut h = LiveHandle::booting(started_at, storage, held);
+        h.disk = Arc::new(DiskCache::from_snapshot(data_dir));
+        h
     }
 
     /// Live-phase handle directly (seam used by Engine fallbacks and tests):
@@ -548,10 +607,11 @@ impl LiveHandle {
         };
 
         let (up_total, down_total) = totals.unwrap_or((0, 0));
-        let (used, limit) = match &phase {
-            Phase::Live { storage, .. } => crate::engine::stats::disk_usage(storage),
-            Phase::Booting { storage, .. } => crate::engine::stats::disk_usage(storage),
+        let storage: Vec<(PathBuf, u64)> = match &phase {
+            Phase::Live { storage, .. } => storage.clone(),
+            Phase::Booting { storage, .. } => storage.clone(),
         };
+        let (used, limit) = self.disk.get(&storage);
         let booting = matches!(phase, Phase::Booting { .. });
         let held_len = match &phase {
             Phase::Booting { held_len, .. } => *held_len,
@@ -650,4 +710,48 @@ pub struct StateEntry {
     pub info_hash: String,
     pub size_bytes: u64,
     pub last_known_seeders: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The disk cache must serve the seeded snapshot value on the first
+    /// query (no walk — the walk is what pushed runtime_view over the 5s
+    /// query timeout on a 4TB library during boot), then recompute only
+    /// after the TTL lapses.
+    #[test]
+    fn disk_cache_seeds_from_snapshot_and_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // A snapshot with a distinctive used figure, in the dir the cache
+        // seeds from.
+        crate::config::atomic_write(
+            &dir.join("runtime-stats.json"),
+            &serde_json::to_vec(&crate::netstats::RuntimeStats {
+                disk_used_bytes: 555,
+                disk_limit_bytes: 999,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let cache = DiskCache::from_snapshot(&dir);
+        // Fresh: returns the seeded value WITHOUT walking (the walk target
+        // doesn't exist, so a walk would report used=0).
+        let storage = vec![(dir.join("nonexistent"), 999)];
+        assert_eq!(cache.get(&storage), (555, 999));
+
+        // Aged past the TTL: falls back to the walk (used=0 for a missing
+        // dir — disk_usage creates it, empty → 0 bytes).
+        *cache.inner.lock().unwrap() = Some((
+            Instant::now() - DISK_CACHE_TTL - Duration::from_secs(1),
+            555,
+            999,
+        ));
+        let (used, limit) = cache.get(&storage);
+        assert_eq!(limit, 999, "limit comes from the storage tuple");
+        assert_eq!(used, 0, "expired cache recomputes via the walk");
+    }
 }

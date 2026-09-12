@@ -182,7 +182,8 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    let live = keep_at::live::LiveHandle::booting(started_at, storage, held);
+    let live =
+        keep_at::live::LiveHandle::booting_with_snapshot(started_at, storage, held, &cfg.data_dir);
     {
         let h = live.clone();
         let dir = cfg.data_dir.clone();

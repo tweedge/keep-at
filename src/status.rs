@@ -48,7 +48,20 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
             }
         }
     }
-    if st.running {
+    // Booting is a state of its own, prior to running: the daemon process
+    // is up (pid file written) and answers the socket, but the engine is
+    // still resuming + integrity-checking the held library. Saying "is
+    // running" over that window made operators wait for a daemon that was
+    // minutes from serving.
+    let booting = matches!(&live, Some(live::Response::Runtime(v)) if v.booting);
+    if booting {
+        match st.pid.or(foreign_pid) {
+            Some(pid) => println!("keep-at is booting (pid {pid})"),
+            None => {
+                println!("keep-at is booting (pid file missing or stale; live socket answered)")
+            }
+        }
+    } else if st.running {
         match st.pid {
             Some(pid) => println!("keep-at is running (pid {pid})"),
             None => println!("keep-at is running in the foreground, not as a service"),
@@ -90,7 +103,7 @@ pub fn cmd_status(args: &CommonArgs) -> Result<()> {
 fn print_live(v: &live::RuntimeView) {
     if v.booting {
         println!(
-            "runtime stats (live, starting up, uptime {}):",
+            "runtime stats (live, booting for {} — full live counters once startup completes):",
             humanize::human_duration(std::time::Duration::from_secs(v.uptime_seconds))
         );
     } else {
@@ -132,7 +145,10 @@ fn print_live(v: &live::RuntimeView) {
 fn print_state(v: &live::RuntimeView) {
     use crate::live::Activity;
     let base = match v.activity {
-        Activity::Booting => format!("starting up: resuming {} held torrents", v.held_torrents),
+        Activity::Booting => format!(
+            "starting up: resuming {} held torrents (existing data being verified, seeding begins as checks complete)",
+            v.held_torrents
+        ),
         Activity::Scanning => {
             "scanning the Academic Torrents catalog (fetch, scrape, evaluate)".to_string()
         }
