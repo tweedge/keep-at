@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.23-beta - SIGPIPE no longer fatal (death-mark fix)
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### The kill forensics themselves could kill the daemon on a broken pipe
+
+Since v0.8.15 the death-mark system caught SIGPIPE along with the truly fatal signals — but its handler logs the mark and then re-raises under the default disposition, killing the process. That overrode the daemon's own `SIG_IGN` posture (Rust runtime default, re-pinned at startup), converting a routine broken-pipe write into a daemon death: observed live, a `status` client that disconnected mid-response (large booting held-list, client Ctrl-C/time-out/disconnect) made the daemon's socket write raise SIGPIPE and the daemon died right after boot. SIGPIPE is now excluded from the death-mark signal list: the daemon keeps `SIG_IGN`, broken-pipe writes return `EPIPE`, the socket server logs the failure at debug and keeps serving. Death marks remain for the genuinely fatal catchable signals (SIGSEGV/SIGABRT/SIGBUS/SIGXCPU/SIGHUP/SIGQUIT). Pinned by a regression test; the e2e signal-disposition behavior was verified by A/B harness (pre-fix dies on a direct SIGPIPE, fixed survives and keeps serving).
+
 ## v0.8.22-beta - status disk line on `limit: max` nodes
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.

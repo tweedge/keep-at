@@ -11,6 +11,14 @@
 //!    startup, static strings, no allocation in the handler). If the mark
 //!    appears, we know the killer; if the heartbeat just stops, the killer
 //!    used SIGKILL (or the kernel), which nothing can log.
+//!    SIGPIPE is deliberately NOT here: under the daemon's SIG_IGN
+//!    (Rust runtime default, re-pinned in cmd_run) a broken-pipe write is
+//!    a routine EPIPE condition, not a death — and because the death-mark
+//!    handler re-raises after logging, catching SIGPIPE converted exactly
+//!    that benign condition into a daemon death (observed 2026-09-13:
+//!    daemon killed at boot by a `status` client that disconnected
+//!    mid-response; write(2) on sockets raises SIGPIPE — tokio's write
+//!    path has no MSG_NOSIGNAL).
 //! 2. [`heartbeat_task`]: every 60s, one compact log line + an atomically
 //!    replaced `heartbeat.json` recording RSS, cgroup memory state (usage,
 //!    limit, oom_kill counter - readable post-mortem even after SIGKILL),
@@ -36,18 +44,18 @@ const STATM_PATH: &str = "/proc/self/statm";
 /// async-signal-safe; the fd number is installed once at startup).
 static DEATH_FD: AtomicI32 = AtomicI32::new(-1);
 
+/// Fatal catchable signals worth a death mark. SIGPIPE (13) is deliberately
+/// absent — see the module docs: under SIG_IGN a broken-pipe write is a
+/// routine EPIPE, and catching it (then re-raising) made the daemon die on
+/// status clients that disconnect mid-response.
 #[cfg(target_os = "linux")]
-const SIG_NAMES: [(i32, &[u8]); 7] = [
+const SIG_NAMES: [(i32, &[u8]); 6] = [
     (11, b"death-mark: SIGSEGV (11) received\n"),
     (6, b"death-mark: SIGABRT (6) received\n"),
     (7, b"death-mark: SIGBUS (7) received\n"),
     (24, b"death-mark: SIGXCPU (24) received - cpu limit hit\n"),
     (1, b"death-mark: SIGHUP (1) received\n"),
     (3, b"death-mark: SIGQUIT (3) received\n"),
-    (
-        13,
-        b"death-mark: SIGPIPE (13) received - write to closed pipe/fd\n",
-    ),
 ];
 
 unsafe extern "C" {
@@ -77,7 +85,11 @@ extern "C" fn death_mark_handler(sig: i32) {
 }
 
 /// Open `log_path` for the death marks and install handlers for every
-/// catchable fatal signal. Best effort: failures are logged, never fatal.
+/// catchable fatal signal (SIGPIPE deliberately excluded — module docs).
+/// Best effort: failures are logged, never fatal. The caller pins SIGPIPE
+/// to SIG_IGN (cmd_run does this immediately before), and the Rust runtime
+/// already ignores SIGPIPE at process start, so no window exists where
+/// SIG_DFL could kill the daemon on a broken pipe.
 pub fn install_signal_death_marks(log_path: &Path) {
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new()
@@ -351,5 +363,19 @@ mod tests {
             "panic mark written to log, got: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SIGPIPE must never carry a death-mark handler: the handler logs and
+    /// re-raises, so catching SIGPIPE converts the benign EPIPE condition
+    /// (status client disconnected mid-response) into a daemon death —
+    /// observed live on a personal node 2026-09-13, right after boot while
+    /// the user ran `keep-at status`. The daemon pins SIGPIPE to SIG_IGN
+    /// instead (cmd_run) and broken-pipe writes return EPIPE.
+    #[test]
+    fn sigpipe_is_not_a_death_mark_signal() {
+        assert!(
+            !SIG_NAMES.iter().any(|(num, _)| *num == 13),
+            "SIGPIPE (13) must not be in the death-mark signal list"
+        );
     }
 }

@@ -6,11 +6,17 @@ knob. Nothing here needs special compilation.
 ## Always-on diagnostics
 
 **Death marks.** Handlers for SIGSEGV, SIGABRT, SIGBUS, SIGXCPU, SIGHUP,
-SIGQUIT, and SIGPIPE write a one-line mark to the log file (async-signal-safe
+and SIGQUIT write a one-line mark to the log file (async-signal-safe
 write on a pre-opened append fd) before dying. SIGKILL cannot be caught — a
 silent death with no mark and a stopped heartbeat is itself the diagnostic
-(external SIGKILL). SIGPIPE additionally cannot kill the daemon in the first
-place (see below); the mark exists as defense-in-depth.
+(external SIGKILL). SIGPIPE is deliberately NOT caught: under the daemon's
+`SIG_IGN` (Rust runtime default, re-pinned in `cmd_run` before the marks
+install) a broken-pipe write is a routine EPIPE condition, not a death — and
+because the death-mark handler re-raises after logging, catching SIGPIPE
+turned exactly that benign condition into a daemon death (a `status` client
+that disconnects mid-response makes the daemon's socket write raise SIGPIPE;
+observed live on a personal node, 2026-09-13). Broken-pipe writes return
+EPIPE, the socket server logs the failure at debug, and the daemon lives.
 
 **Heartbeat.** Every 60 s the daemon samples RSS, open-fd count, and cgroup
 memory state (current/peak/oom_kill) and atomically replaces

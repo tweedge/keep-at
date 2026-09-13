@@ -210,7 +210,11 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
     // Belt and braces against SIGPIPE deaths (measured 2026-09-11, see main()):
     // whatever our ancestors set, the daemon itself pins SIGPIPE to ignored.
     // Socket writes are already immune (std sends with MSG_NOSIGNAL); this
-    // covers pipes and inherited stderr/stdout fds.
+    // covers pipes and inherited stderr/stdout fds. MUST run before
+    // install_signal_death_marks below: the death-mark handler list
+    // deliberately excludes SIGPIPE (catching it re-raises and kills the
+    // daemon on routine broken-pipe writes — observed 2026-09-13), and this
+    // call is what keeps that exclusion from mattering.
     #[cfg(unix)]
     libc_signal(13, 1); // SIGPIPE -> SIG_IGN (broken-pipe writes return EPIPE)
                         // Redirect stdout+stderr into the log file: the daemon must never hold a
