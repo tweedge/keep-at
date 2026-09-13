@@ -79,6 +79,8 @@ async fn main() -> Result<()> {
         Command::Stop(a) => cmd_stop(&a),
         Command::Status(a) => keep_at::status::cmd_status(&a),
         Command::Logs(a) => keep_at::logs::cmd_logs(&a),
+
+        Command::History(a) => keep_at::history::cmd_history(&a),
         Command::Service(s) => cmd_service(s).await,
         Command::NetworkStatus(a) => {
             init_logging(false);

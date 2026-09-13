@@ -11,6 +11,7 @@ pub mod engine;
 pub mod fdlimit;
 pub mod filter;
 pub mod forensics;
+pub mod history;
 pub mod hosted;
 pub mod humanize;
 pub mod live;

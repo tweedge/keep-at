@@ -23,6 +23,7 @@ use crate::engine::stats as engstats;
 use crate::engine::storage;
 use crate::engine::torrents as engtorrents;
 use crate::filter::KeywordBlocklist;
+use crate::history;
 use crate::netstats::{self, Snapshot};
 use crate::selector::{self, Candidate, Held};
 use crate::state::{self, State};
@@ -72,6 +73,9 @@ pub struct Engine {
     /// from the running daemon instead of stale files). None in tests and
     /// anywhere no server is wanted. Refreshed after every state mutation.
     live: Option<crate::live::LiveHandle>,
+    /// Append-only record of additions, swaps, and removals
+    /// (<data_dir>/history.jsonl, rendered by `keep-at history`).
+    history: crate::history::Writer,
 }
 
 /// Counters from the most recent scan, for tests and status callers.
@@ -626,6 +630,8 @@ impl Engine {
 
         let size_bias = ram::size_bias_for_ratio(budget, disk_limit_total(&cfg));
 
+        let history = crate::history::Writer::new(cfg.data_dir.join("history.jsonl"));
+
         let mut eng = Engine {
             cfg,
             session,
@@ -651,6 +657,7 @@ impl Engine {
             last_scan: tokio::sync::Mutex::new(None),
             completed_seen: std::sync::Mutex::new(std::collections::HashSet::new()),
             live: None,
+            history,
         };
         eng.blocklist = KeywordBlocklist::new(eng.cfg.keyword_blocklist.clone());
         {
@@ -1526,6 +1533,32 @@ impl Engine {
         }) {
             tracing::error!("failed to persist state for {}: {e:#}", c.title);
         }
+        let cause = if displaced.is_empty() {
+            history::Cause::Fill
+        } else {
+            history::Cause::Swap
+        };
+        self.history.record(&history::add_event(
+            &hex_str,
+            &c.title,
+            size_bytes,
+            c.seeders,
+            location,
+            cause,
+            decision.chance,
+            decision.roll,
+            seeder_floor,
+            &decision.reason,
+            displaced
+                .iter()
+                .map(|d| history::Displaced {
+                    hash: hex::encode(d.info_hash),
+                    title: d.title.clone(),
+                    seeders: d.seeders,
+                    size_bytes: d.size_bytes,
+                })
+                .collect(),
+        ));
         self.push_live();
         (true, decision)
     }
@@ -1654,6 +1687,15 @@ impl Engine {
                 tracing::error!("failed to drop state for {}: {e:#}", h.title);
             } else {
                 removed_any = true;
+                self.history.record(&history::remove_event(
+                    &h.info_hash,
+                    &h.title,
+                    h.size_bytes,
+                    h.last_known_seeders,
+                    &h.storage_location,
+                    history::Cause::DeletedFromCatalog,
+                    "no longer listed on Academic Torrents",
+                ));
             }
         }
         if removed_any {
@@ -1755,6 +1797,18 @@ impl Engine {
                 tracing::error!("failed to drop state for {}: {e:#}", h.title);
             } else {
                 removed_any = true;
+                self.history.record(&history::remove_event(
+                    &h.info_hash,
+                    &h.title,
+                    h.size_bytes,
+                    h.last_known_seeders,
+                    &h.storage_location,
+                    history::Cause::Stalled,
+                    &format!(
+                        "zero seeders and no download progress for {}",
+                        crate::humanize::human_duration(since)
+                    ),
+                ));
             }
         }
         if removed_any {
@@ -1810,6 +1864,13 @@ impl Engine {
     /// socket serves live numbers from the same inputs; the file stays as
     /// the offline fallback `status` reads when no daemon is running.
     fn log_and_save_runtime(&self, kind: &str) {
+        // Cap the daemon's log file: it is written directly (stdout/stderr
+        // are dup2'd into it, not streamed to journald), so nothing else
+        // rotates it. Rewritten in place to its newest half when it
+        // outgrows the cap; best-effort, and stdout runs are uncapped.
+        if let Some(log_path) = &self.cfg.log_file {
+            let _ = history::cap_text_file(log_path, history::MAX_LOG_BYTES);
+        }
         // Advance the bandwidth history on the stats cadence so hour/day
         // rates stay exact even when nobody queries the socket for hours.
         if let Some(live) = &self.live {

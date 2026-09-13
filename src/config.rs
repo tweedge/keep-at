@@ -304,8 +304,25 @@ impl Config {
     /// `<data_dir>/api_key` (owner-only) when present. A legacy inline
     /// `api_key:` field still parses for back-compat; the key file wins.
     pub fn load(path: &Path) -> Result<Config> {
+        Self::load_inner(path, true)
+    }
+
+    /// Load a config file without ever writing anything: for read-only
+    /// commands (status/stop/logs/history/hosted) and /proc cmdline probes.
+    /// A missing config is an error, never a starter write — the probe must
+    /// not materialize configs for paths that merely appear in another
+    /// process's argv (and a concurrent starter-generating `run` would race
+    /// it: whoever writes second parses a starter instead of reporting it).
+    pub fn load_readonly(path: &Path) -> Result<Config> {
+        Self::load_inner(path, false)
+    }
+
+    fn load_inner(path: &Path, write_starter: bool) -> Result<Config> {
         let data = match std::fs::read(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !write_starter {
+                    bail!("no config at {}", path.display());
+                }
                 write_starter_config(path).with_context(|| {
                     format!(
                         "no config at {}, and failed to write a starter one",
@@ -722,6 +739,32 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(dmode & 0o755, 0o755, "dirs traversable by everyone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_readonly_never_writes_a_starter() {
+        let dir = std::env::temp_dir().join(format!("keep-at-cfgro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missing.yaml");
+
+        // Read-only load: a missing config is an error and nothing appears.
+        let err = Config::load_readonly(&path).unwrap_err();
+        assert!(!path.exists(), "read-only load must not write a starter");
+        assert!(err.to_string().contains("no config at"), "err: {err:#}");
+
+        // The starter-writing load still writes (and says so).
+        let err2 = Config::load(&path).unwrap_err();
+        assert!(err2.to_string().contains("wrote a starter config"));
+        assert!(path.exists(), "starter written by the mutating load");
+
+        // An existing file parses identically through both.
+        std::fs::write(&path, "port: 41234\nstorage:\n- path: /tmp\n  limit: 1G\n").unwrap();
+        assert_eq!(
+            Config::load_readonly(&path).unwrap().port,
+            Config::load(&path).unwrap().port
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -81,31 +81,54 @@ fn test_config(data_dir: PathBuf, storage_dir: PathBuf, port: u16, rate: f64) ->
 }
 
 /// Spin a tiny local HTTP server serving `xml` at /database.xml; returns base URL.
+///
+/// Accepts unboundedly for the process lifetime, one thread per connection,
+/// reading until the request headers complete — same hardening as the shared
+/// fixture (a bounded accept count or a single `read()` per request flakes
+/// under load).
 fn serve_catalog(xml: String) -> (String, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind smoke catalog server");
     let addr = listener.local_addr().unwrap();
+    let xml = std::sync::Arc::new(xml);
     let handle = std::thread::spawn(move || {
-        // Serve a handful of requests then exit (each scan fetches once).
-        listener.set_nonblocking(false).ok();
-        for _ in 0..8 {
-            let (mut stream, _) = match listener.accept() {
-                Ok(s) => s,
-                Err(_) => break,
-            };
-            // Read the request (ignore contents), then answer.
-            use std::io::{Read, Write};
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let body = xml.clone();
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(resp.as_bytes());
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let xml = xml.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let mut stream = stream;
+                if common_read_request(&mut stream).is_err() {
+                    return;
+                }
+                let body = &*xml;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            });
         }
     });
     (format!("http://{addr}"), handle)
+}
+
+/// Read one HTTP request (until the header terminator, EOF, or a size cap).
+fn common_read_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    loop {
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 256 * 1024 {
+            break;
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 #[allow(dead_code)]

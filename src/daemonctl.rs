@@ -126,7 +126,9 @@ fn find_foreground_in(proc_dir: &Path, want: &str) -> Option<Option<u32>> {
             continue;
         }
         if let Some(c) = config_arg {
-            if let Ok(cfg) = crate::config::Config::load(std::path::Path::new(&c)) {
+            // Read-only probe of another process's config path: never write
+            // a starter for it (a missing file just means no match).
+            if let Ok(cfg) = crate::config::Config::load_readonly(std::path::Path::new(&c)) {
                 if cfg.data_dir.to_string_lossy() == want {
                     return Some(Some(pid));
                 }
@@ -190,7 +192,7 @@ fn find_any_daemon_in(proc_dir: &Path) -> Option<(u32, PathBuf)> {
             return Some((pid, PathBuf::from(d)));
         }
         if let Some(c) = config_arg {
-            if let Ok(cfg) = crate::config::Config::load(std::path::Path::new(&c)) {
+            if let Ok(cfg) = crate::config::Config::load_readonly(std::path::Path::new(&c)) {
                 return Some((pid, cfg.data_dir));
             }
             continue;

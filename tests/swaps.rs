@@ -91,6 +91,32 @@ async fn swap_beats_margin_and_covers_cost() {
     assert_eq!(held[&held_hex].piece_count, 1);
     engine.close().await;
 
+    // History: the fill add is recorded with its seed-scarcity statistics
+    // and no displaced set.
+    let (events, skipped) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert_eq!(skipped, 0);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        keep_at::history::Event::Add {
+            hash,
+            title,
+            cause,
+            chance,
+            roll,
+            reason,
+            displaced,
+            ..
+        } => {
+            assert_eq!(hash, &held_hex);
+            assert_eq!(title, &held_fx.title);
+            assert_eq!(cause, &keep_at::history::Cause::Fill);
+            assert!(displaced.is_empty(), "fills carry no displaced set");
+            assert!(*chance > 0.0 && *roll >= 0.0, "scarcity stats recorded");
+            assert!(!reason.is_empty(), "admission reason recorded");
+        }
+        _ => panic!("expected a fill Add event"),
+    }
+
     // Phase 2: catalog now has BOTH; the candidate must displace the held
     // one (disk: 1 MB held + 512 KB candidate > 1 MB limit).
     let (cat2, _s2) = common::serve_catalog(Stub::catalog_xml(&[
@@ -143,6 +169,32 @@ async fn swap_beats_margin_and_covers_cost() {
     assert!(
         storage_dir.join(&cand_hex).exists(),
         "winner output dir exists"
+    );
+
+    // History: the swap is one Add event carrying its displaced set — no
+    // separate Remove rows for swap evictions.
+    let (events, _) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert_eq!(events.len(), 2);
+    match &events[1] {
+        keep_at::history::Event::Add {
+            hash,
+            cause,
+            displaced,
+            ..
+        } => {
+            assert_eq!(hash, &cand_hex);
+            assert_eq!(cause, &keep_at::history::Cause::Swap);
+            assert_eq!(displaced.len(), 1);
+            assert_eq!(displaced[0].hash, held_hex);
+            assert_eq!(displaced[0].title, held_fx.title);
+        }
+        _ => panic!("expected a swap Add event"),
+    }
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, keep_at::history::Event::Remove { .. })),
+        "swap evictions are recorded in the winner's displaced set, not as drops"
     );
 }
 

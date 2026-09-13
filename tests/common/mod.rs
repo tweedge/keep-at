@@ -261,28 +261,38 @@ impl Stub {
         let thread_state = state.clone();
         let handle = std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let mut stream = match stream {
+                let stream = match stream {
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                use std::io::{Read, Write};
-                let mut buf = vec![0u8; 65536];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                let path = req
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("/")
-                    .to_string();
-                let body = handle_request(&path, &thread_state);
-                let (status, content_type, payload) = body;
-                let header = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    payload.len()
-                );
-                let _ = stream.write_all(header.as_bytes());
-                let _ = stream.write_all(&payload);
+                // One thread per connection: the engine evaluates candidates
+                // concurrently (metadata + scrape fetches in flight at
+                // once), and a sequential loop both serializes those and
+                // head-of-line blocks on a slow client — a flake source on
+                // a loaded machine.
+                let thread_state = thread_state.clone();
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let mut stream = stream;
+                    let req = match read_http_request(&mut stream) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let body = handle_request(&path, &thread_state);
+                    let (status, content_type, payload) = body;
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&payload);
+                });
             }
         });
         // The catalog endpoint serves whatever XML was passed at start; the
@@ -423,28 +433,57 @@ fn percent_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Serve a static catalog XML on 127.0.0.1; returns the base URL. The engine
 /// is pointed at `{base}/database.xml` via Options.catalog_url.
+///
+/// Accepts unboundedly for the life of the test process, one thread per
+/// connection: a bounded accept count or a sequential loop is a flake under
+/// load (a retried or concurrent catalog fetch would be refused or stalled,
+/// failing scans whose assertions assume the fetch succeeded).
 pub fn serve_catalog(xml: String) -> (String, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind catalog server");
     let addr = listener.local_addr().expect("catalog addr");
+    let xml = std::sync::Arc::new(xml);
     let handle = std::thread::spawn(move || {
-        listener.set_nonblocking(false).ok();
-        for _ in 0..16 {
-            let (mut stream, _) = match listener.accept() {
-                Ok(s) => s,
-                Err(_) => break,
-            };
-            use std::io::{Read, Write};
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                xml.len(),
-                xml
-            );
-            let _ = stream.write_all(resp.as_bytes());
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let xml = xml.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let mut stream = stream;
+                if read_http_request(&mut stream).is_err() {
+                    return;
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    xml.len(),
+                    xml
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            });
         }
     });
     (format!("http://{addr}"), handle)
+}
+
+/// Read one HTTP request: keep reading until the header block terminator
+/// arrives (a single `read()` can return a partial request when TCP splits
+/// it across segments — the resulting bogus path once made a stub serve 404
+/// for a perfectly valid scrape, failing tests under load), EOF, or a
+/// generous size cap.
+fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    loop {
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 256 * 1024 {
+            break;
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Test config: unique port per test, tiny storage, gate forced open unless

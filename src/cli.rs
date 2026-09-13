@@ -32,6 +32,9 @@ pub enum Command {
     Status(CommonArgs),
     /// Print keep-at's logs (follows by default; --all prints and exits)
     Logs(LogsArgs),
+
+    /// Show what keep-at added, swapped, and dropped (follows by default; --all prints and exits)
+    History(HistoryArgs),
     /// Install/remove a systemd service (elevates automatically when needed)
     Service(ServiceArgs),
     /// Census the keep-at network (RAM/time-heavy, on demand)
@@ -65,6 +68,21 @@ pub struct LogsArgs {
     #[arg(long, default_value_t = false)]
     pub all: bool,
     /// How many lines to show before following (default: 50)
+    #[arg(long, default_value_t = 20)]
+    pub lines: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct HistoryArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Print the whole history and exit instead of following
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
+    /// Print the last --lines events and exit instead of following
+    #[arg(long, default_value_t = false)]
+    pub no_follow: bool,
+    /// How many events to show before following (default: 20)
     #[arg(long, default_value_t = 20)]
     pub lines: usize,
 }
@@ -421,13 +439,13 @@ pub fn resolve_data_dir(args: &CommonArgs) -> Result<PathBuf> {
         return Ok(d.clone());
     }
     if let Some(p) = &args.config {
-        return Ok(Config::load(p)?.data_dir);
+        return Ok(Config::load_readonly(p)?.data_dir);
     }
     if let Some(d) = crate::service::read_data_dir_pointer() {
         return Ok(d);
     }
     if let Some(p) = service_config_if_present() {
-        match Config::load(&p) {
+        match Config::load_readonly(&p) {
             Ok(cfg) => return Ok(cfg.data_dir),
             Err(e) => anyhow::bail!(
                 "{e:#}\nhint: this is an older install; run `sudo keep-at service install` once (or restart the daemon) to write {} and open the config up",
@@ -446,7 +464,7 @@ pub fn resolve_census(args: &NetworkStatusArgs) -> Result<Config> {
     }
     let mut cfg = Config::default();
     if let Some(p) = path {
-        cfg = Config::load(&p)?;
+        cfg = Config::load_readonly(&p)?;
     }
     if let Some(d) = &args.common.data_dir {
         cfg.data_dir = d.clone();

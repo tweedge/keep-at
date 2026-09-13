@@ -44,12 +44,9 @@ fn setup(fixtures: &[Fixture]) -> (Stub, String, Vec<String>) {
         }
     }
     let (catalog_base, _srv) = common::serve_catalog(Stub::catalog_xml(&rows));
-    // Leak the catalog server for the test duration (join handle dropped
-    // would close... no: the thread owns the listener; dropping the handle
-    // detaches it. The listener lives as long as the thread runs, and the
-    // thread runs until the test process exits or accept fails. 16 accepts
-    // is plenty for one scan's single fetch.)
-    std::mem::forget(_srv);
+    // The catalog server accepts unboundedly for the process lifetime (its
+    // handle is dropped/detached; the listener thread outlives the test),
+    // so any number of fetches and retries is served.
     (stub, catalog_base, hexes)
 }
 

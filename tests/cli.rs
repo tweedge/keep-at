@@ -325,3 +325,102 @@ fn logs_all_prints_and_follow_streams() {
         .failure()
         .stderr(predicate::str::contains("no log file at"));
 }
+
+#[test]
+fn history_renders_events_tails_and_skips_torn_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let hist = data.join("history.jsonl");
+    let loc = std::path::Path::new("/mnt/disk1/keep-at");
+    let fill = keep_at::history::add_event(
+        "1111111111111111111111111111111111111111",
+        "kept-dataset",
+        1_000_000,
+        1,
+        loc,
+        keep_at::history::Cause::Fill,
+        1.0,
+        0.25,
+        1,
+        "seed-scarcity roll succeeded",
+        Vec::new(),
+    );
+    let swap = keep_at::history::add_event(
+        "2222222222222222222222222222222222222222",
+        "swap-dataset",
+        2_000_000,
+        1,
+        loc,
+        keep_at::history::Cause::Swap,
+        1.0,
+        0.5,
+        1,
+        "seed-scarcity roll succeeded",
+        vec![keep_at::history::Displaced {
+            hash: "1111111111111111111111111111111111111111".to_string(),
+            title: "kept-dataset".to_string(),
+            seeders: 3,
+            size_bytes: 900_000,
+        }],
+    );
+    let drop = keep_at::history::remove_event(
+        "3333333333333333333333333333333333333333",
+        "stalled-dataset",
+        500_000,
+        0,
+        loc,
+        keep_at::history::Cause::Stalled,
+        "zero seeders and no download progress for 14 days",
+    );
+    let mut body = String::new();
+    for ev in [&fill, &swap, &drop] {
+        body.push_str(&serde_json::to_string(ev).unwrap());
+        body.push('\n');
+    }
+    body.push_str("{\"half\":\n"); // torn tail line: skipped, never fatal
+    std::fs::write(&hist, &body).unwrap();
+
+    // --all renders every event (no ANSI codes over a piped stdout), with
+    // the swap's displaced set under the winner and the drop's reason.
+    keep_at()
+        .args(["history", "--data-dir", data.to_str().unwrap(), "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added     kept-dataset"))
+        .stdout(predicate::str::contains("swapped in swap-dataset"))
+        .stdout(predicate::str::contains("displaced kept-dataset"))
+        .stdout(predicate::str::contains("dropped   stalled-dataset"))
+        .stdout(predicate::str::contains("stalled: zero seeders"))
+        .stdout(predicate::str::contains("chance 1.00"))
+        .stdout(predicate::str::contains("seeder floor 1"))
+        .stdout(predicate::str::contains("\x1b[").not())
+        .stderr(predicate::str::contains("skipped 1 unparseable line"));
+
+    // Tail: --lines 2 --no-follow shows only the last two events (the swap
+    // with its displaced line, and the drop) — the fill add is not rendered.
+    keep_at()
+        .args([
+            "history",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--lines",
+            "2",
+            "--no-follow",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("swapped in swap-dataset"))
+        .stdout(predicate::str::contains("added     kept-dataset").not());
+
+    // Missing history: actionable error, not a trace.
+    keep_at()
+        .args([
+            "history",
+            "--data-dir",
+            dir.path().join("none").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no history at"));
+}

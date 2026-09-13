@@ -33,7 +33,7 @@ pub fn resolve_log_path(args: &CommonArgs) -> Result<PathBuf> {
     // permission-denied config read falls through to the default silently —
     // `logs` is a read-only command and must work for any user.
     if let Some(p) = &args.config {
-        if let Ok(cfg) = crate::config::Config::load(p) {
+        if let Ok(cfg) = crate::config::Config::load_readonly(p) {
             if let Some(l) = &cfg.log_file {
                 return Ok(l.clone());
             }
@@ -137,5 +137,5 @@ fn print_tail(path: &std::path::Path, lines: usize) -> Result<u64> {
 /// through to the data-dir default.
 fn service_config_snapshot() -> Option<crate::config::Config> {
     let p = crate::cli::service_config_if_present()?;
-    crate::config::Config::load(&p).ok()
+    crate::config::Config::load_readonly(&p).ok()
 }

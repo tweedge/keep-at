@@ -119,6 +119,28 @@ async fn stall_eviction_removes_quiet_zero_seeder() {
         "stalled torrent evicted"
     );
     assert!(!out_dir.exists(), "evicted output dir removed");
+
+    // History: the stall eviction is a Remove event with its reason.
+    let (events, skipped) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert_eq!(skipped, 0);
+    let drops: Vec<&keep_at::history::Event> = events
+        .iter()
+        .filter(|e| matches!(e, keep_at::history::Event::Remove { .. }))
+        .collect();
+    assert_eq!(drops.len(), 1, "exactly one drop recorded");
+    match drops[0] {
+        keep_at::history::Event::Remove {
+            hash,
+            cause,
+            reason,
+            ..
+        } => {
+            assert_eq!(hash, &hex);
+            assert_eq!(cause, &keep_at::history::Cause::Stalled);
+            assert!(reason.contains("zero seeders"), "reason: {reason}");
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// A live (recent-progress) zero-seeder is NOT evicted.
@@ -272,6 +294,25 @@ async fn deleted_torrents_removed_unless_preserved() {
                 "delisted torrent removed"
             );
             assert!(!storage_dir.join(&hex).exists(), "removed output dir gone");
+        }
+
+        // History: a delisting removal is recorded only when it happens.
+        let (events, _) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+        let drops: Vec<&keep_at::history::Event> = events
+            .iter()
+            .filter(|e| matches!(e, keep_at::history::Event::Remove { .. }))
+            .collect();
+        if preserve {
+            assert!(drops.is_empty(), "no drop recorded when preserved");
+        } else {
+            assert_eq!(drops.len(), 1);
+            match drops[0] {
+                keep_at::history::Event::Remove { hash, cause, .. } => {
+                    assert_eq!(hash, &hex);
+                    assert_eq!(cause, &keep_at::history::Cause::DeletedFromCatalog);
+                }
+                _ => unreachable!(),
+            }
         }
     }
 }
