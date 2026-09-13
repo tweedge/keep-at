@@ -1,5 +1,25 @@
 # keep-at release notes
 
+## v0.8.24-beta - holdings history (`keep-at history`), size-capped logs, read-only config loads
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### `keep-at history`: a record of everything keep-at did to your holdings
+
+Every addition (fill or swap), every swap's displaced set, and every drop (stalled zero-seeder eviction, vanished-from-catalog removal) is now appended to `<data_dir>/history.jsonl` and rendered by the new `keep-at history` command - tail + follow by default like `logs`, with `--all`, `--lines N`, and `--no-follow` for scripts. Additions render green, swaps (with what they displaced) yellow, drops red on a terminal, and each event carries the reason it happened, including the seed-scarcity roll statistics (chance, roll, seeder floor) that admitted the torrent. The file rotates at 5 MB (one previous generation kept), boot resume re-adds are never recorded so restarts do not pollute history, and the command works whether the daemon is running or not.
+
+### keep-at.log is size-capped
+
+The daemon writes its own log (stdout/stderr are redirected into the file, not streamed to journald), so nothing else rotated it and it grew without bound. It is now rewritten in place to its newest ~5 MB whenever it passes 10 MB, checked on the stats cadence. The rewrite keeps the same inode, so the redirected stdout/stderr and the crash-forensics fd stay valid, and at most a line written inside the rewrite window can be lost.
+
+### Read-only commands no longer write starter configs
+
+`Config::load` generates a starter config when the file is missing - a feature for `run`/`start`, but a bug for read-only paths: the `status`/`stop` daemon probe loads config paths scraped from other processes' `/proc` cmdlines and could materialize a starter at a path owned by a concurrently-starting daemon (observed as a rare race; on real hosts it could create unexpected files). All read-only commands (status, stop, logs, history, hosted-torrents, network-status, triage-last-exit) now load configs without ever writing; only `run`/`start`/`service install` generate starters. `status --config <missing>` now reports `no config at <path>` instead of writing one. Pinned by a regression test.
+
+### Release pipeline hardening
+
+GitHub Actions are pinned to full commit SHAs (mutable tags could be repointed upstream of your build), the release tag reaches the publish script via an env var instead of textual workflow interpolation (a hostile tag name can no longer execute shell in the runner), and the Docker image now runs as an unprivileged user (uid 1000) - bind-mounted `./data` and `./storage` must be writable by that uid on the host (see README); named volumes are seeded correctly.
+
 ## v0.8.23-beta - SIGPIPE no longer fatal (death-mark fix)
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
