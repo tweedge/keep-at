@@ -235,6 +235,10 @@ fn print_numbers(
             humanize::human_bytes(disk_limit as i64)
         ));
         println!("{line}");
+    } else {
+        // Unreachable since limits resolve before the live query binds, but
+        // never leave the disk line silently absent: say when it returns.
+        println!("  disk: statistics unavailable — will appear once startup completes");
     }
     println!(
         "  bandwidth since boot: sent {}, received {}",

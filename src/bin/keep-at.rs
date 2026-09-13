@@ -160,6 +160,11 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
     // ("starting up: resuming N held torrents") instead of reporting a
     // stale snapshot with a "may need a restart" warning for the whole
     // Engine::new window (minutes on slow hosts, 144-torrent resumes).
+    // Limits are resolved HERE (not left as `max`): the live query carries
+    // this storage vec into the live phase, and `limit_bytes()` of an
+    // unresolved `max` is 0 — which made the status disk line vanish
+    // entirely on `--storage-limit max` nodes (booting AND seeding).
+    let cfg = keep_at::engine::storage::resolve_all_limits(&cfg)?;
     let started_at = std::time::Instant::now();
     let storage: Vec<(std::path::PathBuf, u64)> = cfg
         .storage

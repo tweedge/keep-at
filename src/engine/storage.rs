@@ -129,6 +129,42 @@ mod tests {
 
     use std::io::{Seek as _, Write as _};
 
+    /// The live query's storage vec must carry RESOLVED limits. `run` builds
+    /// it from the config before Engine::new resolves `limit: max` — and
+    /// `limit_bytes()` of an unresolved `max` is 0, which gated the whole
+    /// disk line out of `status` on `--storage-limit max` nodes (booting AND
+    /// seeding). Resolution must happen before the vec is built; this pins
+    /// the resolve-then-derive behavior the binary relies on.
+    #[test]
+    fn limit_bytes_of_max_is_zero_until_resolved() {
+        let cfg = crate::config::Config {
+            storage: vec![crate::config::StorageLocation {
+                path: std::env::temp_dir(),
+                limit: crate::config::StorageLimit::All,
+            }],
+            ..crate::config::Config::default()
+        };
+        // The pre-fix bug: a vec built from the raw config reports no limit.
+        let raw: Vec<(std::path::PathBuf, u64)> = cfg
+            .storage
+            .iter()
+            .map(|l| (l.path.clone(), l.limit_bytes()))
+            .collect();
+        assert_eq!(raw[0].1, 0, "unresolved max has no concrete byte limit");
+
+        let resolved = resolve_all_limits(&cfg).unwrap();
+        let ok: Vec<(std::path::PathBuf, u64)> = resolved
+            .storage
+            .iter()
+            .map(|l| (l.path.clone(), l.limit_bytes()))
+            .collect();
+        let (_, limit) = super::super::stats::disk_usage(&ok);
+        assert!(
+            limit > 0,
+            "resolution turns max into concrete bytes: got {limit}"
+        );
+    }
+
     /// dir_size_bytes must report ALLOCATED bytes, not apparent size: keep-at
     /// writes sparse (rqbit truncates files to full length and fills pieces
     /// as they download), and a partially-downloaded torrent's apparent size

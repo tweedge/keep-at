@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.22-beta - status disk line on `limit: max` nodes
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### Disk line no longer vanishes on `--storage-limit max` nodes
+
+The live query's storage vec was built from the config *before* `Engine::new` resolved `limit: max` to concrete bytes, and `limit_bytes()` of an unresolved `max` is 0 — so `status` gated the whole disk line out, on `max` nodes in every phase (booting and seeding alike); only the offline snapshot fallback showed it. Limits now resolve before the live query binds, so the disk line always shows, e.g. `disk: 1.2 TiB used (61.5%), 1.9 TiB committed (100.0%), 1.9 TiB configured`. Belt and braces: if a zero limit ever reaches it anyway, the line reads `disk: statistics unavailable — will appear once startup completes` instead of being silently absent. Pinned by a regression test; nodes with explicit byte limits are unaffected.
+
 ## v0.8.21-beta - bounded file-handle pool (EMFILE wedge fix), reorganized disk line
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
