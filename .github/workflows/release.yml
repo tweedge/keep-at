@@ -25,9 +25,11 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to full commit SHAs (mutable tags/branches can be
+      # silently repointed by their owners); bump the SHA to update.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Install cross targets and C cross-compilers
         run: |
@@ -46,6 +48,11 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # github context reaches bash only through env vars: ref_name is a
+          # tag name, which can carry shell metacharacters, so it must never
+          # be interpolated directly into the run: block.
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
           set -x
           ls -la dist/
@@ -55,7 +62,7 @@ jobs:
           # releases: publishing stale or rolled-up history is a bug, so a
           # missing section fails the release instead of falling back to
           # the whole file. See the Releasing section in README.md.
-          tag="${{ github.ref_name }}"
+          tag="$TAG"
           notes_file="RELEASE_NOTES.md"
           if [ ! -f "$notes_file" ]; then
             echo "RELEASE_NOTES.md missing: add it with a '## $tag' section" >&2
@@ -80,7 +87,7 @@ jobs:
             *-beta|*-rc|*-alpha) args+=(--prerelease) ;;
           esac
           gh release create "$tag" dist/*.tar.gz \
-            -R "${{ github.repository }}" \
+            -R "$REPO" \
             --title "$tag" \
             --notes-file "$notes_file" \
             "${args[@]}"

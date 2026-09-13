@@ -21,8 +21,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-lin
     && cp "target/${TRIPLE}/release/keep-at" /out-keep-at
 
 FROM debian:bookworm-slim
+# Unprivileged runtime user: the daemon only writes to the data dir and
+# storage locations, uses an unprivileged port, and fdlimit only raises the
+# soft RLIMIT_NOFILE - nothing needs root. /data and /storage are
+# pre-created with that user's ownership so named volumes inherit it; host
+# bind mounts must be writable by uid 1000 on the host, e.g.
+#   mkdir -p data storage && sudo chown 1000:1000 data storage
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --user-group --create-home keepat \
+    && mkdir -p /data /storage \
+    && chown keepat:keepat /data /storage
 COPY --from=build /out-keep-at /usr/local/bin/keep-at
 
 # keep-at refuses to run without a storage limit (no default space
@@ -33,6 +42,9 @@ COPY --from=build /out-keep-at /usr/local/bin/keep-at
 #
 # Or mount an advanced config file and pass --config instead.
 VOLUME ["/data", "/storage"]
+
+# Run as the unprivileged user created above (see the RUN comment).
+USER keepat
 
 # `start` behaves as `run` (foreground) automatically inside a container -
 # daemonizing here would just exit and kill the container. See

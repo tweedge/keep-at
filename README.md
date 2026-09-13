@@ -22,6 +22,8 @@ Or run the prebuilt image in Docker:
 docker run -v ./data:/data -v ./storage:/storage ghcr.io/tweedge/keep-at:latest --storage-limit 500G
 ```
 
+The image runs as an unprivileged user (uid 1000), so host-mounted directories must be writable by that uid: `mkdir -p data storage && sudo chown 1000:1000 data storage` before the first run. Named volumes don't need this - Docker seeds their ownership from the image.
+
 Building from source (needs a Rust toolchain - no OpenSSL dev headers required, TLS and hashing use rustls/ring) is only necessary if you're modifying keep-at itself:
 
 ```

@@ -60,6 +60,7 @@ services:
 
 Notes:
 
+* The keep-at image runs as an unprivileged user (uid 1000), so the bind-mounted `./data` and `./storage` must be writable by that uid on the host: `mkdir -p data storage && sudo chown 1000:1000 data storage` before the first run.
 * Ports are published on the **gluetun** service, not keep-at's, since keep-at has no network stack of its own once `network_mode: "service:gluetun"` is set.
 * If your provider supports port forwarding and gluetun negotiates a port for you, pass that port to keep-at with `--port` (or `port` in a config file) so its BitTorrent listener matches what's actually forwarded.
 * See [gluetun's wiki](https://github.com/qdm12/gluetun-wiki) for provider-specific environment variables - they vary significantly and are outside keep-at's scope to document.
