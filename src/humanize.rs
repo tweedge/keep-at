@@ -1,6 +1,17 @@
-//! Human-readable byte / duration formatting.
+//! Human-readable byte / duration formatting, plus rendering safety.
 
 const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+
+/// Strip C0 and C1 control bytes from remote text (catalog titles) before
+/// it reaches a terminal. Titles arrive from academictorrents.com - any
+/// registrant can put ANSI escapes (cursor moves, screen clears, OSC title
+/// rewrites) or newlines in a title, and every `println!` of one is a
+/// terminal the attacker gets to write to. Applied at ingest AND render:
+/// ingest keeps newly stored titles clean, render covers titles stored
+/// before the fix.
+pub fn sanitize_title(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
 
 /// Format a byte count like "500 GiB", "10.4 MiB".
 pub fn human_bytes(n: i64) -> String {

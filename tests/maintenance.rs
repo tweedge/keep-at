@@ -270,6 +270,11 @@ async fn deleted_torrents_removed_unless_preserved() {
             1 << 30,
         );
         cfg2.preserve_deleted_torrents = preserve;
+        // This test targets the delisting-removal MECHANISM; the catalog
+        // collapse guard (default 30%) deliberately blocks a 0-item catalog
+        // (its own regression lives in tests/catalog_collapse.rs), so
+        // disable it here to exercise the removal path.
+        cfg2.catalog_collapse_percent = 0;
         let mut engine2 = with_timeout(
             60,
             "engine2 new",

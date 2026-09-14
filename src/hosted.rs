@@ -48,7 +48,7 @@ pub fn cmd_hosted(args: &CommonArgs) -> Result<()> {
             );
         }
         for t in &view.torrents {
-            println!("{}", t.title);
+            println!("{}", crate::humanize::sanitize_title(&t.title));
             println!(
                 "  link:        https://academictorrents.com/details/{}",
                 t.info_hash
@@ -90,7 +90,7 @@ pub fn cmd_hosted(args: &CommonArgs) -> Result<()> {
         // completed-bytes marker says so, else compare on-disk to nominal.
         // Plain storage writes sparse, so on-disk < nominal while downloading.
         let seeding = on_disk >= t.size_bytes && t.size_bytes > 0;
-        println!("{}", t.title);
+        println!("{}", crate::humanize::sanitize_title(&t.title));
         println!(
             "  link:        https://academictorrents.com/details/{}",
             t.info_hash

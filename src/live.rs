@@ -37,6 +37,14 @@ pub const SOCKET_NAME: &str = "keep-at.sock";
 /// slower means wedged or gone — fall back to files.
 pub const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Request-line cap: valid requests are two tiny JSON shapes (`{"op":...}`).
+/// A unix socket sustains GB/s, so an unbounded read_line let one writing
+/// client balloon the daemon's heap without limit.
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// Max concurrent queries (each pins an fd + buffers for up to
+/// QUERY_TIMEOUT; the socket is world-writable). Over capacity: drop.
+pub const MAX_CONCURRENT_QUERIES: usize = 32;
+
 pub fn socket_path(data_dir: &Path) -> PathBuf {
     data_dir.join(SOCKET_NAME)
 }
@@ -266,13 +274,24 @@ pub async fn serve(data_dir: PathBuf, handle: LiveHandle) {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
     }
     tracing::info!("live query socket listening ({})", path.display());
+    // The socket is 0o666 (any local user) and each query pins an fd plus
+    // buffers for up to QUERY_TIMEOUT - bound concurrent queries so a local
+    // slowloris cannot exhaust the daemon's fd table (state.json saves,
+    // history appends, and rqbit peer sockets all draw from the same table).
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_QUERIES));
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
             Err(_) => continue,
         };
+        // Over capacity: drop immediately rather than queueing - a query
+        // that waits here is a query that misses its client-side timeout.
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            continue;
+        };
         let handle = handle.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = serve_one(stream, &handle).await {
                 tracing::debug!("live query failed: {e:#}");
             }
@@ -293,12 +312,43 @@ async fn serve_one(stream: tokio::net::UnixStream, handle: &LiveHandle) -> Resul
     let mut stream = stream;
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    tokio::time::timeout(QUERY_TIMEOUT, reader.read_line(&mut line))
-        .await
-        .context("reading request (client timed out)")?
-        .context("reading request")?;
-    let req: Request = serde_json::from_str(line.trim()).context("parsing request")?;
+    // Cap the request line: read_line on an unbounded BufReader grows with
+    // whatever the client sends (a unix socket sustains GB/s - the 5s
+    // timeout bounds a STALLED client, not a writing one, so one request
+    // could balloon the daemon's heap). Requests are two tiny JSON shapes;
+    // anything past the cap is dropped unread.
+    let mut line_bytes: Vec<u8> = Vec::with_capacity(256);
+    let mut remaining = (MAX_REQUEST_BYTES + 1) as u64;
+    let mut terminated = false;
+    tokio::time::timeout(QUERY_TIMEOUT, async {
+        loop {
+            let buf = reader.fill_buf().await?;
+            if buf.is_empty() {
+                break; // EOF
+            }
+            let take = (buf.len() as u64).min(remaining) as usize;
+            line_bytes.extend_from_slice(&buf[..take]);
+            let found = line_bytes.contains(&b'\n');
+            reader.consume(take);
+            remaining -= take as u64;
+            if found || remaining == 0 {
+                terminated = found;
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .context("reading request (client timed out)")?
+    .context("reading request")?;
+    if !terminated || line_bytes.len() > MAX_REQUEST_BYTES {
+        anyhow::bail!(
+            "request too large or unterminated ({} bytes)",
+            line_bytes.len()
+        );
+    }
+    let req: Request =
+        serde_json::from_slice(line_bytes.trim_ascii()).context("parsing request")?;
     let resp: Response = match req {
         Request::Runtime => Response::Runtime(handle.runtime_view()),
         Request::Held => Response::Held(handle.held_view()),

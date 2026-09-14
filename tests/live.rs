@@ -187,3 +187,90 @@ async fn live_round_trip_matches_engine() {
     srv.abort();
     engine.close().await;
 }
+
+/// Regression (0.8.23): `Engine::run` unconditionally started a fallback
+/// live server at startup, overwriting the booting handle attached by
+/// cmd_run with a fresh one whose server can never bind the socket (the
+/// attached one owns it). Every later state push landed on that dead
+/// handle, so the served held snapshot froze at boot state forever -
+/// observed on a node as held stuck at 693 while state.json and the session
+/// had grown to 823. The guarded startup step must keep the attached
+/// handle, so post-attach mutations show up in the served views.
+#[tokio::test(flavor = "multi_thread")]
+async fn attached_booting_handle_keeps_receiving_pushes() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let fixtures = vec![
+        Fixture::new("push-a", 100_000, 3),
+        Fixture::new("push-b", 200_000, 3),
+    ];
+    let state = Arc::new(Mutex::new(StubState::default()));
+    let mut raws = Vec::new();
+    for f in &fixtures {
+        raws.push((
+            f.clone(),
+            common::torrent_bytes(f, "http://127.0.0.1:9/announce"),
+        ));
+    }
+    let stub = Stub::start(Stub::catalog_xml(&[]), state.clone());
+    let tracker = stub.tracker_url();
+    let mut rows = Vec::new();
+    {
+        let mut st = state.lock().unwrap();
+        for (f, _) in &raws {
+            let (hex, _) = st.add(f, &tracker);
+            rows.push((f.title.clone(), hex, f.size));
+        }
+    }
+    let (catalog_base, _srv) = common::serve_catalog(Stub::catalog_xml(&rows));
+    std::mem::forget(_srv);
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    let cfg = test_config(data_dir.clone(), storage_dir, test_port(62), 1 << 30);
+    let storage = cfg
+        .storage
+        .iter()
+        .map(|l| (l.path.clone(), l.limit_bytes()))
+        .collect();
+
+    // The cmd_run wiring: booting handle from state.json (empty here), serve
+    // it on the data dir, then attach it to the engine.
+    let started = std::time::Instant::now();
+    let h1 =
+        keep_at::live::LiveHandle::booting_with_snapshot(started, storage, Vec::new(), &data_dir);
+    {
+        let h = h1.clone();
+        let d = data_dir.clone();
+        tokio::spawn(async move { keep_at::live::serve(d, h).await });
+    }
+    let mut engine = with_timeout(
+        60,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&catalog_base, &stub.base_url)),
+    )
+    .await
+    .expect("engine new");
+    engine.attach_live(h1.clone());
+
+    // run()'s guarded startup step: must keep the attached handle serving.
+    engine.ensure_live_server();
+
+    with_timeout(180, "scan", engine.scan_once())
+        .await
+        .expect("scan");
+    engine.close().await;
+
+    // The served booting handle must reflect post-attach state mutations.
+    let resp =
+        keep_at::live::query(&data_dir, &keep_at::live::Request::Runtime).expect("runtime answers");
+    match resp {
+        keep_at::live::Response::Runtime(v) => {
+            assert_eq!(
+                v.held_torrents, 2,
+                "held snapshot tracks state after attach"
+            );
+            assert_eq!(v.seeding_torrents + v.downloading_torrents, 2);
+        }
+        other => panic!("expected runtime, got {other:?}"),
+    }
+}

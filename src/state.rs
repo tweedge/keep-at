@@ -99,6 +99,32 @@ impl State {
             .map(|t| t.size_bytes)
             .sum()
     }
+
+    /// Re-key held torrents to canonical storage-location spellings. A
+    /// config relocation/spelling change used to orphan entries: bytes_used
+    /// matches by raw path, so renamed entries under-counted their location
+    /// and free_bytes over-reported, letting the node re-fill on top.
+    /// Canonicalizes each held torrent's directory (when it exists) and
+    /// matches it against the configured (already-canonical) locations.
+    /// Returns true when anything changed (caller persists).
+    pub fn rekey_storage_locations(&mut self, locations: &[PathBuf]) -> bool {
+        let mut changed = false;
+        for t in self.torrents.values_mut() {
+            if locations.contains(&t.storage_location) {
+                continue;
+            }
+            if let Ok(canon) = t.storage_location.canonicalize() {
+                if locations.contains(&canon) && t.storage_location != canon {
+                    t.storage_location = canon;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let _ = self.save();
+        }
+        changed
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

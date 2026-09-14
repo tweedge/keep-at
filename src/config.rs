@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_PORT: u16 = 37550;
 pub const DEFAULT_AGGRESSIVENESS: f64 = 0.6;
 pub const DEFAULT_MIN_SEED_MARGIN: i32 = 2;
+/// Catalog collapse guard threshold (percent of held; see Config).
+pub const DEFAULT_CATALOG_COLLAPSE_PERCENT: u32 = 30;
 pub const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const DEFAULT_MODERATION_DELAY: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const DEFAULT_RATE_LIMIT_PER_SEC: f64 = 0.5;
@@ -190,6 +192,13 @@ pub struct Config {
     pub keyword_blocklist: Vec<String>,
     #[serde(default)]
     pub preserve_deleted_torrents: bool,
+    /// Catalog collapse guard (percent): refuse the removed-from-catalog
+    /// eviction pass when a fresh catalog lists fewer than this percent of
+    /// the held set - a mass deletion is far more likely a parse/schema
+    /// accident than reality, and that pass deletes downloaded data with the
+    /// state entries. 0 disables the guard; 100 is the strictest.
+    #[serde(default = "default_catalog_collapse_percent")]
+    pub catalog_collapse_percent: u32,
     /// 0 = use the 80%-of-system hard cap.
     #[serde(
         default,
@@ -231,6 +240,9 @@ fn default_port() -> u16 {
 }
 fn default_aggr() -> f64 {
     DEFAULT_AGGRESSIVENESS
+}
+fn default_catalog_collapse_percent() -> u32 {
+    DEFAULT_CATALOG_COLLAPSE_PERCENT
 }
 fn is_default_stats_interval(d: &Duration) -> bool {
     *d == DEFAULT_STATS_INTERVAL
@@ -286,6 +298,7 @@ impl Default for Config {
             aggressiveness: DEFAULT_AGGRESSIVENESS,
             keyword_blocklist: Vec::new(),
             preserve_deleted_torrents: false,
+            catalog_collapse_percent: DEFAULT_CATALOG_COLLAPSE_PERCENT,
             max_ram: 0,
             api_key: String::new(),
             upload_rate_limit: 0,
@@ -381,14 +394,20 @@ impl Config {
                 .with_context(|| format!("creating directory for {}", path.display()))?;
         }
         let mut out = header.to_string();
+        // Persist the key file FIRST: if its write fails (data dir full -
+        // keep-at fills disks by design - or read-only), the config on disk
+        // must still carry the inline secret so the key survives. Writing
+        // the keyless config first used to lose the key permanently on any
+        // key-file failure: config rewritten, key nowhere, node silently
+        // anonymous after reload.
+        if !self.api_key.is_empty() {
+            self.write_api_key_file()?;
+        }
         // Never serialize the key: it is not a config-file field anymore.
         let mut public = self.clone();
         public.api_key = String::new();
         out.push_str(&serde_yaml::to_string(&public).context("marshalling config")?);
         atomic_write_mode(path, out.as_bytes(), 0o644)?;
-        if !self.api_key.is_empty() {
-            self.write_api_key_file()?;
-        }
         Ok(())
     }
 
@@ -445,7 +464,11 @@ impl Config {
                 _ => {}
             }
             check_storage_limit(&loc.path, loc.limit)?;
-            if !seen.insert(loc.path.clone()) {
+            // Dedup on the best-effort canonical path: symlink aliases of
+            // one directory must count once (the authoritative alias check
+            // also runs in resolve_all_limits on the daemon path).
+            let key = loc.path.canonicalize().unwrap_or_else(|_| loc.path.clone());
+            if !seen.insert(key) {
                 bail!(
                     "storage location {} is listed more than once",
                     loc.path.display()
@@ -458,14 +481,24 @@ impl Config {
                 self.aggressiveness
             );
         }
+        if self.catalog_collapse_percent > 100 {
+            bail!(
+                "catalog_collapse_percent must be 0-100, got {}",
+                self.catalog_collapse_percent
+            );
+        }
         if self.scan.min_seed_margin < 0 {
             bail!("scan.min_seed_margin must not be negative");
         }
         if self.port == 0 {
             bail!("port {} is out of range", self.port);
         }
-        if self.scan.rate_limit_per_second <= 0.0 {
-            bail!("scan.rate_limit_per_second must be positive");
+        if self.scan.rate_limit_per_second.is_nan() || self.scan.rate_limit_per_second <= 0.0 {
+            // !(x > 0.0), not x <= 0.0: NaN compares false against both and
+            // would otherwise sail through validation into
+            // Duration::from_secs_f64(1.0/NaN), which panics - and the
+            // release profile is panic=abort, so that is a boot loop.
+            bail!("scan.rate_limit_per_second must be a positive finite number");
         }
         check_bandwidth_limit("max_ram", self.max_ram)?;
         check_bandwidth_limit("upload_rate_limit", self.upload_rate_limit)?;
@@ -536,27 +569,25 @@ pub fn atomic_write_mode(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Walk up from `dir`, ensuring every existing level is at least
-/// owner-rwx + group/other rx (0o755 masked in, never stripped), so a data
-/// dir created earlier under a restrictive umask (or by root's 077 default)
-/// still lets other users traverse to the world-readable snapshots inside.
-/// Stops at filesystem boundaries it can't change (errors ignored past the
-/// first failure — best effort, never fatal).
+/// Ensure the data-dir subtree is traversable: chmod `dir` itself to at
+/// least owner-rwx + group/other rx (0o755 masked in, never stripped), so a
+/// data dir created earlier under a restrictive umask (or by root's 077
+/// default) still lets other users reach the world-readable snapshots
+/// inside. Best effort, never fatal.
+///
+/// Deliberately scoped to the data dir ONLY: the previous version walked up
+/// to `/` OR-ing 0o755 into every owned ancestor, which silently widened
+/// private directories that merely happen to contain the data dir - a
+/// `--data-dir /home/alice/private/kat` turned `$HOME` itself
+/// world-traversable as a side effect of running `keep-at status`.
 pub fn ensure_shared_dirs(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        match std::fs::metadata(d) {
-            Ok(m) => {
-                let mode = m.permissions().mode() & 0o777;
-                let fixed = mode | 0o755;
-                if fixed != mode {
-                    let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(fixed));
-                }
-            }
-            Err(_) => break,
+    if let Ok(m) = std::fs::metadata(dir) {
+        let mode = m.permissions().mode() & 0o777;
+        let fixed = mode | 0o755;
+        if fixed != mode {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(fixed));
         }
-        cur = d.parent().filter(|p| !p.as_os_str().is_empty());
     }
 }
 

@@ -259,9 +259,12 @@ impl Writer {
 /// boundary. In-place on purpose: the daemon's stdout/stderr (dup2'd
 /// O_APPEND) and the forensics death-mark fd keep pointing at the live log,
 /// so renaming underneath them would silently strand future writes in the
-/// rotated file. A line written inside the read->truncate window can be
-/// lost; the check runs on the stats cadence, so that window is rare and
-/// the worst case is one old log line.
+/// rotated file. The write-then-truncate ordering keeps the tail intact
+/// across a crash mid-cap (at worst stale bytes past the new tail, trimmed
+/// by the next pass); a line appended by a concurrent O_APPEND writer
+/// inside the read->truncate window can be lost - the check runs on the
+/// stats cadence, so that window is rare and the worst case is one old log
+/// line.
 pub fn cap_text_file(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
     let len = std::fs::metadata(path)?.len();
     if len <= max_bytes {
@@ -277,9 +280,17 @@ pub fn cap_text_file(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
     f.read_to_end(&mut buf)?;
     // Resume at a line boundary so the capped log never starts mid-line.
     let cut = buf.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
-    f.set_len(0)?;
+    // Write the kept tail at offset 0 FIRST, then truncate to its length:
+    // the source region never overlaps the destination (keep <= len/2, so a
+    // forward copy cannot clobber unread source), so a kill between the
+    // write and the set_len leaves the tail intact with stale bytes past it
+    // that the next cap pass trims. The previous order (set_len(0) then
+    // write) erased the ENTIRE log - death marks and panic evidence
+    // included - at exactly the moment forensics matter.
     f.seek(std::io::SeekFrom::Start(0))?;
-    f.write_all(&buf[cut..])?;
+    let tail = &buf[cut..];
+    f.write_all(tail)?;
+    f.set_len(tail.len() as u64)?;
     let _ = f.sync_all();
     Ok(true)
 }
@@ -365,11 +376,12 @@ pub fn render(ev: &Event, color: bool) -> Vec<String> {
             } else {
                 "added     "
             };
+            let sanitized_title = crate::humanize::sanitize_title(title);
             let mut out = vec![paint(
                 color,
                 code,
                 format!(
-                    "{ts} {verb}{title} ({}, {} seeders) at {} — {}: {reason} \
+                    "{ts} {verb}{sanitized_title} ({}, {} seeders) at {} — {}: {reason} \
                      (chance {chance:.2}, roll {roll:.2}, seeder floor {seeder_floor}) [{}]",
                     crate::humanize::human_bytes(*size_bytes as i64),
                     seeders,
@@ -384,7 +396,7 @@ pub fn render(ev: &Event, color: bool) -> Vec<String> {
                     code,
                     format!(
                         "{ts}   displaced {} ({}, {} seeders) [{}]",
-                        d.title,
+                        crate::humanize::sanitize_title(&d.title),
                         crate::humanize::human_bytes(d.size_bytes as i64),
                         d.seeders,
                         &d.hash[..d.hash.len().min(8)],
@@ -404,11 +416,12 @@ pub fn render(ev: &Event, color: bool) -> Vec<String> {
             reason,
         } => {
             let ts = fmt_ts(ts);
+            let sanitized_title = crate::humanize::sanitize_title(title);
             vec![paint(
                 color,
                 RED,
                 format!(
-                    "{ts} dropped   {title} ({}, {} seeders) from {} — {}: {reason} [{}]",
+                    "{ts} dropped   {sanitized_title} ({}, {} seeders) from {} — {}: {reason} [{}]",
                     crate::humanize::human_bytes(*size_bytes as i64),
                     seeders,
                     location.display(),
@@ -469,32 +482,51 @@ pub fn cmd_history(args: &HistoryArgs) -> Result<()> {
         return Ok(());
     }
     let mut pos = complete_len as u64;
+    let mut last_id: Option<(u64, u64)> = None;
     loop {
-        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(pos);
-        if len > pos {
-            let mut f = std::fs::File::open(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            f.seek(std::io::SeekFrom::Start(pos))?;
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf).unwrap_or(0);
-            // Hold back a partial trailing line: only complete lines parse.
-            let complete = match buf.iter().rposition(|&b| b == b'\n') {
-                Some(i) => &buf[..=i],
-                None => &[][..],
-            };
-            for line in complete.split(|&b| b == b'\n') {
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(ev) = serde_json::from_slice::<Event>(line) {
-                    for out in render(&ev, color) {
-                        println!("{out}");
+        let meta = std::fs::metadata(&path).ok();
+        if let Some(m) = &meta {
+            use std::os::unix::fs::MetadataExt as _;
+            let id = (m.dev(), m.ino());
+            let len = m.len();
+            // tail -F semantics: Writer::rotate renames the live file and
+            // starts a fresh generation underneath a running follow (new
+            // inode), and any shrink - manual truncation, a cap - would
+            // trip the length check. The stale offset would otherwise stall
+            // until the new file regrows past it, then skip its first `pos`
+            // bytes. Reset to the new head instead.
+            if len < pos || last_id.is_some_and(|prev| prev != id) {
+                pos = 0;
+                println!("--- history rotated; following the new generation ---");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+            }
+            last_id = Some(id);
+            if len > pos {
+                let mut f = std::fs::File::open(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                f.seek(std::io::SeekFrom::Start(pos))?;
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf).unwrap_or(0);
+                // Hold back a partial trailing line: only complete lines parse.
+                let complete = match buf.iter().rposition(|&b| b == b'\n') {
+                    Some(i) => &buf[..=i],
+                    None => &[][..],
+                };
+                for line in complete.split(|&b| b == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(ev) = serde_json::from_slice::<Event>(line) {
+                        for out in render(&ev, color) {
+                            println!("{out}");
+                        }
                     }
                 }
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                pos += complete.len() as u64;
             }
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-            pos += complete.len() as u64;
         }
         std::thread::sleep(Duration::from_millis(500));
     }

@@ -147,6 +147,10 @@ pub struct ConfigArgs {
     /// Keep seeding a torrent even if Academic Torrents removes it
     #[arg(long, help_heading = "Selection")]
     pub preserve_deleted_torrents: Option<bool>,
+    /// Refuse removed-from-catalog eviction when a fresh catalog lists fewer
+    /// than this percent of held torrents (0 disables the guard)
+    #[arg(long, help_heading = "Selection")]
+    pub catalog_collapse_percent: Option<u32>,
     /// Max RAM to plan around, e.g. 1G (default: 80% of system RAM)
     #[arg(long, help_heading = "Limits")]
     pub max_ram: Option<String>,
@@ -252,6 +256,7 @@ impl ConfigArgs {
             || self.stall_eviction_timeout.is_some()
             || self.keyword_blocklist.is_some()
             || self.preserve_deleted_torrents.is_some()
+            || self.catalog_collapse_percent.is_some()
             || self.max_ram.is_some()
             || self.api_key.is_some()
             || self.upload_rate_limit.is_some()
@@ -291,6 +296,9 @@ impl ConfigArgs {
         }
         if let Some(v) = self.preserve_deleted_torrents {
             cfg.preserve_deleted_torrents = v;
+        }
+        if let Some(v) = self.catalog_collapse_percent {
+            cfg.catalog_collapse_percent = v;
         }
         if let Some(v) = &self.max_ram {
             let bytes = config::parse_byte_size(v).with_context(|| "--max-ram")?;
@@ -473,6 +481,12 @@ pub fn resolve_census(args: &NetworkStatusArgs) -> Result<Config> {
         cfg.api_key = k.clone();
     }
     if let Some(r) = args.rate_limit {
+        // The daemon config path validates this in Config::validate; census
+        // flags bypass that, so reject non-positive/NaN here (NaN would
+        // panic the probe limiter; <=0 silently disables AT politeness).
+        if r.is_nan() || r <= 0.0 {
+            bail!("--rate-limit must be a positive finite number, got {r}");
+        }
         cfg.scan.rate_limit_per_second = r;
     }
     Ok(cfg)

@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::config::{Config, StorageLimit, ALL_LIMIT_FRACTION};
 
@@ -105,6 +105,14 @@ pub fn device_total_bytes(path: &Path) -> Result<u64> {
 pub fn resolve_all_limits(cfg: &Config) -> Result<Config> {
     let mut out = cfg.clone();
     for loc in &mut out.storage {
+        // Canonicalize so duplicates of the same directory (symlink
+        // aliases) can never double-budget one physical location, and so
+        // accounting keys stay stable across config spelling changes.
+        // Nonexistent locations stay as spelled - they are created right
+        // after, before any accounting happens.
+        if let Ok(canon) = loc.path.canonicalize() {
+            loc.path = canon;
+        }
         if loc.limit == StorageLimit::All {
             let total = device_total_bytes(&loc.path).with_context(|| {
                 format!(
@@ -117,6 +125,15 @@ pub fn resolve_all_limits(cfg: &Config) -> Result<Config> {
                 "resolved `limit: max` for {} to {}",
                 loc.path.display(),
                 crate::humanize::human_bytes(loc.limit_bytes() as i64),
+            );
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for loc in &out.storage {
+        if !seen.insert(loc.path.clone()) {
+            bail!(
+                "storage location {} is listed more than once (aliases of the same directory count once)",
+                loc.path.display()
             );
         }
     }

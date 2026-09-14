@@ -68,27 +68,45 @@ pub fn cmd_logs(args: &crate::cli::LogsArgs) -> Result<()> {
     // land. Partial trailing lines are carried to the next poll (a line is
     // complete only once it ends with \n).
     let mut pos = print_tail(&path, args.lines)?;
+    let mut last_id: Option<(u64, u64)> = None;
     loop {
-        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(pos);
-        if len > pos {
-            let mut f = std::fs::File::open(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            use std::io::Seek;
-            f.seek(std::io::SeekFrom::Start(pos))?;
-            let mut buf = String::new();
-            f.read_to_string(&mut buf).unwrap_or(0);
-            // Hold back a partial trailing line: only print up to the last \n.
-            let emit = match buf.rfind('\n') {
-                Some(i) => &buf[..=i],
-                None => "",
-            };
-            if !emit.is_empty() {
+        let meta = std::fs::metadata(&path).ok();
+        if let Some(m) = &meta {
+            use std::os::unix::fs::MetadataExt as _;
+            let id = (m.dev(), m.ino());
+            let len = m.len();
+            // tail -F semantics: the file shrank underneath us (the 0.8.24
+            // log cap rewrites keep-at.log in place; an operator truncated
+            // it) or was replaced (fresh boot that recreated the file).
+            // Reset to the new head instead of silently stalling until the
+            // file regrows past the stale offset and then skipping content.
+            if len < pos || last_id.is_some_and(|prev| prev != id) {
+                pos = 0;
+                println!("--- log truncated; following from the top ---");
                 use std::io::Write;
-                print!("{emit}");
-                std::io::stdout().flush().context("flushing log output")?;
+                std::io::stdout().flush().ok();
             }
-            let consumed = if emit.is_empty() { 0 } else { emit.len() };
-            pos += consumed as u64;
+            last_id = Some(id);
+            if len > pos {
+                let mut f = std::fs::File::open(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                use std::io::Seek;
+                f.seek(std::io::SeekFrom::Start(pos))?;
+                let mut buf = String::new();
+                f.read_to_string(&mut buf).unwrap_or(0);
+                // Hold back a partial trailing line: only print up to the last \n.
+                let emit = match buf.rfind('\n') {
+                    Some(i) => &buf[..=i],
+                    None => "",
+                };
+                if !emit.is_empty() {
+                    use std::io::Write;
+                    print!("{emit}");
+                    std::io::stdout().flush().context("flushing log output")?;
+                }
+                let consumed = if emit.is_empty() { 0 } else { emit.len() };
+                pos += consumed as u64;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }

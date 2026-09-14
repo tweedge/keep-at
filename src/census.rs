@@ -214,7 +214,9 @@ impl RateState {
         }
     }
     async fn wait(&mut self) {
-        if self.per_second <= 0.0 {
+        // Same defensive predicate as the engine limiter: NaN must never
+        // reach Duration::from_secs_f64 (panic=abort in release).
+        if self.per_second.is_nan() || self.per_second <= 0.0 {
             return;
         }
         let now = tokio::time::Instant::now();
@@ -383,4 +385,28 @@ fn keep_at_peers(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    /// A NaN rate limit used to panic RateState::wait
+    /// (Duration::from_secs_f64(1.0/NaN)); the defensive predicate keeps it
+    /// a no-op. Non-positive remains fail-open inside the limiter (the
+    /// CLI/config entry points reject it - see resolve_census/validate).
+    #[tokio::test]
+    async fn rate_state_wait_does_not_panic_on_nan() {
+        let mut rs = RateState::new(f64::NAN);
+        let res = tokio::spawn(async move { rs.wait().await }).await;
+        assert!(res.is_ok(), "wait must not panic on NaN: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn rate_state_negative_fails_open() {
+        let mut rs = RateState::new(-1.0);
+        let armed = rs.next_allowed;
+        rs.wait().await;
+        assert_eq!(armed, rs.next_allowed, "non-positive rate: limiter off");
+    }
 }

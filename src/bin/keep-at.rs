@@ -477,13 +477,18 @@ async fn cmd_self_update(beta: bool) -> Result<()> {
         println!("keep-at is already up to date ({current})");
         return Ok(());
     }
-    // Never "update" sideways or backwards: the stable channel resolves
-    // to the latest STABLE (x.y), which can lag a running beta (e.g.
-    // running 0.9.1-beta while stable is 0.9). Suggest --beta instead of
-    // downloading an older binary over a newer one.
-    if !beta && version_older_or_equal(&latest, current) {
+    // Never "update" sideways or backwards - on EITHER channel: GitHub's
+    // release list is ordered by created_at, not version, so a re-published
+    // older release (this project re-tags for md5-verified promotions) is
+    // "newest" by list position, and the stable channel can legitimately
+    // lag a running beta (e.g. running 0.9.1-beta while stable is 0.9).
+    // Suggest --beta instead of downloading an older binary over a newer
+    // one. The guard never blocks a genuine upgrade: 0.9 -> 0.9.1-beta
+    // compares newer.
+    if version_older_or_equal(&latest, current) {
         println!(
-            "latest stable is {latest}, but this binary is {current} (newer). Nothing to do — pass --beta to track prereleases."
+            "latest {channel} release is {latest}, but this binary is {current} (newer). Nothing to do.",
+            channel = if beta { "beta" } else { "stable" }
         );
         return Ok(());
     }

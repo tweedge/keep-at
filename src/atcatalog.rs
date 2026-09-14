@@ -75,7 +75,7 @@ pub fn parse(data: &[u8]) -> Result<Catalog> {
             _ => continue,
         };
         items.push(Item {
-            title: raw.title,
+            title: crate::humanize::sanitize_title(&raw.title),
             category: raw.category,
             info_hash: hash,
             guid: raw.guid,

@@ -4,7 +4,6 @@
 
 use anyhow::{Context, Result};
 
-pub static RELEASES_URL: &str = "https://api.github.com/repos/tweedge/keep-at/releases/latest";
 pub static RELEASES_LIST_URL: &str = "https://api.github.com/repos/tweedge/keep-at/releases";
 
 #[derive(Debug, serde::Deserialize)]
@@ -22,27 +21,8 @@ struct Asset {
     browser_download_url: String,
 }
 
-fn releases_url() -> String {
-    std::env::var("KEEPAT_RELEASES_URL").unwrap_or_else(|_| RELEASES_URL.to_string())
-}
-
 fn releases_list_url() -> String {
     std::env::var("KEEPAT_RELEASES_LIST_URL").unwrap_or_else(|_| RELEASES_LIST_URL.to_string())
-}
-
-async fn fetch_release(client: &reqwest::Client, user_agent: &str, url: &str) -> Result<Release> {
-    let resp = client
-        .get(url)
-        .header("User-Agent", user_agent)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("fetching {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("fetching {url} returned {status}");
-    }
-    resp.json().await.context("parsing release metadata")
 }
 
 /// Versioning scheme: stable releases are `x.y` (two components, e.g.
@@ -97,9 +77,19 @@ async fn fetch_latest(
     user_agent: &str,
     include_beta: bool,
 ) -> Result<Release> {
-    if !include_beta {
-        return fetch_release(client, user_agent, &releases_url()).await;
-    }
+    let want = if include_beta {
+        Channel::Beta
+    } else {
+        Channel::Stable
+    };
+    // Both channels resolve through the list endpoint with an explicit
+    // tag-shape filter. The old stable path trusted /releases/latest
+    // directly - whatever GitHub serves as "latest non-draft, non-prerelease"
+    // gets installed, so a mis-shaped release (a bare x.y.z published
+    // without the prerelease flag, or a legacy -beta published non-prerelease)
+    // crossed channels, and list order is created_at, not version, which
+    // made a re-published older beta a downgrade candidate on the beta
+    // channel too.
     let resp = client
         .get(releases_list_url())
         .header("User-Agent", user_agent)
@@ -112,16 +102,20 @@ async fn fetch_latest(
         anyhow::bail!("fetching releases returned {status}");
     }
     let releases: Vec<Release> = resp.json().await.context("parsing release metadata")?;
-    // Beta channel: newest release whose tag classifies as beta. The
-    // releases API returns newest-first, so the first beta-classified,
-    // non-draft release wins. (Drafts excluded; GitHub prerelease flags
-    // ignored — the tag shape is the source of truth, so a mis-flagged
-    // release can't cross channels.)
+    // Newest release whose tag classifies into the requested channel. The
+    // releases API returns newest-first, so the first match wins. (Drafts
+    // excluded; GitHub prerelease flags ignored — the tag shape is the
+    // source of truth, so a mis-flagged release can't cross channels.)
     releases
         .into_iter()
         .filter(|r| !r.draft)
-        .find(|r| channel_of(&r.tag_name) == Some(Channel::Beta))
-        .context("no beta releases found")
+        .find(|r| channel_of(&r.tag_name) == Some(want))
+        .with_context(|| {
+            format!(
+                "no {} releases found",
+                if include_beta { "beta" } else { "stable" }
+            )
+        })
 }
 
 pub async fn latest_version(

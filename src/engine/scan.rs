@@ -112,7 +112,10 @@ struct RateLimiter {
 
 impl RateLimiter {
     async fn wait(&mut self) {
-        if self.per_second <= 0.0 {
+        // Defensive: validate() rejects non-positive/NaN, but a panic here
+        // (from_secs_f64 on NaN) is abort-in-release, so never do the math
+        // on a rate that is not a positive finite number.
+        if self.per_second.is_nan() || self.per_second <= 0.0 {
             return;
         }
         let now = tokio::time::Instant::now();
@@ -555,7 +558,14 @@ impl Engine {
                 .with_context(|| format!("creating storage {}", loc.path.display()))?;
         }
 
-        let state = State::load(&cfg.data_dir.join("state.json"))?;
+        let mut state = State::load(&cfg.data_dir.join("state.json"))?;
+        // Storage locations are canonicalized in resolve_all_limits; re-key
+        // legacy state entries spelled under an old config spelling or
+        // symlink so accounting matches the configured locations.
+        let locations: Vec<PathBuf> = cfg.storage.iter().map(|l| l.path.clone()).collect();
+        if state.rekey_storage_locations(&locations) {
+            tracing::info!("re-keyed held torrents to canonical storage locations");
+        }
         let swarm_cache =
             SwarmCache::load(&cfg.data_dir.join("scrape-cache.json"), cfg.scan.interval);
 
@@ -673,14 +683,13 @@ impl Engine {
         self.cfg.data_dir.join("network-stats.json")
     }
 
-    /// Build the live-query push handle from current state and spawn the
-    /// socket server. Idempotent: a second call replaces the handle and
-    /// re-binds (the old server task exits when its listener is gone —
-    /// actually it keeps serving the same handle contents; rebinding fails
-    /// Fallback socket startup for direct `run()` calls without an attached
-    /// booting handle (tests): creates a live handle from the existing
-    /// session and serves. The production path binds earlier via
-    /// `attach_live` (see cmd_run) so the socket exists during boot.
+    /// Fallback socket startup for engines with no attached handle (direct
+    /// `run()` in tests): builds a live handle from the existing session and
+    /// serves it. The production path binds earlier via `attach_live` (see
+    /// cmd_run) so the socket exists during boot; call
+    /// [`Engine::ensure_live_server`](Self::ensure_live_server) instead of
+    /// this in `run()` - an unconditional start here would overwrite the
+    /// attached handle with one that can never bind the socket.
     fn start_live_server(&mut self) {
         let handle = self.test_live_handle();
         self.live = Some(handle.clone());
@@ -688,6 +697,24 @@ impl Engine {
         tokio::spawn(async move {
             crate::live::serve(data_dir, handle).await;
         });
+    }
+
+    /// `run()`'s live-socket startup step: keep the handle attached by
+    /// cmd_run (already bound and serving the booting view), and only fall
+    /// back to a self-made server when nothing is attached.
+    ///
+    /// The fallback used to run unconditionally, overwriting `self.live`
+    /// with a fresh handle whose server can never bind the socket (the
+    /// attached one owns it). Every later state push landed on that dead
+    /// handle, so the served held snapshot froze at boot state forever:
+    /// observed on a 0.8.23 node as held stuck at 693 while state.json and
+    /// the session had grown to 823 (the session-derived seeding/downloading
+    /// counters stayed live because the attached handle shares the session).
+    pub fn ensure_live_server(&mut self) {
+        if self.live.is_some() {
+            return;
+        }
+        self.start_live_server();
     }
 
     /// Attach the booting-phase live handle created by cmd_run and promote
@@ -729,7 +756,7 @@ impl Engine {
     /// socket (`status`/`hosted-torrents` read here, not stale files) before
     /// the first scan; state pushes after every mutation keep it current.
     pub async fn run(&mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
-        self.start_live_server();
+        self.ensure_live_server();
         self.log_and_save_runtime("startup");
 
         // Periodic runtime stats tick on their own interval. The ticker is
@@ -869,7 +896,32 @@ impl Engine {
         let held = self.state.all();
         let held_hashes: HashSet<String> = held.iter().map(|h| h.info_hash.clone()).collect();
 
-        self.remove_deleted_torrents(&held, &catalog_hashes).await;
+        // Catalog collapse guard: a fresh fetch that parses but lists far
+        // fewer items than we hold is a parse/schema accident (e.g. AT
+        // renaming the infohash field silently skips every row), not a mass
+        // deletion - and the eviction pass below deletes downloaded data
+        // along with each state entry. Refuse it unless the fresh catalog
+        // lists at least catalog_collapse_percent% of the held set
+        // (default 30; 0 disables, 100 is strictest). If a collapse is real,
+        // raise the percent or set preserve_deleted_torrents - see
+        // docs/RECOVERY.md for recovery after a wipe.
+        let collapse = !held.is_empty()
+            && self.cfg.catalog_collapse_percent > 0
+            && catalog_hashes.len()
+                < (held.len() * self.cfg.catalog_collapse_percent as usize / 100).max(1);
+        if collapse {
+            tracing::warn!(
+                "catalog collapse guard: fresh catalog lists {} items but {} torrents are held \
+                 (catalog_collapse_percent={}) - skipping removed-from-catalog eviction this scan; \
+                 if the collapse is real, raise --catalog-collapse-percent (0 disables the guard) \
+                 or set preserve_deleted_torrents - see docs/RECOVERY.md",
+                catalog_hashes.len(),
+                held.len(),
+                self.cfg.catalog_collapse_percent,
+            );
+        } else {
+            self.remove_deleted_torrents(&held, &catalog_hashes).await;
+        }
         self.refresh_held_seeder_counts(&shutdown).await;
         if *shutdown.borrow() {
             anyhow::bail!("scan interrupted by shutdown");
@@ -1418,6 +1470,17 @@ impl Engine {
             );
         }
 
+        // DESIGN.md: "candidates that lose the [seed-scarcity] roll are
+        // skipped entirely." The fill path already drew the roll; falling
+        // through to the swap path would hand the candidate a fresh roll per
+        // storage location (P(admit) = 1-(1-p)^k), so a roll-rejected
+        // candidate could displace strictly better-seeded held torrents even
+        // with free space plentiful - swap exists for space/RAM pressure,
+        // gated by margin, not as a scarcity-roll retry.
+        if decision.seed_scarcity_blocked() {
+            return;
+        }
+
         let (swapped, d) = self
             .try_swap(
                 &c,
@@ -1610,6 +1673,37 @@ impl Engine {
                 self.size_bias,
             );
             let Some(displaced) = displaced else { continue };
+            // Device-level gate: displacement frees only what the displaced
+            // torrents ACTUALLY occupy on disk (a sparse held torrent frees
+            // ~nothing), while the candidate writes its full footprint. The
+            // nominal checks above know nothing about the device; without
+            // this gate a full device admits a swap candidate that provably
+            // cannot finish (its writes hit ENOSPC, which fatals the
+            // torrent) - trading a live torrent for one that can't seed.
+            let freed_actual: u64 = displaced
+                .iter()
+                .map(|h| {
+                    storage::dir_size_bytes(&engtorrents::torrent_output_dir(
+                        &h.storage_location,
+                        &h.info_hash,
+                    ))
+                })
+                .sum();
+            let size_needed = self.size_needed(size_bytes);
+            if let Some(reason) = device_gate_reason(
+                storage::device_free_bytes(&location).ok(),
+                freed_actual,
+                size_needed,
+            ) {
+                tracing::warn!("swap skipped: {} (title={})", reason, c.title,);
+                last = selector::SwapDecision {
+                    should_swap: false,
+                    chance: 0.0,
+                    roll: 0.0,
+                    reason,
+                };
+                continue;
+            }
             let sel_held: Vec<Held> = displaced
                 .iter()
                 .map(|h| Held {
@@ -2191,9 +2285,101 @@ struct StoredCache {
     entries: HashMap<String, StoredEntry>,
 }
 
+/// Device-level swap gate: `None` admits, `Some(reason)` blocks. Device
+/// free after displacement (the ACTUAL bytes the displaced torrents
+/// occupied) must cover the candidate's full need - sparse displacement
+/// frees almost nothing real. A missing device-free reading (statvfs
+/// failure) admits: the nominal per-location checks still apply, and
+/// refusing every swap on a statfs hiccup would stall the node.
+fn device_gate_reason(
+    dev_free: Option<u64>,
+    freed_actual: u64,
+    size_needed: u64,
+) -> Option<String> {
+    let dev_free = dev_free?;
+    let after = dev_free.saturating_add(freed_actual);
+    if after < size_needed {
+        Some(format!(
+            "device free space after displacement ({}) is below the candidate's need ({}) - displaced torrents were sparse",
+            crate::humanize::human_bytes(after as i64),
+            crate::humanize::human_bytes(size_needed as i64),
+        ))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StoredEntry {
     seeders: u32,
     leechers: u32,
     at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod device_gate_tests {
+    use super::device_gate_reason;
+
+    #[test]
+    fn blocks_when_device_free_after_displacement_cannot_fit_candidate() {
+        // Sparse displaced torrent: freed actual ~0, device nearly full.
+        let r = device_gate_reason(Some(1_000_000), 0, 60_262_144);
+        assert!(r.is_some(), "gate must block: {r:?}");
+    }
+
+    #[test]
+    fn admits_when_displacement_frees_enough_real_space() {
+        assert!(device_gate_reason(Some(1_000_000), 100_000_000, 60_262_144).is_none());
+        assert!(device_gate_reason(Some(60_262_144), 0, 60_262_144).is_none());
+    }
+
+    #[test]
+    fn admits_on_missing_device_free_reading() {
+        assert!(device_gate_reason(None, 0, 60_262_144).is_none());
+    }
+
+    #[test]
+    fn saturates_instead_of_overflowing() {
+        assert!(
+            device_gate_reason(Some(u64::MAX), u64::MAX, 1).is_none(),
+            "saturating add must not wrap to a small number"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    /// A NaN rate limit used to panic RateLimiter::wait
+    /// (Duration::from_secs_f64(1.0/NaN); panic=abort in release). The
+    /// defensive predicate must keep it a no-op instead.
+    #[tokio::test]
+    async fn rate_limiter_wait_does_not_panic_on_nan() {
+        let mut rl = RateLimiter {
+            per_second: f64::NAN,
+            next_allowed: tokio::time::Instant::now(),
+        };
+        let res = tokio::spawn(async move { rl.wait().await }).await;
+        assert!(res.is_ok(), "wait must not panic on NaN: {res:?}");
+    }
+
+    #[test]
+    fn validate_rejects_nan_rate_limit() {
+        let scan: crate::config::ScanConfig =
+            serde_yaml::from_str("rate_limit_per_second: .nan").unwrap();
+        assert!(scan.rate_limit_per_second.is_nan());
+        let cfg = crate::config::Config {
+            storage: vec![crate::config::StorageLocation {
+                path: "/tmp/keep-at-nan-check".into(),
+                limit: crate::config::StorageLimit::Bytes(1 << 30),
+            }],
+            scan,
+            ..crate::config::Config::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "NaN rate_limit_per_second must fail validation"
+        );
+    }
 }

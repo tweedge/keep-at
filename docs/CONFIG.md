@@ -94,6 +94,10 @@ From the CLI, pass a comma-separated list: `--keyword-blocklist confidential,dra
 
 *Default: `false`.* If Academic Torrents removes a torrent keep-at is seeding, keep-at removes its local copy too by default, on the theory that a takedown probably happened for a reason. Set this to `true` to keep seeding removed torrents anyway.
 
+### `catalog_collapse_percent` / `--catalog-collapse-percent`
+
+*Default: `30`.* Safety guard for the removal pass above: if a freshly fetched catalog parses cleanly but lists fewer than this percent of the torrents you hold, keep-at refuses to run removals that scan (a mass deletion is far more likely a parse/schema accident on the catalog side than real). The scan logs a `catalog collapse guard` warning when this happens and keeps everything seeded. `0` disables the guard, `100` demands the catalog list every held torrent before any removal. If the collapse is real and you have verified it on academictorrents.com, raise the percent (or use `--preserve-deleted-torrents`). See [RECOVERY.md](RECOVERY.md) for recovery after a wipe.
+
 ## Memory
 
 ### `max_ram` / `--max-ram`
