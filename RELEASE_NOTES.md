@@ -1,5 +1,57 @@
 # keep-at release notes
 
+## v0.8.25-beta - adversarial-review fix wave: data-loss guard, follow loops, persistence, updater, socket hardening
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag. Every fix below was found by an adversarial review pass and pinned with a regression test before the fix landed.
+
+### Catalog collapse guard: one bad fetch can no longer wipe the library
+
+The removal pass deletes every held torrent (and its files) that the fresh Academic Torrents catalog no longer lists. That trusted the catalog response completely: a parse/schema accident on the catalog side (e.g. a renamed field silently skipping every row) would produce a clean, empty catalog and wipe the whole library in one scan - found by two independent reviewers. The removal pass is now refused when a fresh catalog lists fewer than 30% (default) of the held set; the scan logs a `catalog collapse guard` warning and keeps everything seeded. The threshold is tunable via `--catalog-collapse-percent` (0 disables, 100 is strictest), and docs/RECOVERY.md documents tuning plus manual recovery after a wipe (the `history.jsonl` ledger is the recovery record).
+
+### `logs --follow` and `history` no longer stall after truncation/rotation
+
+The follow loops used a stale byte offset: when the log cap truncated the log in place, or history rotated at 5 MB, the follower stalled until the file regrew past the old offset and then skipped everything written before it. Both now use tail -F semantics (shrink and inode-change detection) and keep streaming.
+
+### Seed-scarcity roll: losing it really means losing it
+
+A candidate that lost its seed-scarcity roll on the fill path could get a fresh roll per storage location through the swap path (P(admit) = 1-(1-p)^k), letting it displace strictly better-seeded held torrents with free space plentiful - against the documented design. Roll-rejected candidates are now skipped entirely.
+
+### Privacy: read-only commands no longer chmod your home directory
+
+`ensure_shared_dirs` walked up to `/` OR-ing 0755 into every owned ancestor, so a `--data-dir /home/alice/private/kat` turned `$HOME` itself world-traversable as a side effect of `keep-at status`. The repair is now scoped to the data dir only.
+
+### API key survives a failed config save
+
+`Config::save` wrote the keyless config before persisting the key file - a disk-full or permission failure in between lost the key permanently (node silently drops to anonymous). The key file is written first; a failed save is now non-destructive and retryable.
+
+### Storage locations are canonicalized
+
+Locations were identified by raw path spelling: symlink aliases of one directory double-budgeted it (two 110 MB budgets over one physical dir), and a config relocation orphaned state entries (accounting under-counted, free space over-reported, node re-filled on top). Locations are canonicalized and deduped at resolution; legacy state entries are re-keyed at boot.
+
+### Self-update: channel integrity + no downgrades
+
+The stable channel trusted GitHub's `/releases/latest` blind - a mis-shaped release published without the prerelease flag would be installed by stable users. Both channels now filter releases through the tag-shape rule, and the downgrade guard applies on the beta channel too (GitHub's release list is created_at-ordered, so a re-published older beta is "newest" by position and must not overwrite a newer binary).
+
+### Log cap is crash-safe
+
+The in-place cap truncated the log *before* rewriting the kept tail - a kill in that window erased the entire log, death marks included, at exactly the moment forensics matter. The kept tail is now written first and the truncate happens last.
+
+### Terminal injection: remote titles are sanitized
+
+Torrent titles come from any Academic Torrents registrant. ANSI escapes, OSC sequences, and newlines in a title printed raw through `hosted-torrents` and `history` - a remote attacker could rewrite your terminal title, clear the screen, or inject fake output rows. Titles are sanitized at ingest and on render.
+
+### Swap no longer trades a live torrent for one that cannot finish
+
+Displacement freed only *nominal* space; a sparse held torrent frees ~0 real bytes, so the swapped-in candidate could immediately hit ENOSPC and die while the displaced torrent was already gone. The swap path now gates on actual device free space after displacement (what the displaced torrents really occupied) against the candidate's full footprint.
+
+### NaN rate limits can no longer crash-loop the daemon
+
+A NaN `rate_limit_per_second` (YAML `.nan`) passed validation and panicked the politeness limiter on the first scrape - `panic = "abort"` in release, so the watchdog restarted into the same crash loop. Validation now rejects non-finite/non-positive values and both limiters are defensive; the census `--rate-limit` flag (which bypassed daemon validation) is validated too.
+
+### Query socket: bounded memory and bounded connections
+
+The query socket is world-writable, and an unbounded request read let a local user balloon the daemon's heap without limit (a unix socket sustains GB/s - the timeout bounds a stalled client, not a writing one); silent connections also pinned one fd each with no cap. Request lines are capped at 64 KiB (dropped unread) and concurrent queries at 32 (over capacity drops immediately; recovery after a flood verified).
+
 ## v0.8.24-beta - holdings history (`keep-at history`), size-capped logs, read-only config loads
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
