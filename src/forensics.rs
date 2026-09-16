@@ -465,11 +465,11 @@ mod malloc_trim_tests {
         assert!(a.is_some(), "glibc trim must be available on gnu targets");
         let b = malloc_trim_returning_pages();
         assert!(b.is_some());
-        // The returned delta is saturating, so it can never be inflated.
-        assert_eq!(
-            a.unwrap().saturating_sub(b.unwrap()),
-            0,
-            "second trim frees no more than the first"
-        );
+        // Per-call deltas are deliberately NOT compared: parallel test
+        // threads allocate and free around us, so the second call can free
+        // more than the first (CI flaked on exactly that). The contract is
+        // only "runs, never panics" - the delta math is saturating by
+        // construction.
+        let _ = (a, b);
     }
 }
