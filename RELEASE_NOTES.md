@@ -1,5 +1,15 @@
 # keep-at release notes
 
+## v0.8.26-beta - hourly `malloc_trim`: RSS now tracks the live working set
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+### Memory: hourly `malloc_trim` returns retained allocator memory to the OS
+
+Diagnosed on a live node: a keep-at daemon seeded 165 torrents with **zero active peers**, yet resident memory sat at 2.1x its configured RAM budget (16.7 GiB against 8 GiB) and climbed ~600 MiB/h with no plateau. The memory was not live data - `/proc/<pid>/maps` showed the classic glibc malloc pattern: **165 x exactly-64-MB per-thread arena heaps (10.5 GiB retained)** and only a 147 MB main heap. On a many-core host, glibc binds each of the daemon's ~200 threads to its own arena and retains freed pages in 64 MB segments (it only ever returns top-of-heap memory), so resident memory is the *sum of every arena's historical high-water mark* and only ratchets upward as scan/check/peer bursts warm more arenas - worst case 576 arenas x 64 MB on a 72-core host. The RAM budget model anticipated ~1.9x fragmentation, but this overshoot is unbounded.
+
+Every heartbeat now runs `malloc_trim(0)` hourly (glibc targets): the trim walks every arena and madvises free pages back to the OS, so resident memory tracks the **live working set** instead of the historical high-water mark, and the log records how much each trim returned (`malloc_trim returned ~N M of retained arena memory`). Non-glibc targets skip it. The heartbeat's existing per-minute RSS/cgroup logging makes the effect directly observable.
+
 ## v0.8.25-beta - adversarial-review fix wave: data-loss guard, follow loops, persistence, updater, socket hardening
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag. Every fix below was found by an adversarial review pass and pinned with a regression test before the fix landed.

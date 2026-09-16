@@ -1,6 +1,6 @@
 [package]
 name = "keep-at"
-version = "0.8.25"
+version = "0.8.26"
 edition = "2021"
 description = "A smart node that seeds Academic Torrents"
 license = "MIT"
@@ -22,6 +22,7 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"
+libc = "0.2"
 hex = "0.4"
 humantime = "2"
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls", "http-api-client"] }
