@@ -62,7 +62,7 @@ Read-only operations are readable by every local user: `status` and `hosted-torr
 
 ### `scan.min_seed_margin` / `--min-seed-margin`
 
-*Default: `2`.* How many fewer seeds a candidate torrent needs, relative to each held torrent it would displace (or the least-seeded of a displaced set), before keep-at will displace it to make room. Higher values make keep-at more conservative about swapping; `0` means any strictly-lower seed count qualifies. This is the swap-specific guard on top of the global seed-scarcity gate - see DESIGN.md's "Seeding minimally-seeded torrents" section for how the two interact.
+*Default: `4`.* How many fewer seeds a candidate torrent needs, relative to each held torrent it would displace (or the least-seeded of a displaced set), before keep-at will displace it to make room. Higher values make keep-at more conservative about swapping; `0` means any strictly-lower seed count qualifies. This is the swap-specific guard on top of the global seed-scarcity gate - see DESIGN.md's "Seeding minimally-seeded torrents" section for how the two interact.
 
 ### `scan.moderation_delay` / `--moderation-delay`
 
