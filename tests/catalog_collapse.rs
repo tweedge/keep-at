@@ -11,6 +11,16 @@ use std::sync::{Arc, Mutex};
 
 use common::{test_config, test_options, test_port, with_timeout, Fixture, Stub, StubState};
 
+/// The two tests below each build a real Engine, and the production session
+/// options keep rqbit's DHT enabled with persistence (default): both DHT
+/// instances bind the same persisted UDP port and read/write the same
+/// `~/.cache/com.rqbit.dht/dht.json`. Run concurrently (the default within
+/// one test binary) that races: observed as a ~1-in-5 full-suite failure of
+/// these tests with corrupted shared DHT state. Serializing just this file
+/// removes the race without serializing the whole suite.
+static DHT_STATE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 fn data_files_recursive(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -83,6 +93,7 @@ async fn hold_one_fixture(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_catalog_response_preserves_held_library() {
+    let _dht_guard = DHT_STATE.lock().await;
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let data_dir = tempfile::tempdir().unwrap().keep();
     let storage_dir = tempfile::tempdir().unwrap().keep();
@@ -144,6 +155,7 @@ async fn empty_catalog_response_preserves_held_library() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn collapse_guard_zero_disables_and_removal_proceeds() {
+    let _dht_guard = DHT_STATE.lock().await;
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let data_dir = tempfile::tempdir().unwrap().keep();
     let storage_dir = tempfile::tempdir().unwrap().keep();
