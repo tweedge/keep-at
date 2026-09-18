@@ -1,3 +1,4 @@
+pub mod allocator;
 pub mod atcatalog;
 pub mod atkey;
 pub mod attorrent;

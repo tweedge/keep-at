@@ -14,6 +14,9 @@
 # plus the matching C cross-compilers for the non-native targets:
 #   sudo apt-get install -y gcc-aarch64-linux-gnu \
 #     gcc-arm-linux-gnueabihf gcc-i686-linux-gnu
+# plus make and a C compiler for the native target (vendored jemalloc in
+# tikv-jemalloc-sys runs its own configure+make per target; autoconf is NOT
+# needed - the configure script ships pre-generated with the crate).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -21,6 +24,11 @@ cd "$(dirname "$0")/.."
 OUT_DIR="${OUT_DIR:-dist}"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
+
+command -v make >/dev/null || {
+  echo "make is required (vendored jemalloc builds with configure+make)" >&2
+  exit 1
+}
 
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 

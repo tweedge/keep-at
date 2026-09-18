@@ -6,6 +6,18 @@ use clap::Parser;
 use keep_at::cli::{self, Cli, Command};
 use keep_at::config::Config;
 
+// Process allocator: jemalloc on Linux gnu targets (the targets the
+// release builds and Docker run), system allocator elsewhere. Lives in the
+// binary crate, not the library: a library-level allocator would apply to
+// every crate linking keep_at (test harnesses, every subcommand process)
+// and would compile-error any consumer that wants its own. Configuration
+// and the startup log line live in keep_at::allocator; jemalloc's default
+// dirty decay (10s, sigmoidal, background-purged) returns freed pages to
+// the OS continuously - no glibc arena ratchet, no hourly trim.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn init_logging(debug: bool) {
     init_logging_to(debug, None);
 }
@@ -227,6 +239,12 @@ async fn cmd_run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
     redirect_stdio_to(&log_path);
     keep_at::forensics::install_signal_death_marks(&log_path);
     keep_at::forensics::install_panic_hook(&log_path);
+    // Configure the process allocator (jemalloc on Linux gnu targets) and
+    // log the result. AFTER the stdio redirect so the line lands in
+    // keep-at.log on every launch mode (flag-run, systemd, start-spawned,
+    // container), and before Engine::new so the heavy startup allocations
+    // already run under the final configuration.
+    keep_at::allocator::init();
     keep_at::forensics::heartbeat_task(cfg.data_dir.clone(), std::time::Instant::now());
     // Debug knob: KEEPAT_DEBUG_PANIC=1 schedules an intentional panic in a
     // background thread 20s after boot. Used to measure death handling

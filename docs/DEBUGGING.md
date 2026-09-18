@@ -33,6 +33,16 @@ means every crash class is visible in the log.
 write can ever hit a closed reader (the historical silent-SIGPIPE death —
 fixed in 0.8.15). Panic output lands in the log file.
 
+**Allocator line.** At boot the daemon logs one allocator line, e.g.
+`allocator: jemalloc (background purging on, dirty decay 10000ms)` on Linux
+gnu targets (background purging verified by read-back) or a WARN variant
+(`background purging NOT running`) if enabling failed — freed pages then
+return to the OS only lazily and that warning is actionable. Since 0.8.27
+there is no hourly `malloc_trim` line anymore; the allocator line plus the
+heartbeat's `rss=` line are the memory-health signals. `MALLOC_CONF`
+environment tuning (decay times, arena count) is honored by the daemon from
+process start; `MALLOC_ARENA_MAX` is inert under jemalloc.
+
 ## Post-mortem
 
 ```

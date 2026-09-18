@@ -22,8 +22,8 @@
 //! 2. [`heartbeat_task`]: every 60s, one compact log line + an atomically
 //!    replaced `heartbeat.json` recording RSS, cgroup memory state (usage,
 //!    limit, oom_kill counter - readable post-mortem even after SIGKILL),
-//!    open fd count, peer count, uptime. The heartbeat's last timestamp
-//!    brackets the death minute.
+//!    open fd count, uptime. The heartbeat's last timestamp brackets the
+//!    death minute.
 //! 3. Watchdog integration (`forensics_on_death`): when the watchdog finds
 //!    the daemon dead, it appends the cgroup `memory.events` snapshot and
 //!    the last heartbeat to the watchdog log - so the next cron tick
@@ -240,20 +240,8 @@ fn sample(now: std::time::Instant, started_at: Instant) -> Heartbeat {
 /// `data_dir/heartbeat.json` with the latest sample. Post-mortem, the JSON
 /// shows the last observed state and its timestamp - bracketing the death
 /// minute precisely. Never fails.
-///
-/// Hourly, on glibc targets, the heartbeat also runs `malloc_trim(0)`:
-/// the daemon allocates across many threads (tokio runtime + blocking
-/// pool), and glibc binds each thread to a malloc arena that retains freed
-/// pages in 64 MB heap segments - observed on a 72-core host as RSS
-/// ratcheting to 2.1x the configured RAM budget (165 arenas x 64 MB =
-/// 10.5 GiB retained with zero live peers) and climbing ~600 MiB/h with no
-/// plateau. The trim walks every arena and madvises the free pages back to
-/// the OS, so resident memory tracks the live working set instead of the
-/// historical high-water mark.
 pub fn heartbeat_task(data_dir: PathBuf, started_at: Instant) {
     let path = data_dir.join("heartbeat.json");
-    #[cfg(all(unix, target_env = "gnu"))]
-    let mut last_trim: Option<Instant> = None;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -262,20 +250,6 @@ pub fn heartbeat_task(data_dir: PathBuf, started_at: Instant) {
             let hb = sample(std::time::Instant::now(), started_at);
             if let Ok(json) = serde_json::to_string_pretty(&hb) {
                 let _ = crate::config::atomic_write_mode(&path, json.as_bytes(), 0o644);
-            }
-            #[cfg(all(unix, target_env = "gnu"))]
-            {
-                if last_trim.is_none_or(|t| t.elapsed() >= MALLOC_TRIM_INTERVAL) {
-                    last_trim = Some(Instant::now());
-                    match malloc_trim_returning_pages() {
-                        Some(0) => tracing::debug!("malloc_trim ran: nothing to return"),
-                        Some(freed) => tracing::info!(
-                            "malloc_trim returned ~{}M of retained arena memory to the OS",
-                            freed / 1024 / 1024
-                        ),
-                        None => {}
-                    }
-                }
             }
             if let Some(cg) = &hb.cgroup {
                 tracing::info!(
@@ -294,53 +268,8 @@ pub fn heartbeat_task(data_dir: PathBuf, started_at: Instant) {
                     hb.open_fds
                 );
             }
-            #[cfg(all(unix, target_env = "gnu"))]
-            {
-                if last_trim.is_none_or(|t| t.elapsed() >= MALLOC_TRIM_INTERVAL) {
-                    last_trim = Some(Instant::now());
-                    match malloc_trim_returning_pages() {
-                        Some(0) => tracing::debug!("malloc_trim ran: nothing to return"),
-                        Some(freed) => tracing::info!(
-                            "malloc_trim returned ~{}M of retained arena memory to the OS",
-                            freed / 1024 / 1024
-                        ),
-                        None => {}
-                    }
-                }
-            }
         }
     });
-}
-
-/// How often `malloc_trim(0)` runs (glibc targets only). The ratchet it
-/// counters grows ~600 MiB/h at worst; hourly trims bound the overshoot to
-/// one hour of activity on top of the live set, and the trim itself is a
-/// cheap walk-and-madvise over the arenas.
-#[cfg(all(unix, target_env = "gnu"))]
-const MALLOC_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// Run `malloc_trim(0)` and return the resident-memory delta (bytes) it
-/// achieved. `Some(0)` = ran, nothing free to return; `None` = unavailable
-/// (non-glibc target or /proc unreadable - in which case the call is
-/// skipped, never fatal).
-#[cfg(all(unix, target_env = "gnu"))]
-fn malloc_trim_returning_pages() -> Option<u64> {
-    let rss_bytes = || -> Option<u64> {
-        let s = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let resident = s.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-        Some(resident * 4096)
-    };
-    let before = rss_bytes()?;
-    // SAFETY: malloc_trim is thread-safe; it walks glibc's arenas and
-    // madvises free pages back to the OS. The `pad: 0` form keeps only
-    // M_TOP_PAD slack per arena.
-    let freed_something = unsafe { libc::malloc_trim(0) };
-    let after = rss_bytes()?;
-    let delta = match freed_something {
-        1 => before.saturating_sub(after),
-        _ => 0,
-    };
-    Some(delta)
 }
 
 /// Watchdog-side capture: called by the HOST watchdog via a keep-at
@@ -448,28 +377,5 @@ mod tests {
             !SIG_NAMES.iter().any(|(num, _)| *num == 13),
             "SIGPIPE (13) must not be in the death-mark signal list"
         );
-    }
-}
-
-#[cfg(all(unix, target_env = "gnu"))]
-#[cfg(test)]
-mod malloc_trim_tests {
-    use super::malloc_trim_returning_pages;
-
-    /// The trim helper must be callable on glibc targets and return a sane
-    /// result (the actual delta depends on whether anything was free to
-    /// return - the contract is "runs, never panics, never inflates RSS").
-    #[test]
-    fn trim_runs_and_returns_sane_result() {
-        let a = malloc_trim_returning_pages();
-        assert!(a.is_some(), "glibc trim must be available on gnu targets");
-        let b = malloc_trim_returning_pages();
-        assert!(b.is_some());
-        // Per-call deltas are deliberately NOT compared: parallel test
-        // threads allocate and free around us, so the second call can free
-        // more than the first (CI flaked on exactly that). The contract is
-        // only "runs, never panics" - the delta math is saturating by
-        // construction.
-        let _ = (a, b);
     }
 }

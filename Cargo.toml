@@ -22,7 +22,6 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"
-libc = "0.2"
 hex = "0.4"
 humantime = "2"
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls", "http-api-client"] }
@@ -41,6 +40,14 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+
+# Allocator: jemalloc returns freed pages to the OS continuously (10s dirty
+# decay, background purging) instead of glibc's ratcheting arena retention.
+# Gated to the Linux gnu targets the release builds; other targets keep the
+# system allocator. See src/allocator.rs.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = "0.7"
+tikv-jemalloc-ctl = "0.7"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

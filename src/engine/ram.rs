@@ -20,8 +20,7 @@ use crate::config::SYSTEM_RAM_FRACTION_HARD_CAP;
 
 /// Fixed per-torrent cost: rqbit handle + metadata + bitfield skeleton +
 /// session bookkeeping. Measured ~150 KiB live; 256 KiB keeps headroom for
-/// allocator fragmentation (system malloc retains freed arenas — observed
-/// ~1.9x steady-state in the debug build).
+/// allocator overhead (tcache/arena metadata, burst churn between decays).
 pub const PER_TORRENT_RAM_BASE: u64 = 256 * 1024;
 
 /// Marginal cost per piece: ~32 B measured (chunk-status bit + queue,
