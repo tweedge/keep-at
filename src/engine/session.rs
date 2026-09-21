@@ -74,6 +74,16 @@ pub async fn new_seeder_session(cfg: &Config, ram_budget: u64) -> Result<Arc<Ses
         }),
         ratelimits,
         peer_limit: Some(crate::engine::ram::peer_limit_for_budget(ram_budget)),
+        // DHT stays off: heap profiling on production (see notes/PROD-TEST-LOG.md,
+        // 2026-09-21T08:40Z) attributed the steady-state memory leak to the DHT
+        // subsystem - request_peers_forever's FuturesUnordered accumulates the
+        // per-request task cells indefinitely, scaling with DHT activity and live
+        // torrent count (~129-235 MiB/h at 181 torrents). With DHT off, resident
+        // memory is flat (~113 MiB allocated, ~550 MiB RSS) and seeding is
+        // unchanged: this seeder is tracker-centric (Academic Torrents swarms),
+        // so DHT peer discovery and announce are redundant with the trackers.
+        // Revisit only with an upstream librqbit-dht fix.
+        dht: None,
         disable_local_service_discovery: true,
         client_name_and_version: Some(buildinfo::seeder_user_agent()),
         peer_id: Some(peer_id_from_prefix()),
