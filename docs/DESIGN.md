@@ -38,7 +38,7 @@ Three mechanisms turn that model into behavior:
 - **The peer limit scales with the budget** (`peer_limit_for_budget`): 20 peers/torrent on comfortable hosts (≥4 GiB budget), stepping to 12 / 8 / 4 as the budget shrinks. Peer buffers are the dominant per-torrent term, so this is the main lever that lets a small host hold several times more torrents - at the cost of slower per-torrent swarms, the right trade for a seeder whose torrents are mostly already complete.
 - **RAM headroom gates every add** (`ram_headroom_bytes`): free-space fill refuses any candidate whose priced footprint exceeds the budget minus the summed footprints of what's held (held torrents price from their stored piece counts), and swaps require the displaced set to cover the candidate's RAM cost as well as its disk. The budget is therefore a ceiling the scan can approach but never cross, regardless of free disk - which is what lets a 512 MiB node sit safely next to a terabyte of empty disk.
 
-Recommended provisioning is **1 GiB of RAM per 1 TB of storage**; see the README's napkin math for the derivation. The startup log prints `budget`, `peer-limit`, `size-bias`, and `max-torrents` so the arithmetic is checkable per host.
+Recommended provisioning is **512 MiB of RAM as a base, plus ~128 MiB per TB of storage**; see the README's napkin math for the derivation. The startup log prints `budget`, `peer-limit`, `size-bias`, and `max-torrents` so the arithmetic is checkable per host.
 
 ## Multi-torrent swaps
 
