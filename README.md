@@ -128,7 +128,9 @@ storage:
 
 ### Stalled downloads free themselves
 
-A torrent that falls to zero seeders and never completes can't ever finish - with no seeders, nobody can serve its missing pieces. keep-at tracks download progress per held torrent and, after `scan.stall_eviction_timeout` (default **two weeks**, configurable via `--stall-eviction-timeout` or `stall_eviction_timeout` in a config file; `0` disables), removes any held torrent that has stayed at zero seeders and gained no new pieces, freeing its slot and disk for a torrent that can actually complete. A torrent is only ever considered stalled once its clock has run a full quiet period - progress resets it - so slow-but-alive downloads are never evicted.
+A torrent that falls to zero seeders and never completes can't ever finish - with no seeders, nobody can serve its missing pieces. keep-at tracks download progress per held torrent and, after `scan.stall_eviction_timeout` (default **three months**, configurable via `--stall-eviction-timeout` or `stall_eviction_timeout` in a config file; `0` disables), removes any held torrent that has stayed at zero seeders and gained no new pieces, freeing its slot and disk for a torrent that can actually complete. A torrent is only ever considered stalled once its clock has run a full quiet period - progress resets it - so slow-but-alive downloads are never evicted.
+
+Torrents that disappear from the Academic Torrents catalog get the same treatment: after `scan.vanished_eviction_timeout` (default **three months**, configurable; `0` removes on the first scan after delisting; `--preserve-deleted-torrents` keeps them regardless), a torrent the catalog has stopped listing is removed. The clock resets whenever the catalog lists the torrent again, so an AT-side hiccup that briefly hides entries costs nothing - only a torrent that has genuinely stayed gone for the whole window is cleaned up.
 
 ### Academic Torrents API Keys
 

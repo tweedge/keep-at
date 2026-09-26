@@ -141,6 +141,9 @@ pub struct ConfigArgs {
     /// How long a zero-seeder torrent with no progress can sit before removal (0 disables)
     #[arg(long, value_parser = parse_duration, help_heading = "Selection")]
     pub stall_eviction_timeout: Option<std::time::Duration>,
+    /// How long a torrent missing from the AT catalog can sit before removal (0 disables)
+    #[arg(long, value_parser = parse_duration, help_heading = "Selection")]
+    pub vanished_eviction_timeout: Option<std::time::Duration>,
     /// Comma-separated keywords to block, matched against title and description
     #[arg(long, help_heading = "Selection")]
     pub keyword_blocklist: Option<String>,
@@ -254,6 +257,7 @@ impl ConfigArgs {
             || self.moderation_delay.is_some()
             || self.rate_limit.is_some()
             || self.stall_eviction_timeout.is_some()
+            || self.vanished_eviction_timeout.is_some()
             || self.keyword_blocklist.is_some()
             || self.preserve_deleted_torrents.is_some()
             || self.catalog_collapse_percent.is_some()
@@ -290,6 +294,9 @@ impl ConfigArgs {
         }
         if let Some(v) = self.stall_eviction_timeout {
             cfg.scan.stall_eviction_timeout = v;
+        }
+        if let Some(v) = self.vanished_eviction_timeout {
+            cfg.scan.vanished_eviction_timeout = v;
         }
         if let Some(v) = &self.keyword_blocklist {
             cfg.keyword_blocklist = split_keywords(v);

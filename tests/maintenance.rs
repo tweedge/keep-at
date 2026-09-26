@@ -224,7 +224,8 @@ async fn live_zero_seeder_survives() {
     );
 }
 
-/// Vanished-from-catalog torrents are removed; preserved with the flag.
+/// Vanished-from-catalog torrents are removed once the vanished-eviction
+/// grace expires; preserved outright with the flag.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleted_torrents_removed_unless_preserved() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
@@ -273,8 +274,10 @@ async fn deleted_torrents_removed_unless_preserved() {
         // This test targets the delisting-removal MECHANISM; the catalog
         // collapse guard (default 30%) deliberately blocks a 0-item catalog
         // (its own regression lives in tests/catalog_collapse.rs), so
-        // disable it here to exercise the removal path.
+        // disable it here to exercise the removal path. vanished timeout 0
+        // = no grace, the pre-grace next-scan removal this test pins.
         cfg2.catalog_collapse_percent = 0;
+        cfg2.scan.vanished_eviction_timeout = Duration::ZERO;
         let mut engine2 = with_timeout(
             60,
             "engine2 new",
@@ -320,4 +323,122 @@ async fn deleted_torrents_removed_unless_preserved() {
             }
         }
     }
+}
+
+/// The vanished-eviction grace: a torrent missing from the catalog is held
+/// (not removed) while absent for less than the timeout, even across scans,
+/// and the confirmation stamp resets when the catalog lists it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn vanished_grace_defers_removal() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let fx = Fixture::new("grace-survivor", 200_000, 1);
+    let (stub, _cat, hexes) = setup(std::slice::from_ref(&fx));
+    let hex = hexes[0].clone();
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    let (cat1, _s1) = common::serve_catalog(Stub::catalog_xml(&[(
+        fx.title.clone(),
+        hex.clone(),
+        fx.size,
+    )]));
+    std::mem::forget(_s1);
+    let cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(49),
+        1 << 30,
+    );
+    let mut engine = with_timeout(
+        60,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&cat1, &stub.base_url)),
+    )
+    .await
+    .expect("engine new");
+    with_timeout(180, "scan 1", engine.scan_once())
+        .await
+        .expect("scan 1");
+    assert_eq!(engine.held_torrents().len(), 1);
+    engine.close().await;
+
+    // Phase 2: torrent vanishes. Grace is far in the future, so the removal
+    // must be deferred (files and state survive) - and the confirmation
+    // stamp must NOT advance (torrent is not listed anymore).
+    let (cat2, _s2) = common::serve_catalog(Stub::catalog_xml(&[]));
+    std::mem::forget(_s2);
+    let mut cfg2 = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(50),
+        1 << 30,
+    );
+    cfg2.catalog_collapse_percent = 0;
+    cfg2.scan.vanished_eviction_timeout = Duration::from_secs(90 * 24 * 3600);
+    let mut engine2 = with_timeout(
+        60,
+        "engine2 new",
+        keep_at::engine::Engine::new_with_options(cfg2, test_options(&cat2, &stub.base_url)),
+    )
+    .await
+    .expect("engine2 new");
+    with_timeout(180, "scan 2 (vanished, in grace)", engine2.scan_once())
+        .await
+        .expect("scan 2");
+    engine2.close().await;
+
+    assert_eq!(
+        engine2.held_torrents().len(),
+        1,
+        "torrent within the vanished grace survives"
+    );
+    assert!(
+        storage_dir.join(&hex).exists(),
+        "grace survivor's data intact"
+    );
+    let state_path = data_dir.join("state.json");
+    let raw = std::fs::read_to_string(&state_path).unwrap();
+    let stamp_after_vanish = {
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        v["torrents"][&hex]["last_confirmed_in_catalog_at"].clone()
+    };
+
+    // Phase 3: catalog hiccup ends - the torrent is listed again. The
+    // confirmation stamp must reset to now, keeping the grace window full.
+    let (cat3, _s3) = common::serve_catalog(Stub::catalog_xml(&[(
+        fx.title.clone(),
+        hex.clone(),
+        fx.size,
+    )]));
+    std::mem::forget(_s3);
+    let mut cfg3 = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(51),
+        1 << 30,
+    );
+    cfg3.scan.vanished_eviction_timeout = Duration::from_secs(90 * 24 * 3600);
+    let mut engine3 = with_timeout(
+        60,
+        "engine3 new",
+        keep_at::engine::Engine::new_with_options(cfg3, test_options(&cat3, &stub.base_url)),
+    )
+    .await
+    .expect("engine3 new");
+    with_timeout(180, "scan 3 (relisted)", engine3.scan_once())
+        .await
+        .expect("scan 3");
+    engine3.close().await;
+
+    assert_eq!(
+        engine3.held_torrents().len(),
+        1,
+        "relisted torrent survives"
+    );
+    let raw3 = std::fs::read_to_string(&state_path).unwrap();
+    let v3: serde_json::Value = serde_json::from_str(&raw3).unwrap();
+    assert_ne!(
+        v3["torrents"][&hex]["last_confirmed_in_catalog_at"], stamp_after_vanish,
+        "confirmation stamp reset when the catalog lists the torrent again"
+    );
 }

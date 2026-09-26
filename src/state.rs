@@ -25,6 +25,13 @@ pub struct Torrent {
     pub completed_pieces: u32,
     #[serde(default)]
     pub last_progress_at: Option<DateTime<Utc>>,
+    /// Last scan that saw this info_hash still listed in the AT catalog.
+    /// None on state written by older versions (treated as "last confirmed
+    /// at add time" by the vanished-eviction grace period). Set every scan
+    /// the catalog still lists it; the deleted-torrent pass evicts only
+    /// once it has stayed absent longer than the grace timeout.
+    #[serde(default)]
+    pub last_confirmed_in_catalog_at: Option<DateTime<Utc>>,
 }
 
 pub struct State {
@@ -153,6 +160,7 @@ mod tests {
             last_known_seeders: 0,
             completed_pieces: 0,
             last_progress_at: None,
+            last_confirmed_in_catalog_at: None,
         })
         .unwrap();
         let st2 = State::load(&path).unwrap();
@@ -180,6 +188,7 @@ mod tests {
                 last_known_seeders: 0,
                 completed_pieces: 0,
                 last_progress_at: None,
+                last_confirmed_in_catalog_at: None,
             })
             .unwrap();
         }

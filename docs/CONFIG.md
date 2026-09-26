@@ -70,7 +70,7 @@ Read-only operations are readable by every local user: `status` and `hosted-torr
 
 ### `scan.stall_eviction_timeout` / `--stall-eviction-timeout`
 
-*Default: `336h` (two weeks).* How long a held torrent can sit with **zero seeders and no download progress** before keep-at removes it to free the slot and disk for a torrent that can actually complete. Every scan refreshes how many pieces a held torrent has stored; a torrent that gains no new pieces for this entire timeout while having zero seeders can never finish (no one can serve its missing pieces), so it's evicted. The clock starts at a torrent's first observation and resets whenever it gains a piece, so slow-but-alive downloads are never evicted. Set to `0` to disable stalled-torrent eviction entirely.
+*Default: `2160h` (three months).* How long a held torrent can sit with **zero seeders and no download progress** before keep-at removes it to free the slot and disk for a torrent that can actually complete. Every scan refreshes how many pieces a held torrent has stored; a torrent that gains no new pieces for this entire timeout while having zero seeders can never finish (no one can serve its missing pieces), so it's evicted. The clock starts at a torrent's first observation and resets whenever it gains a piece, so slow-but-alive downloads are never evicted. Set to `0` to disable stalled-torrent eviction entirely.
 
 ### `aggressiveness` / `--aggressiveness`
 
@@ -90,9 +90,13 @@ keyword_blocklist:
 
 From the CLI, pass a comma-separated list: `--keyword-blocklist confidential,draft`.
 
+### `scan.vanished_eviction_timeout` / `--vanished-eviction-timeout`
+
+*Default: `2160h` (three months).* Grace period before a held torrent that **disappeared from the Academic Torrents catalog** is removed. Every scan stamps which held torrents the catalog still lists; when one stops appearing, the clock starts, and the torrent is removed only once it has stayed unlisted for this whole window - so a real removal is cleaned up eventually, while catalog hiccups (partial fetches, schema changes, AT-side outages) that list the torrent again within the window reset the clock and cost nothing. This works together with the collapse guard below, which covers the opposite failure (the whole catalog listing far too little at once). `0` disables the grace and restores removal on the first scan after delisting; `preserve_deleted_torrents` (below) disables the removal pass entirely.
+
 ### `preserve_deleted_torrents` / `--preserve-deleted-torrents`
 
-*Default: `false`.* If Academic Torrents removes a torrent keep-at is seeding, keep-at removes its local copy too by default, on the theory that a takedown probably happened for a reason. Set this to `true` to keep seeding removed torrents anyway.
+*Default: `false`.* If Academic Torrents removes a torrent keep-at is seeding, keep-at removes its local copy too - after `scan.vanished_eviction_timeout` (above) - on the theory that a takedown probably happened for a reason. Set this to `true` to keep seeding removed torrents regardless of how long they have been gone.
 
 ### `catalog_collapse_percent` / `--catalog-collapse-percent`
 

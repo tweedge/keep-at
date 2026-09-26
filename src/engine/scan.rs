@@ -922,6 +922,29 @@ impl Engine {
         } else {
             self.remove_deleted_torrents(&held, &catalog_hashes).await;
         }
+        // Confirm the survivors: every held torrent the fresh catalog still
+        // lists gets its vanished-eviction clock reset. Only unlisted ones
+        // keep counting toward the deleted-torrent grace window.
+        let now = Utc::now();
+        let mut confirmed_any = false;
+        for h in self.state.all() {
+            if catalog_hashes.contains(&h.info_hash)
+                && h.last_confirmed_in_catalog_at
+                    .map(|t| t < now)
+                    .unwrap_or(true)
+                && self
+                    .state
+                    .update(&h.info_hash, |t| {
+                        t.last_confirmed_in_catalog_at = Some(now);
+                    })
+                    .unwrap_or(false)
+            {
+                confirmed_any = true;
+            }
+        }
+        if confirmed_any {
+            self.push_live();
+        }
         self.refresh_held_seeder_counts(&shutdown).await;
         if *shutdown.borrow() {
             anyhow::bail!("scan interrupted by shutdown");
@@ -1593,6 +1616,7 @@ impl Engine {
             last_known_seeders: c.seeders,
             completed_pieces: 0,
             last_progress_at: Some(Utc::now()),
+            last_confirmed_in_catalog_at: Some(Utc::now()),
         }) {
             tracing::error!("failed to persist state for {}: {e:#}", c.title);
         }
@@ -1762,14 +1786,37 @@ impl Engine {
         if self.cfg.preserve_deleted_torrents {
             return;
         }
+        let timeout = self.cfg.scan.vanished_eviction_timeout;
+        let now = Utc::now();
         let mut removed_any = false;
         for h in held {
             if catalog_hashes.contains(&h.info_hash) {
                 continue;
             }
+            // Grace window: a torrent genuinely removed from AT stays gone,
+            // so it evicts once unlisted longer than the timeout. A catalog
+            // hiccup lists it again within the window and the confirmation
+            // stamp (set after this pass each scan) resets the clock.
+            // Timeout 0 = no grace (the pre-grace next-scan behavior).
+            // Legacy state without a stamp is priced from add time - always
+            // past any real timeout, preserving the old next-scan eviction.
+            let anchor = h.last_confirmed_in_catalog_at.unwrap_or(h.added_at);
+            let Ok(absent_for) = (now - anchor).to_std() else {
+                continue;
+            };
+            if absent_for < timeout {
+                tracing::debug!(
+                    "deferring removal of {}: no longer listed on Academic Torrents for {} (grace {})",
+                    h.title,
+                    crate::humanize::human_duration(absent_for),
+                    crate::humanize::human_duration(timeout)
+                );
+                continue;
+            }
             tracing::info!(
-                "removing torrent no longer listed on Academic Torrents (title={})",
-                h.title
+                "removing torrent no longer listed on Academic Torrents (title={}, absent for {})",
+                h.title,
+                crate::humanize::human_duration(absent_for)
             );
             let out_dir = engtorrents::torrent_output_dir(&h.storage_location, &h.info_hash);
             if let Err(e) = engtorrents::remove_torrent(&self.session, &h.info_hash, &out_dir).await

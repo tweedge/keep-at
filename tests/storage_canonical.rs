@@ -114,6 +114,7 @@ fn rekey_storage_locations_migrates_legacy_spellings() {
         last_known_seeders: 5,
         completed_pieces: 0,
         last_progress_at: None,
+        last_confirmed_in_catalog_at: None,
     })
     .unwrap();
     // Historical spelling is invisible to the canonical location's budget...

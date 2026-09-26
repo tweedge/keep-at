@@ -16,7 +16,13 @@ pub const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const DEFAULT_MODERATION_DELAY: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const DEFAULT_RATE_LIMIT_PER_SEC: f64 = 0.5;
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(30 * 60);
-pub const DEFAULT_STALL_EVICTION_TIMEOUT: Duration = Duration::from_secs(14 * 24 * 3600);
+pub const DEFAULT_STALL_EVICTION_TIMEOUT: Duration = Duration::from_secs(90 * 24 * 3600);
+/// Grace period for held torrents that vanished from the AT catalog: how
+/// long a torrent must stay unlisted before the deleted-torrent pass
+/// removes it. Real removals are permanent, so they evict after the window;
+/// catalog hiccups (partial fetches, schema changes, AT-side outages) list
+/// the torrent again well within it and the entry recovers untouched.
+pub const DEFAULT_VANISHED_EVICTION_TIMEOUT: Duration = Duration::from_secs(90 * 24 * 3600);
 
 /// Fraction of a device's total formatted capacity `limit: max` resolves to.
 /// Dedicated data drives only.
@@ -63,6 +69,12 @@ fn default_stats_interval() -> Duration {
 }
 fn default_stall_timeout() -> Duration {
     DEFAULT_STALL_EVICTION_TIMEOUT
+}
+fn default_vanished_timeout() -> Duration {
+    DEFAULT_VANISHED_EVICTION_TIMEOUT
+}
+fn is_default_vanished_timeout(d: &Duration) -> bool {
+    *d == DEFAULT_VANISHED_EVICTION_TIMEOUT
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +152,13 @@ pub struct ScanConfig {
         skip_serializing_if = "is_default_stall_timeout"
     )]
     pub stall_eviction_timeout: Duration,
+    #[serde(
+        default = "default_vanished_timeout",
+        deserialize_with = "de_duration_secs_opt",
+        serialize_with = "ser_duration_secs_opt",
+        skip_serializing_if = "is_default_vanished_timeout"
+    )]
+    pub vanished_eviction_timeout: Duration,
 }
 
 fn default_rate() -> f64 {
@@ -294,6 +313,7 @@ impl Default for Config {
                 min_seed_margin: DEFAULT_MIN_SEED_MARGIN,
                 moderation_delay: DEFAULT_MODERATION_DELAY,
                 stall_eviction_timeout: DEFAULT_STALL_EVICTION_TIMEOUT,
+                vanished_eviction_timeout: DEFAULT_VANISHED_EVICTION_TIMEOUT,
             },
             aggressiveness: DEFAULT_AGGRESSIVENESS,
             keyword_blocklist: Vec::new(),
