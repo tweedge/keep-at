@@ -425,6 +425,12 @@ pub fn resolve(common: &CommonArgs, args: &ConfigArgs) -> Result<Config> {
         cfg.data_dir = d.clone();
     }
 
+    // The key file is the runtime home of the API key; merge it on every
+    // resolution so flag-only runs (no --config) attribute seeding too.
+    // An explicit --api-key flag wins over the file, matching load_inner's
+    // file-wins-over-inline-config order only when no flag is passed.
+    cfg.merge_key_file();
+
     if storage_set {
         if file_loaded {
             bail!("--storage-location/--storage-limit/--storage can't be combined with --config; edit {} instead", path.unwrap().display());

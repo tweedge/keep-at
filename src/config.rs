@@ -394,12 +394,7 @@ impl Config {
         // API key from the secret file (authoritative at runtime). Unreadable
         // (non-owner) => keep whatever the config field said, never fatal —
         // an anonymous node is a supported mode.
-        if let Ok(k) = std::fs::read_to_string(cfg.data_dir.join(API_KEY_FILE)) {
-            let k = k.trim();
-            if !k.is_empty() {
-                cfg.api_key = k.to_string();
-            }
-        }
+        cfg.merge_key_file();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -461,6 +456,22 @@ impl Config {
         // save() writes the config keyless + world-readable; the key file
         // itself is written at startup (write_api_key_file).
         cfg.save(path)
+    }
+
+    /// Merge the `<data_dir>/api_key` secret file into this config when
+    /// present. Called from every path that assembles a runtime config
+    /// (file loads merge it inside `load_inner`; flag-only runs call this
+    /// after the data dir is resolved) so attribution works without a
+    /// `--api-key` flag on every invocation. Unreadable (non-owner) keeps
+    /// whatever the config field said, never fatal - an anonymous node is a
+    /// supported mode.
+    pub fn merge_key_file(&mut self) {
+        if let Ok(k) = std::fs::read_to_string(self.data_dir.join(API_KEY_FILE)) {
+            let k = k.trim();
+            if !k.is_empty() {
+                self.api_key = k.to_string();
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
