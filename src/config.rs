@@ -459,13 +459,17 @@ impl Config {
     }
 
     /// Merge the `<data_dir>/api_key` secret file into this config when
-    /// present. Called from every path that assembles a runtime config
-    /// (file loads merge it inside `load_inner`; flag-only runs call this
-    /// after the data dir is resolved) so attribution works without a
-    /// `--api-key` flag on every invocation. Unreadable (non-owner) keeps
-    /// whatever the config field said, never fatal - an anonymous node is a
-    /// supported mode.
+    /// present and the config field is still empty. Called from every path
+    /// that assembles a runtime config (file loads merge it inside
+    /// `load_inner`; flag-only runs call this after the data dir resolves)
+    /// so attribution works without a `--api-key` flag on every invocation.
+    /// Precedence: an explicit `--api-key` flag beats the file, which beats
+    /// nothing. Unreadable (non-owner) keeps whatever the field said, never
+    /// fatal - an anonymous node is a supported mode.
     pub fn merge_key_file(&mut self) {
+        if !self.api_key.is_empty() {
+            return;
+        }
         if let Ok(k) = std::fs::read_to_string(self.data_dir.join(API_KEY_FILE)) {
             let k = k.trim();
             if !k.is_empty() {
