@@ -132,7 +132,7 @@ pub struct ConfigArgs {
     /// How many fewer seeds a candidate needs before displacing a held torrent
     #[arg(long, help_heading = "Selection")]
     pub min_seed_margin: Option<i32>,
-    /// How often to rescan the Academic Torrents catalog (e.g. 168h)
+    /// How often to rescan the Academic Torrents catalog (e.g. 336h)
     #[arg(long, value_parser = parse_duration, help_heading = "Selection")]
     pub scan_interval: Option<std::time::Duration>,
     /// Minimum torrent age before keep-at will download it

@@ -54,7 +54,7 @@ Read-only operations are readable by every local user: `status` and `hosted-torr
 
 ### `scan.interval` / `--scan-interval`
 
-*Default: `168h` (one week).* How often keep-at rescans the full Academic Torrents catalog. A scan can take a while on a large catalog - see DESIGN.md - so shortening this a lot mostly just means overlapping or back-to-back scans, not more frequent decisions.
+*Default: `336h` (two weeks).* How often keep-at rescans the full Academic Torrents catalog. A scan can take a while on a large catalog - see DESIGN.md - so shortening this a lot mostly just means overlapping or back-to-back scans, not more frequent decisions.
 
 ### `scan.rate_limit_per_second` / `--rate-limit`
 

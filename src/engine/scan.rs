@@ -761,7 +761,7 @@ impl Engine {
 
         // Periodic runtime stats tick on their own interval. The ticker is
         // created BEFORE the next-scan delay wait and armed in both select
-        // loops: a host sleeping out a long scan-interval (e.g. 168h with a
+        // loops: a host sleeping out a long scan-interval (e.g. 336h with a
         // recent completion) still gets periodic stats passes and tracker
         // feeds — previously the ticker was created after the delay, so the
         // whole sleep went without stats and the persisted snapshot went

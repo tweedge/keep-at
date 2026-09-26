@@ -12,7 +12,7 @@ pub const DEFAULT_AGGRESSIVENESS: f64 = 0.6;
 pub const DEFAULT_MIN_SEED_MARGIN: i32 = 4;
 /// Catalog collapse guard threshold (percent of held; see Config).
 pub const DEFAULT_CATALOG_COLLAPSE_PERCENT: u32 = 30;
-pub const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
+pub const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_secs(14 * 24 * 3600);
 pub const DEFAULT_MODERATION_DELAY: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const DEFAULT_RATE_LIMIT_PER_SEC: f64 = 0.5;
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(30 * 60);
