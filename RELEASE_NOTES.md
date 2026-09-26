@@ -1,5 +1,13 @@
 # keep-at release notes
 
+## v0.8.29-beta - fix: AT seeding attribution on flag-only installs
+
+### Seeding attribution: the `<data_dir>/api_key` file was ignored by flag-only runs
+
+A daemon started purely from CLI flags (`--storage-location ... --max-ram 8G`, no `--config`) never read the API-key file, so `userannounce` was never resolved and every tracker announce went out unkeyed: Academic Torrents listed the node as "public" in a torrent's mirrors table instead of the operator's account, even with the key correctly sitting in `<data_dir>/api_key`. Only daemons launched with `--config` picked the key up. Found by live swarm-table testing (a keyed test announce attributed instantly; the same host's daemon peers showed "public").
+
+The key file is now merged into every resolved config (`Config::merge_key_file`, called from both the file-load path and flag resolution after the data dir settles). Precedence: an explicit `--api-key` flag beats the file, which beats nothing. After installing or changing `<data_dir>/api_key`, restart the daemon once — attribution applies from the next announce; the tracker's own min-interval (30 min on AT) governs when each torrent re-announces.
+
 ## v0.8.28-beta - DHT disabled: eliminates the memory leak root cause found by production heap profiling
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
