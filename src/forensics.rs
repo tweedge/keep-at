@@ -60,7 +60,10 @@ const SIG_NAMES: [(i32, &[u8]); 6] = [
 
 unsafe extern "C" {
     fn signal(signum: i32, handler: usize) -> usize;
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    // Signature matches libc's write(2) exactly (the buffer is `const
+    // void*`): rustc's suspicious_runtime_symbol_definitions lint rejects
+    // shapely-wrong declarations of symbols the std runtime links against.
+    fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
     fn raise(sig: i32) -> i32;
 }
 
@@ -70,7 +73,7 @@ extern "C" fn death_mark_handler(sig: i32) {
         for (num, msg) in SIG_NAMES {
             if num == sig {
                 // write(2) is async-signal-safe; msg is static.
-                unsafe { write(fd, msg.as_ptr(), msg.len()) };
+                unsafe { write(fd, msg.as_ptr().cast(), msg.len()) };
                 break;
             }
         }
