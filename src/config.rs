@@ -23,6 +23,18 @@ pub const DEFAULT_STALL_EVICTION_TIMEOUT: Duration = Duration::from_secs(90 * 24
 /// catalog hiccups (partial fetches, schema changes, AT-side outages) list
 /// the torrent again well within it and the entry recovers untouched.
 pub const DEFAULT_VANISHED_EVICTION_TIMEOUT: Duration = Duration::from_secs(90 * 24 * 3600);
+/// Broken-piece watchdog cadence (0 = disabled).
+pub const DEFAULT_QUARANTINE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Discarded-download volume (received-but-never-validated bytes) that
+/// marks a torrent's swarm as broken.
+pub const DEFAULT_BROKEN_PIECE_DISCARD_BYTES: u64 = 256 * 1024 * 1024;
+/// Consecutive watchdog passes with zero verified progress required on top
+/// of the discard volume (rides out transient stalls).
+pub const DEFAULT_BROKEN_PIECE_MIN_WINDOWS: u32 = 2;
+/// How long a quarantined hash stays un-selectable before the next re-probe.
+pub const DEFAULT_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(3 * 24 * 3600);
+/// Re-probes before a quarantine becomes permanent (0 = unlimited).
+pub const DEFAULT_QUARANTINE_MAX_RETRIES: u32 = 0;
 
 /// Fraction of a device's total formatted capacity `limit: max` resolves to.
 /// Dedicated data drives only.
@@ -77,6 +89,37 @@ fn is_default_vanished_timeout(d: &Duration) -> bool {
     *d == DEFAULT_VANISHED_EVICTION_TIMEOUT
 }
 
+fn default_quarantine_check_interval() -> Duration {
+    DEFAULT_QUARANTINE_CHECK_INTERVAL
+}
+fn is_default_quarantine_check_interval(d: &Duration) -> bool {
+    *d == DEFAULT_QUARANTINE_CHECK_INTERVAL
+}
+fn default_broken_piece_discard_bytes() -> u64 {
+    DEFAULT_BROKEN_PIECE_DISCARD_BYTES
+}
+fn is_default_broken_piece_discard_bytes(v: &u64) -> bool {
+    *v == DEFAULT_BROKEN_PIECE_DISCARD_BYTES
+}
+fn default_broken_piece_min_windows() -> u32 {
+    DEFAULT_BROKEN_PIECE_MIN_WINDOWS
+}
+fn is_default_broken_piece_min_windows(v: &u32) -> bool {
+    *v == DEFAULT_BROKEN_PIECE_MIN_WINDOWS
+}
+fn default_quarantine_cooldown() -> Duration {
+    DEFAULT_QUARANTINE_COOLDOWN
+}
+fn is_default_quarantine_cooldown(d: &Duration) -> bool {
+    *d == DEFAULT_QUARANTINE_COOLDOWN
+}
+fn default_quarantine_max_retries() -> u32 {
+    DEFAULT_QUARANTINE_MAX_RETRIES
+}
+fn is_default_quarantine_max_retries(v: &u32) -> bool {
+    *v == DEFAULT_QUARANTINE_MAX_RETRIES
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageLocation {
     pub path: PathBuf,
@@ -125,11 +168,11 @@ impl StorageLimit {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanConfig {
     #[serde(
         default = "default_scan_interval",
-        deserialize_with = "de_duration_secs_opt",
+        deserialize_with = "de_scan_interval",
         serialize_with = "ser_duration_secs_opt",
         skip_serializing_if = "is_default_scan_interval"
     )]
@@ -140,25 +183,68 @@ pub struct ScanConfig {
     pub min_seed_margin: i32,
     #[serde(
         default = "default_moderation_delay",
-        deserialize_with = "de_duration_secs_opt",
+        deserialize_with = "de_moderation_delay",
         serialize_with = "ser_duration_secs_opt",
         skip_serializing_if = "is_default_moderation_delay"
     )]
     pub moderation_delay: Duration,
     #[serde(
         default = "default_stall_timeout",
-        deserialize_with = "de_duration_secs_opt",
+        deserialize_with = "de_stall_timeout",
         serialize_with = "ser_duration_secs_opt",
         skip_serializing_if = "is_default_stall_timeout"
     )]
     pub stall_eviction_timeout: Duration,
     #[serde(
         default = "default_vanished_timeout",
-        deserialize_with = "de_duration_secs_opt",
+        deserialize_with = "de_vanished_timeout",
         serialize_with = "ser_duration_secs_opt",
         skip_serializing_if = "is_default_vanished_timeout"
     )]
     pub vanished_eviction_timeout: Duration,
+    /// How often the broken-piece watchdog inspects per-torrent receive
+    /// counters (0 = disabled). Torrents whose wire bytes never pass hash
+    /// validation (poisoned/mis-seeded swarms) get removed and quarantined
+    /// for `quarantine_cooldown` instead of looping forever.
+    #[serde(
+        default = "default_quarantine_check_interval",
+        deserialize_with = "de_quarantine_check",
+        serialize_with = "ser_duration_secs_opt",
+        skip_serializing_if = "is_default_quarantine_check_interval"
+    )]
+    pub quarantine_check_interval: Duration,
+    /// Discarded bytes (received minus validated) accumulated with zero
+    /// verified progress before a torrent's swarm is declared broken.
+    #[serde(
+        default = "default_broken_piece_discard_bytes",
+        skip_serializing_if = "is_default_broken_piece_discard_bytes"
+    )]
+    pub broken_piece_discard_bytes: u64,
+    /// Consecutive zero-progress watchdog passes required on top of the
+    /// discard volume.
+    #[serde(
+        default = "default_broken_piece_min_windows",
+        skip_serializing_if = "is_default_broken_piece_min_windows"
+    )]
+    pub broken_piece_min_windows: u32,
+    /// Re-probe interval for quarantined hashes: after this long, the
+    /// selection gate admits the hash again (a fresh probe; if the swarm
+    /// is still broken the watchdog re-quarantines within one interval).
+    #[serde(
+        default = "default_quarantine_cooldown",
+        deserialize_with = "de_quarantine_cooldown",
+        serialize_with = "ser_duration_secs_opt",
+        skip_serializing_if = "is_default_quarantine_cooldown"
+    )]
+    pub quarantine_cooldown: Duration,
+    /// Quarantine cycles tolerated before the cooldown becomes indefinite
+    /// (0 = unlimited; raise only for catalog entries that stay broken for
+    /// many months).
+    #[serde(
+        default = "default_quarantine_max_retries",
+        skip_serializing_if = "is_default_quarantine_max_retries"
+    )]
+    pub quarantine_max_retries: u32,
 }
 
 fn default_rate() -> f64 {
@@ -177,16 +263,43 @@ fn is_default_stall_timeout(d: &Duration) -> bool {
     *d == DEFAULT_STALL_EVICTION_TIMEOUT
 }
 
-fn de_duration_secs_opt<'de, D>(d: D) -> std::result::Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
+/// Core for the per-field Duration deserializers below: an explicit `null`
+/// (serde_json/yaml) falls back to the FIELD's own default, not some other
+/// field's. A field's absence is handled separately by its `default = ..`
+/// attribute; only `null` reaches here.
+///
+/// History: a single shared helper used to fall back to
+/// `DEFAULT_SCAN_INTERVAL` for every field it served, so
+/// `stall_eviction_timeout: null` silently meant 14d (the pre-2026-09-26
+/// default) instead of the documented 90d. Each field now has a thin
+/// wrapper; fix fallbacks here, in exactly one place.
+fn de_duration_secs<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    fallback: Duration,
+) -> std::result::Result<Duration, D::Error> {
     use serde::de::Deserialize as _;
-    let opt = Option::<u64>::deserialize(d)?;
-    Ok(opt
+    Ok(Option::<u64>::deserialize(d)?
         .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_SCAN_INTERVAL))
+        .unwrap_or(fallback))
 }
+
+macro_rules! de_secs_wrapper {
+    ($name:ident, $fallback:expr) => {
+        fn $name<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> std::result::Result<Duration, D::Error> {
+            de_duration_secs(d, $fallback)
+        }
+    };
+}
+
+de_secs_wrapper!(de_scan_interval, DEFAULT_SCAN_INTERVAL);
+de_secs_wrapper!(de_moderation_delay, DEFAULT_MODERATION_DELAY);
+de_secs_wrapper!(de_stall_timeout, DEFAULT_STALL_EVICTION_TIMEOUT);
+de_secs_wrapper!(de_vanished_timeout, DEFAULT_VANISHED_EVICTION_TIMEOUT);
+de_secs_wrapper!(de_quarantine_check, DEFAULT_QUARANTINE_CHECK_INTERVAL);
+de_secs_wrapper!(de_quarantine_cooldown, DEFAULT_QUARANTINE_COOLDOWN);
+de_secs_wrapper!(de_stats_interval, DEFAULT_STATS_INTERVAL);
 
 fn ser_duration_secs_opt<S>(d: &Duration, s: S) -> std::result::Result<S::Ok, S::Error>
 where
@@ -241,7 +354,7 @@ pub struct Config {
     pub download_rate_limit: u64,
     #[serde(
         default = "default_stats_interval",
-        deserialize_with = "de_duration_secs_opt_stats",
+        deserialize_with = "de_stats_interval",
         serialize_with = "ser_duration_secs_opt",
         skip_serializing_if = "is_default_stats_interval"
     )]
@@ -265,16 +378,6 @@ fn default_catalog_collapse_percent() -> u32 {
 }
 fn is_default_stats_interval(d: &Duration) -> bool {
     *d == DEFAULT_STATS_INTERVAL
-}
-fn de_duration_secs_opt_stats<'de, D>(d: D) -> std::result::Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Deserialize as _;
-    let opt = Option::<u64>::deserialize(d)?;
-    Ok(opt
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_STATS_INTERVAL))
 }
 
 fn de_bytesize_opt<'de, D>(d: D) -> std::result::Result<u64, D::Error>
@@ -301,6 +404,29 @@ where
     }
 }
 
+impl Default for ScanConfig {
+    /// Manual, not derived: a config file (or `#[serde(default)]` field)
+    /// missing the whole `scan` section must land on the documented
+    /// defaults, not zero values. A derived Default used to give
+    /// `interval = 0` here (60s-floored continuous scans) — a latent
+    /// hazard the quarantine validation surfaced.
+    fn default() -> Self {
+        ScanConfig {
+            interval: DEFAULT_SCAN_INTERVAL,
+            rate_limit_per_second: DEFAULT_RATE_LIMIT_PER_SEC,
+            min_seed_margin: DEFAULT_MIN_SEED_MARGIN,
+            moderation_delay: DEFAULT_MODERATION_DELAY,
+            stall_eviction_timeout: DEFAULT_STALL_EVICTION_TIMEOUT,
+            vanished_eviction_timeout: DEFAULT_VANISHED_EVICTION_TIMEOUT,
+            quarantine_check_interval: DEFAULT_QUARANTINE_CHECK_INTERVAL,
+            broken_piece_discard_bytes: DEFAULT_BROKEN_PIECE_DISCARD_BYTES,
+            broken_piece_min_windows: DEFAULT_BROKEN_PIECE_MIN_WINDOWS,
+            quarantine_cooldown: DEFAULT_QUARANTINE_COOLDOWN,
+            quarantine_max_retries: DEFAULT_QUARANTINE_MAX_RETRIES,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -314,6 +440,11 @@ impl Default for Config {
                 moderation_delay: DEFAULT_MODERATION_DELAY,
                 stall_eviction_timeout: DEFAULT_STALL_EVICTION_TIMEOUT,
                 vanished_eviction_timeout: DEFAULT_VANISHED_EVICTION_TIMEOUT,
+                quarantine_check_interval: DEFAULT_QUARANTINE_CHECK_INTERVAL,
+                broken_piece_discard_bytes: DEFAULT_BROKEN_PIECE_DISCARD_BYTES,
+                broken_piece_min_windows: DEFAULT_BROKEN_PIECE_MIN_WINDOWS,
+                quarantine_cooldown: DEFAULT_QUARANTINE_COOLDOWN,
+                quarantine_max_retries: DEFAULT_QUARANTINE_MAX_RETRIES,
             },
             aggressiveness: DEFAULT_AGGRESSIVENESS,
             keyword_blocklist: Vec::new(),
@@ -525,6 +656,26 @@ impl Config {
         if self.scan.min_seed_margin < 0 {
             bail!("scan.min_seed_margin must not be negative");
         }
+        if self.scan.broken_piece_min_windows == 0 {
+            bail!(
+                "scan.broken_piece_min_windows must be at least 1 (0 windows \
+                 would quarantine on discard volume alone)"
+            );
+        }
+        if self.scan.broken_piece_discard_bytes == 0 {
+            bail!(
+                "scan.broken_piece_discard_bytes must be at least 1 byte (0 \
+                 would quarantine any live torrent with no verified bytes)"
+            );
+        }
+        if self.scan.quarantine_check_interval > Duration::ZERO
+            && self.scan.quarantine_check_interval < Duration::from_secs(60)
+        {
+            bail!(
+                "scan.quarantine_check_interval must be 0 (disabled) or at least 60s, got {:?}",
+                self.scan.quarantine_check_interval
+            );
+        }
         if self.port == 0 {
             bail!("port {} is out of range", self.port);
         }
@@ -534,6 +685,35 @@ impl Config {
             // Duration::from_secs_f64(1.0/NaN), which panics - and the
             // release profile is panic=abort, so that is a boot loop.
             bail!("scan.rate_limit_per_second must be a positive finite number");
+        }
+        if self.scan.rate_limit_per_second < MIN_RATE_LIMIT_PER_SECOND {
+            bail!(
+                "scan.rate_limit_per_second must be at least {} (one request every \
+                 {}s at that rate would wedge a scan for months) - got {}",
+                MIN_RATE_LIMIT_PER_SECOND,
+                (1.0 / MIN_RATE_LIMIT_PER_SECOND) as u64,
+                self.scan.rate_limit_per_second
+            );
+        }
+        for (name, d) in [
+            ("scan.interval", self.scan.interval),
+            ("scan.moderation_delay", self.scan.moderation_delay),
+            (
+                "scan.stall_eviction_timeout",
+                self.scan.stall_eviction_timeout,
+            ),
+            (
+                "scan.vanished_eviction_timeout",
+                self.scan.vanished_eviction_timeout,
+            ),
+            (
+                "scan.quarantine_check_interval",
+                self.scan.quarantine_check_interval,
+            ),
+            ("scan.quarantine_cooldown", self.scan.quarantine_cooldown),
+            ("stats_interval", self.stats_interval),
+        ] {
+            check_duration_knob(name, d)?;
         }
         check_bandwidth_limit("max_ram", self.max_ram)?;
         check_bandwidth_limit("upload_rate_limit", self.upload_rate_limit)?;
@@ -597,7 +777,29 @@ pub fn atomic_write_mode(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
         .with_context(|| format!("setting mode on {}", tmp.display()))?;
+    // Flush data blocks BEFORE the rename: without fsync the rename can
+    // commit while the temp file's blocks are still unordered on disk, so
+    // power loss can leave the destination zero-length or truncated —
+    // and state.json is load-fatal (a corrupt one boot-loops the daemon
+    // under the watchdog). Cost: one fsync per save (state.json saves are
+    // seconds apart at most, not per-request). Opened READ-WRITE on
+    // purpose: Windows refuses FlushFileBuffers on a read-only handle, so
+    // `File::open` here would hard-fail every state save there.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&tmp)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("syncing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("finalizing {}", path.display()))?;
+    // Persist the rename itself so the old-content window cannot survive
+    // a crash either. Best-effort: some filesystems (network mounts)
+    // reject directory fsyncs.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
     // rename preserves the temp file's mode; belt-and-suspenders in case a
     // platform ever copies instead of renaming.
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
@@ -659,7 +861,37 @@ pub fn parse_byte_size(s: &str) -> Result<u64> {
         "P" | "PB" | "PI" | "PIB" => 1024.0_f64.powi(5),
         other => bail!("unknown byte-size suffix {other:?} in {s:?} (use K/M/G/T/P, a plain byte count, or max for a dedicated drive)"),
     };
-    Ok((n * mult) as u64)
+    let bytes = n * mult;
+    // f64→u64 casts SATURATE at u64::MAX (rustc ≥1.45): an input like
+    // "999999999T" would silently become ~18 EB and neuter every limit
+    // and threshold it feeds. Reject instead of saturating.
+    if bytes >= u64::MAX as f64 {
+        bail!("byte size {s:?} overflows (max is 18446744073709551615 bytes)");
+    }
+    Ok(bytes as u64)
+}
+
+/// Upper bound for every Duration knob. The scheduler and calendar
+/// arithmetic these feed overflow beyond huge values (std Instant
+/// checked_add panics past u64 seconds; chrono DateTime maxes at year
+/// 262143), and a release panic is abort → watchdog boot loop. 366 days
+/// is far beyond any sane cadence (the scan default is 14d) and matches
+/// the 1-year internal "disabled" sentinel the tickers use.
+const MAX_DURATION_KNOB: Duration = Duration::from_secs(366 * 24 * 3600);
+
+/// Lower bound for the catalog request rate: below this, one request
+/// every `1/rate` seconds wedges a multi-thousand-request scan for
+/// months while activity reads "Scanning".
+pub const MIN_RATE_LIMIT_PER_SECOND: f64 = 1e-6;
+
+fn check_duration_knob(name: &str, d: Duration) -> Result<()> {
+    if d > Duration::ZERO && d > MAX_DURATION_KNOB {
+        bail!(
+            "{name} must be 0 (disabled) or at most 366 days, got {}s",
+            d.as_secs()
+        );
+    }
+    Ok(())
 }
 
 /// Check a parsed storage limit against the sanity floors. Rejects
@@ -931,5 +1163,69 @@ mod tests {
     // the process mask and returns the old one), so callers need no block.
     fn libc_umask(mask: u32) -> u32 {
         unsafe { umask(mask) }
+    }
+
+    #[test]
+    fn explicit_null_durations_fall_back_to_own_defaults() {
+        // Regression for the shared-deserializer bug: `null` used to fall
+        // back to DEFAULT_SCAN_INTERVAL (14d) for every Duration field, so
+        // `stall_eviction_timeout: null` silently meant 14d, not the
+        // documented 90d. Absence must land on the same defaults as null.
+        let dir = std::env::temp_dir().join(format!("keep-at-cfgnull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nulls.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "port: {}\ndata_dir: {}\nstorage:\n- path: {}/s\n  limit: 200M\nscan:\n  interval: null\n  moderation_delay: null\n  stall_eviction_timeout: null\n  vanished_eviction_timeout: null\n  quarantine_check_interval: null\n  quarantine_cooldown: null\n",
+                DEFAULT_PORT,
+                dir.display(),
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.scan.interval, DEFAULT_SCAN_INTERVAL);
+        assert_eq!(cfg.scan.moderation_delay, DEFAULT_MODERATION_DELAY);
+        assert_eq!(
+            cfg.scan.stall_eviction_timeout,
+            DEFAULT_STALL_EVICTION_TIMEOUT
+        );
+        assert_eq!(
+            cfg.scan.vanished_eviction_timeout,
+            DEFAULT_VANISHED_EVICTION_TIMEOUT
+        );
+        assert_eq!(
+            cfg.scan.quarantine_check_interval,
+            DEFAULT_QUARANTINE_CHECK_INTERVAL
+        );
+        assert_eq!(cfg.scan.quarantine_cooldown, DEFAULT_QUARANTINE_COOLDOWN);
+        assert_eq!(cfg.stats_interval, DEFAULT_STATS_INTERVAL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_zero_durations_stay_zero() {
+        // 0 is meaningful (disable): it must survive null-fallback logic.
+        let dir = std::env::temp_dir().join(format!("keep-at-cfgzero-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zeros.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "port: {}\ndata_dir: {}\nstorage:\n- path: {}/s\n  limit: 200M\nscan:\n  stall_eviction_timeout: 0\n  vanished_eviction_timeout: 0\n  quarantine_check_interval: 0\n",
+                DEFAULT_PORT,
+                dir.display(),
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.scan.stall_eviction_timeout, Duration::ZERO);
+        assert_eq!(cfg.scan.vanished_eviction_timeout, Duration::ZERO);
+        assert_eq!(cfg.scan.quarantine_check_interval, Duration::ZERO);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

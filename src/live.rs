@@ -96,6 +96,10 @@ pub struct RuntimeView {
     pub held_torrents: usize,
     pub seeding_torrents: usize,
     pub downloading_torrents: usize,
+    /// Hashes currently quarantined as broken-swarms (removed from the
+    /// session, not re-selectable until cooldown). Absent on older daemons.
+    #[serde(default)]
+    pub quarantined_torrents: usize,
     pub disk_used_bytes: u64,
     pub disk_limit_bytes: u64,
     /// Storage reserved by held torrents (sum of their nominal sizes) out of
@@ -371,6 +375,9 @@ struct LiveState {
     storage: Vec<(PathBuf, u64)>,
     /// Held-torrent snapshot pushed by the Engine after every mutation.
     held: std::sync::Mutex<Vec<StateEntry>>,
+    /// Broken-piece quarantine registry size, pushed alongside the held
+    /// list (the registry lives in state.json; the session can't see it).
+    quarantined: std::sync::Mutex<usize>,
 }
 
 /// How long a computed disk-usage sum is reused by runtime queries. The
@@ -479,7 +486,7 @@ impl LiveHandle {
         storage: Vec<(PathBuf, u64)>,
     ) -> LiveHandle {
         let h = LiveHandle::booting(started_at, storage, Vec::new());
-        h.activate(session, api, torrents);
+        h.activate(session, api, 0, torrents);
         h
     }
 
@@ -489,6 +496,7 @@ impl LiveHandle {
         &self,
         session: Arc<librqbit::Session>,
         api: librqbit::Api,
+        quarantined: usize,
         torrents: Vec<StateEntry>,
     ) {
         let (started_at, storage) = {
@@ -517,6 +525,7 @@ impl LiveHandle {
             started_at,
             storage,
             held: std::sync::Mutex::new(torrents),
+            quarantined: std::sync::Mutex::new(quarantined),
         }));
         self.set_activity(Activity::Seeding);
     }
@@ -524,7 +533,7 @@ impl LiveHandle {
     /// Replace the held-torrent snapshot (called by the Engine after every
     /// state mutation). During booting the list is static; refresh still
     /// merges (keeping verifying=true) in case state changes early.
-    pub fn refresh(&self, torrents: Vec<StateEntry>) {
+    pub fn refresh(&self, quarantined: usize, torrents: Vec<StateEntry>) {
         let mut inner = self.inner.write();
         match &mut *inner {
             HandleInner::Booting { held, .. } => {
@@ -543,6 +552,7 @@ impl LiveHandle {
             }
             HandleInner::Live(live) => {
                 *live.held.lock().unwrap() = torrents;
+                *live.quarantined.lock().unwrap() = quarantined;
             }
         }
     }
@@ -591,6 +601,7 @@ impl LiveHandle {
                 storage: Vec<(PathBuf, u64)>,
                 held_len: usize,
                 committed: u64,
+                quarantined: usize,
             },
         }
         let (phase, started_at) = {
@@ -614,6 +625,7 @@ impl LiveHandle {
                         api: live.api.clone(),
                         tracker: live.tracker.clone(),
                         storage: live.storage.clone(),
+                        quarantined: *live.quarantined.lock().unwrap(),
                     }
                 }
             };
@@ -681,6 +693,12 @@ impl LiveHandle {
             Phase::Booting { held_len, .. } => *held_len,
             Phase::Live { held_len, .. } => *held_len,
         };
+        let quarantined_torrents = match &phase {
+            // Quarantine state can't change during the booting window; the
+            // live phase reads the count pushed by the Engine.
+            Phase::Booting { .. } => 0,
+            Phase::Live { quarantined, .. } => *quarantined,
+        };
         let committed = match &phase {
             Phase::Booting { committed, .. } => *committed,
             Phase::Live { committed, .. } => *committed,
@@ -693,6 +711,7 @@ impl LiveHandle {
             held_torrents: held_len,
             seeding_torrents: seeding,
             downloading_torrents: downloading,
+            quarantined_torrents,
             disk_used_bytes: used,
             disk_limit_bytes: limit,
             disk_committed_bytes: committed,
@@ -813,20 +832,23 @@ mod tests {
         assert_eq!(v.disk_used_bytes, 0, "nothing on disk yet");
 
         // A mid-boot mutation (torrent added/removed) updates the view.
-        h.refresh(vec![
-            crate::live::StateEntry {
-                title: "a".to_string(),
-                info_hash: "hash-a".to_string(),
-                size_bytes: 100,
-                last_known_seeders: 0,
-            },
-            crate::live::StateEntry {
-                title: "d".to_string(),
-                info_hash: "hash-d".to_string(),
-                size_bytes: 50_000,
-                last_known_seeders: 0,
-            },
-        ]);
+        h.refresh(
+            0,
+            vec![
+                crate::live::StateEntry {
+                    title: "a".to_string(),
+                    info_hash: "hash-a".to_string(),
+                    size_bytes: 100,
+                    last_known_seeders: 0,
+                },
+                crate::live::StateEntry {
+                    title: "d".to_string(),
+                    info_hash: "hash-d".to_string(),
+                    size_bytes: 50_000,
+                    last_known_seeders: 0,
+                },
+            ],
+        );
         let v = h.runtime_view();
         assert_eq!(v.held_torrents, 2);
         assert_eq!(v.disk_committed_bytes, 50_100, "committed follows refresh");

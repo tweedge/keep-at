@@ -70,7 +70,7 @@ Read-only operations are readable by every local user: `status` and `hosted-torr
 
 ### `scan.stall_eviction_timeout` / `--stall-eviction-timeout`
 
-*Default: `2160h` (three months).* How long a held torrent can sit with **zero seeders and no download progress** before keep-at removes it to free the slot and disk for a torrent that can actually complete. Every scan refreshes how many pieces a held torrent has stored; a torrent that gains no new pieces for this entire timeout while having zero seeders can never finish (no one can serve its missing pieces), so it's evicted. The clock starts at a torrent's first observation and resets whenever it gains a piece, so slow-but-alive downloads are never evicted. Set to `0` to disable stalled-torrent eviction entirely.
+*Default: `2160h` (three months).* How long a held torrent can sit with **no download progress** before keep-at removes it to free the slot and disk for a torrent that can actually finish. The rule covers two shapes of dead weight: **zero seeders** (no one can serve its missing pieces) and — since the relaxation — **incomplete with live seeders** (e.g. a swarm whose data mismatches the registered hashes, the territory of the broken-piece quarantine below; this is the long-tail backstop if a quarantine entry is ever released). A torrent that is fully present is always exempt: its progress clock legitimately freezes at completion, since there is nothing left to verify, and a completed torrent with a live swarm is exactly what keep-at exists to hold. The clock starts at a torrent's first observation and resets whenever it gains verified bytes, so slow-but-alive downloads are never evicted; torrents running an integrity check are exempt too (a boot-time check walks thousands of torrents at once and reads as "no progress" while it does). Set to `0` to disable stalled-torrent eviction entirely.
 
 ### `aggressiveness` / `--aggressiveness`
 
@@ -101,6 +101,30 @@ From the CLI, pass a comma-separated list: `--keyword-blocklist confidential,dra
 ### `catalog_collapse_percent` / `--catalog-collapse-percent`
 
 *Default: `30`.* Safety guard for the removal pass above: if a freshly fetched catalog parses cleanly but lists fewer than this percent of the torrents you hold, keep-at refuses to run removals that scan (a mass deletion is far more likely a parse/schema accident on the catalog side than real). The scan logs a `catalog collapse guard` warning when this happens and keeps everything seeded. `0` disables the guard, `100` demands the catalog list every held torrent before any removal. If the collapse is real and you have verified it on academictorrents.com, raise the percent (or use `--preserve-deleted-torrents`). See [RECOVERY.md](RECOVERY.md) for recovery after a wipe.
+
+## Broken-piece quarantine
+
+Some swarms are quietly poisoned: the seeders hold data that contradicts the torrent's registered piece hashes (e.g. an uploader re-generated a README after creating the torrent). Every client — not just keep-at — downloads a piece, fails its hash check, and retries from another peer, forever: megabytes per second of download with zero progress. A real incident ran like that for a week at ~2.3 GiB/h before anyone noticed. The quarantine detects the signature, removes the torrent, and cools the hash down so future scans don't re-add it, re-probing periodically in case the upstream data gets fixed. The registry lives in `<data_dir>/state.json` and survives restarts; `keep-at status` shows a `quarantined:` line while any hash is under cooldown, and drops are recorded in the history with the `quarantined` cause. Entries whose hash is no longer held, catalog-listed, or in the session — and whose cooldown has lapsed — are garbage-collected automatically at the next watchdog pass (catalog membership is judged against the last completed catalog fetch, so a still-listed hash keeps its entry and its attempts count until its probe runs; a delisted-then-relisted torrent re-enters selection as a fresh candidate). All Duration knobs in this section accept 0 (disabled) up to 366 days.
+
+### `scan.quarantine_check_interval` / `--quarantine-check-interval`
+
+*Default: `30m`.* How often the watchdog inspects per-torrent receive counters between scans (it also runs during the initial post-boot wait). `0` disables the watchdog entirely.
+
+### `scan.broken_piece_discard_bytes` / `--broken-piece-discard-bytes`
+
+*Default: `256M` (268435456).* How many **received-but-never-validated** bytes a torrent may accumulate before its swarm is declared broken. rqbit counts every received wire byte pre-validation (`fetched_bytes`) separately from bytes in pieces that passed the hash check (`downloaded_and_checked_bytes`); the gap is discarded download. The counter resets whenever any validated byte lands, so healthy-but-slow torrents never accumulate. The config-file form is a plain byte count (`268435456`); the `--broken-piece-discard-bytes` CLI flag also accepts suffix forms like `256M`.
+
+### `scan.broken_piece_min_windows` / `--broken-piece-min-windows`
+
+*Default: `2`.* Consecutive watchdog passes with zero validated bytes required on top of the discard volume above. The zero-progress streak must span two pass boundaries (about 30 minutes apart at the default cadence), which rules out transient stalls and mid-flight pieces (they get credited when their piece completes). Missed passes never burst-catch up: a pass delayed by a long scan reschedules one interval out. Must be at least 1.
+
+### `scan.quarantine_cooldown` / `--quarantine-cooldown`
+
+*Default: `3d` (259200s).* How long a quarantined hash stays un-selectable. When the cooldown lapses, the next scan re-adds the torrent as a fresh probe while the registry entry (and its attempts count) stays; the probe bypasses the seed-scarcity roll, so even a well-seeded broken swarm genuinely re-enters the session. Probes fill FREE SPACE only — a speculative probe never displaces a healthy held torrent (a full node's probe waits for room instead of trading a good holding for a likely failure). If upstream fixed their seeders, the re-probe completes against the registered hashes and the quarantine is lifted; if the swarm is still broken, the watchdog re-quarantines it after `scan.broken_piece_min_windows` consecutive zero-progress passes (about an hour after the re-probe at the default 30m cadence). A mixed swarm — most pieces valid, one poisoned — never completes and therefore never lifts, so its attempts accumulate until `scan.quarantine_max_retries` (if set) stops the cycle. `0` makes the hash re-eligible immediately (not recommended — that re-creates the churn the feature exists to prevent). Capped at 366 days by validation.
+
+### `scan.quarantine_max_retries` / `--quarantine-max-retries`
+
+*Default: `0` (unlimited).* How many quarantine cycles a hash may go through before the cooldown becomes indefinite (release by deleting the hash's entry from the `quarantined` map in state.json). Leave at 0 with the default cooldown; raise it only if a catalog entry stays broken for many months and the probe traffic bothers you.
 
 ## Memory
 

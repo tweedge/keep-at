@@ -442,3 +442,358 @@ async fn vanished_grace_defers_removal() {
         "confirmation stamp reset when the catalog lists the torrent again"
     );
 }
+
+/// The relaxed stall rule: a torrent that is INCOMPLETE but has live
+/// seeders is evictable after the stall timeout (previously the seeders>0
+/// exemption shielded it forever — that is how a broken-piece loop sat
+/// hidden for weeks; see notes/DESIGN-broken-piece-quarantine.md). Fixture
+/// torrents are permanently incomplete (their hash table is zeros), which
+/// is exactly the scenario.
+#[tokio::test(flavor = "multi_thread")]
+async fn stall_eviction_incomplete_with_seeders_evicted() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let fx = Fixture::new("stuck-with-seeders", 200_000, 1);
+    let (stub, _cat, hexes) = setup(std::slice::from_ref(&fx));
+    let hex = hexes[0].clone();
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(61),
+        1 << 30,
+    );
+    cfg.scan.stall_eviction_timeout = Duration::from_secs(3600); // survives phase 1
+    let mut engine = with_timeout(
+        60,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&_cat, &stub.base_url)),
+    )
+    .await
+    .expect("engine new");
+    with_timeout(180, "scan 1", engine.scan_once())
+        .await
+        .expect("scan 1");
+    assert_eq!(engine.held_torrents().len(), 1, "phase 1 holds it");
+    let out_dir = storage_dir.join(&hex);
+    assert!(out_dir.exists());
+    engine.close().await;
+
+    // Stale progress clock, live swarm (1 seeder): the old rule shielded
+    // this forever; the relaxed rule evicts after the timeout.
+    {
+        let mut st =
+            keep_at::state::State::load(&data_dir.join("state.json")).expect("state loads");
+        st.update(&hex, |t| {
+            t.last_known_seeders = 1;
+            t.last_progress_at = Some(chrono::Utc::now() - chrono::Duration::try_hours(2).unwrap());
+        })
+        .expect("state update");
+    }
+
+    let mut cfg2 = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(62),
+        1 << 30,
+    );
+    cfg2.scan.stall_eviction_timeout = Duration::from_secs(1);
+    let mut engine2 = with_timeout(
+        60,
+        "engine2 new",
+        keep_at::engine::Engine::new_with_options(cfg2, test_options(&_cat, &stub.base_url)),
+    )
+    .await
+    .expect("engine2 new");
+    with_timeout(180, "scan 2", engine2.scan_once())
+        .await
+        .expect("scan 2");
+    engine2.close().await;
+
+    let held2 = engine2.held_torrents();
+    assert!(
+        held2.iter().all(|t| t.info_hash != hex),
+        "incomplete torrent with seeders evicted after stall timeout"
+    );
+    assert!(!out_dir.exists(), "evicted output dir removed");
+    let (events, skipped) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert_eq!(skipped, 0);
+    let drops: Vec<&keep_at::history::Event> = events
+        .iter()
+        .filter(|e| matches!(e, keep_at::history::Event::Remove { .. }))
+        .collect();
+    match drops[0] {
+        keep_at::history::Event::Remove { cause, reason, .. } => {
+            assert_eq!(cause, &keep_at::history::Cause::Stalled);
+            assert!(
+                reason.contains("1 seeders, incomplete"),
+                "relaxed-rule reason string: {reason}"
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// The fully-present guard: a COMPLETE torrent with a live swarm must
+/// never be stall-evicted, no matter how stale its progress clock looks.
+/// Its clock legitimately froze at completion (nothing left to verify);
+/// the pre-relaxation code protected it via the seeders>0 exemption, and
+/// the relaxation must not regress that. Uses a real-hash torrent so the
+/// integrity check actually passes and rqbit reports it complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn stall_eviction_complete_torrent_survives() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let fx = Fixture::new("complete-and-healthy", 200_000, 1);
+    let state = Arc::new(Mutex::new(StubState::default()));
+    let stub = Stub::start(Stub::catalog_xml(&[]), state.clone());
+    // Deterministic content + matching piece hashes; the data file is
+    // written below so the boot integrity check passes.
+    let content: Vec<u8> = (0..fx.size).map(|i| (i % 251) as u8).collect();
+    let raw = common::torrent_bytes_with_real_pieces(&fx, &stub.tracker_url(), &content);
+    let hex = common::torrent_info_hash(&raw);
+    {
+        let mut st = stub.state.lock().unwrap();
+        st.torrents.insert(hex.clone(), raw.clone());
+        st.scrapes.insert(hex.clone(), (1, 0));
+    }
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    let (cat1, _s1) = common::serve_catalog(Stub::catalog_xml(&[(
+        fx.title.clone(),
+        hex.clone(),
+        fx.size,
+    )]));
+    std::mem::forget(_s1);
+
+    // Seed state.json directly: torrent already complete (completed_pieces
+    // == size), progress clock frozen 2h ago, live swarm. The cached
+    // .torrent is written too — resume needs it, and WITH it the boot
+    // adds the torrent into the session and the integrity check passes,
+    // so the survival assertion pins rqbit's finished-flag guard (the
+    // padding-file protection); without the cache file the test would
+    // exercise only the handle-less dir-size fallback.
+    let out_dir = storage_dir.join(&hex);
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(out_dir.join("complete-and-healthy.bin"), &content).unwrap();
+    let cache_dir = data_dir.join("torrent-cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join(format!("{hex}.torrent")), &raw).unwrap();
+    {
+        let mut st =
+            keep_at::state::State::load(&data_dir.join("state.json")).expect("state loads");
+        st.put(keep_at::state::Torrent {
+            info_hash: hex.clone(),
+            title: fx.title.clone(),
+            size_bytes: fx.size,
+            storage_location: storage_dir.clone(),
+            added_at: chrono::Utc::now() - chrono::Duration::try_hours(3).unwrap(),
+            piece_count: 1,
+            last_known_seeders: 1,
+            completed_pieces: fx.size,
+            last_progress_at: Some(chrono::Utc::now() - chrono::Duration::try_hours(2).unwrap()),
+            last_confirmed_in_catalog_at: None,
+        })
+        .expect("state put");
+    }
+
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(63),
+        1 << 30,
+    );
+    cfg.scan.stall_eviction_timeout = Duration::from_secs(1);
+    let mut engine = with_timeout(
+        60,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&cat1, &stub.base_url)),
+    )
+    .await
+    .expect("engine new");
+    with_timeout(180, "scan", engine.scan_once())
+        .await
+        .expect("scan");
+    engine.close().await;
+
+    assert_eq!(
+        engine.held_torrents().len(),
+        1,
+        "complete torrent survives the stall timeout regardless of its frozen clock"
+    );
+    let (events, skipped) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert_eq!(skipped, 0);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, keep_at::history::Event::Remove { .. })),
+        "no removal recorded for a healthy complete torrent"
+    );
+}
+
+/// The Initializing exemption: a torrent mid-integrity-check reads as
+/// "incomplete" (progress = bytes the check has walked so far) even when
+/// the data is all there, and boots run hundreds of these — without the
+/// exemption a post-crash boot would evict healthy data en masse. A big
+/// real-piece fixture keeps the check running (seconds) while the scan's
+/// eviction pass executes (~sub-second); if the machine is fast enough
+/// that the check finishes first, the finished guard skips instead and
+/// the test still passes (pinning the sibling guard).
+#[tokio::test(flavor = "multi_thread")]
+async fn stall_eviction_spares_check_in_flight() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // 256 MiB, one piece: debug-profile hashing of the check takes
+    // seconds — comfortably longer than the scan's path to evictions.
+    let fx = Fixture::new("check-in-flight", 256 * 1024 * 1024, 1);
+    let state = Arc::new(Mutex::new(StubState::default()));
+    let stub = Stub::start(Stub::catalog_xml(&[]), state.clone());
+    let content: Vec<u8> = (0..fx.size).map(|i| (i % 251) as u8).collect();
+    let raw = common::torrent_bytes_with_real_pieces(&fx, &stub.tracker_url(), &content);
+    let hex = common::torrent_info_hash(&raw);
+    {
+        let mut st = stub.state.lock().unwrap();
+        st.torrents.insert(hex.clone(), raw.clone());
+        st.scrapes.insert(hex.clone(), (1, 0));
+    }
+    let (cat1, _s1) = common::serve_catalog(Stub::catalog_xml(&[(
+        fx.title.clone(),
+        hex.clone(),
+        fx.size,
+    )]));
+    std::mem::forget(_s1);
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    let out_dir = storage_dir.join(&hex);
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(out_dir.join("check-in-flight.bin"), &content).unwrap();
+    let cache_dir = data_dir.join("torrent-cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join(format!("{hex}.torrent")), &raw).unwrap();
+    {
+        let mut st =
+            keep_at::state::State::load(&data_dir.join("state.json")).expect("state loads");
+        st.put(keep_at::state::Torrent {
+            info_hash: hex.clone(),
+            title: fx.title.clone(),
+            size_bytes: fx.size,
+            storage_location: storage_dir.clone(),
+            added_at: chrono::Utc::now() - chrono::Duration::try_hours(3).unwrap(),
+            piece_count: 1,
+            last_known_seeders: 1,
+            // Complete stamp: the mid-check partial progress must never
+            // restamp the clock below it, keeping the eviction judgment
+            // on the seeded 2h-stale stamp.
+            completed_pieces: fx.size,
+            last_progress_at: Some(chrono::Utc::now() - chrono::Duration::try_hours(2).unwrap()),
+            last_confirmed_in_catalog_at: None,
+        })
+        .expect("state put");
+    }
+
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(64),
+        1 << 30,
+    );
+    cfg.scan.stall_eviction_timeout = Duration::from_secs(1);
+    let mut engine = with_timeout(
+        120,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&cat1, &stub.base_url)),
+    )
+    .await
+    .expect("engine new");
+    with_timeout(300, "scan", engine.scan_once())
+        .await
+        .expect("scan");
+    engine.close().await;
+
+    assert_eq!(
+        engine.held_torrents().len(),
+        1,
+        "torrent mid-integrity-check (or freshly finished) must not be stall-evicted"
+    );
+    let (events, skipped) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert_eq!(skipped, 0);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, keep_at::history::Event::Remove { .. })),
+        "no removal recorded for a check in flight"
+    );
+}
+
+/// The handle-less eviction direction: a held torrent the session lost
+/// (boot resume skipped it — no cached .torrent) with missing data
+/// (dir absent → dir-size fallback reads 0) is evictable after the stall
+/// timeout, and remove_torrent on an absent session handle must not fail
+/// the scan. This is the "data dir deleted externally" recovery path.
+#[tokio::test(flavor = "multi_thread")]
+async fn stall_eviction_handleless_evicts_missing_data() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let fx = Fixture::new("handleless-gone", 200_000, 1);
+    let (stub, _cat, hexes) = setup(std::slice::from_ref(&fx));
+    let hex = hexes[0].clone();
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    // State entry ONLY: no cache file (resume skips → no session handle),
+    // no output dir (data gone). Stale progress clock.
+    {
+        let mut st =
+            keep_at::state::State::load(&data_dir.join("state.json")).expect("state loads");
+        st.put(keep_at::state::Torrent {
+            info_hash: hex.clone(),
+            title: fx.title.clone(),
+            size_bytes: fx.size,
+            storage_location: storage_dir.clone(),
+            added_at: chrono::Utc::now() - chrono::Duration::try_hours(3).unwrap(),
+            piece_count: 0,
+            last_known_seeders: 1,
+            completed_pieces: 0,
+            last_progress_at: Some(chrono::Utc::now() - chrono::Duration::try_hours(2).unwrap()),
+            last_confirmed_in_catalog_at: None,
+        })
+        .expect("state put");
+    }
+
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(65),
+        1 << 30,
+    );
+    cfg.scan.stall_eviction_timeout = Duration::from_secs(1);
+    let mut engine = with_timeout(
+        60,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&_cat, &stub.base_url)),
+    )
+    .await
+    .expect("engine new");
+    with_timeout(180, "scan", engine.scan_once())
+        .await
+        .expect("scan");
+    engine.close().await;
+
+    let held = engine.held_torrents();
+    assert!(
+        held.iter().all(|t| t.info_hash != hex),
+        "handle-less torrent with missing data evicted after the stall timeout"
+    );
+    let (events, skipped) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert_eq!(skipped, 0);
+    let drops: Vec<&keep_at::history::Event> = events
+        .iter()
+        .filter(|e| matches!(e, keep_at::history::Event::Remove { .. }))
+        .collect();
+    match drops[0] {
+        keep_at::history::Event::Remove { cause, .. } => {
+            assert_eq!(cause, &keep_at::history::Cause::Stalled);
+        }
+        _ => unreachable!(),
+    }
+}

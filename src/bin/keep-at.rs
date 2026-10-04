@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
             keep_at::forensics::print_triage_last_exit(&dir);
             Ok(())
         }
-        Command::SelfUpdate(a) => cmd_self_update(a.beta).await,
+        Command::SelfUpdate(a) => cmd_self_update(a.beta, &a.common).await,
         Command::Version => {
             println!("keep-at {}", keep_at::buildinfo::VERSION);
             Ok(())
@@ -484,7 +484,7 @@ async fn cmd_service(s: keep_at::cli::ServiceArgs) -> Result<()> {
     }
 }
 
-async fn cmd_self_update(beta: bool) -> Result<()> {
+async fn cmd_self_update(beta: bool, common: &keep_at::cli::CommonArgs) -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
@@ -511,6 +511,25 @@ async fn cmd_self_update(beta: bool) -> Result<()> {
         return Ok(());
     }
     println!("updating keep-at {current} -> {latest}...");
+    // Snapshot state.json BEFORE the binary is replaced: the new release
+    // may widen state fields (0.8.30 did: completed_pieces u32 -> u64),
+    // and a later rollback of a refreshed state crashes the OLD binary at
+    // load (watchdog restarts it into a crash loop). Best-effort: any
+    // failure logs and continues — the update must not depend on it
+    // (docs/RECOVERY.md "Rollback and state.json compatibility").
+    match keep_at::cli::resolve_data_dir(common) {
+        Ok(data_dir) => {
+            let from = data_dir.join("state.json");
+            if from.exists() {
+                let to = data_dir.join(format!("state.json.pre-{latest}"));
+                match std::fs::copy(&from, &to) {
+                    Ok(_) => println!("state snapshot: {}", to.display()),
+                    Err(e) => eprintln!("warning: state snapshot failed ({e:#}); update continues"),
+                }
+            }
+        }
+        Err(e) => eprintln!("warning: could not locate data dir for state snapshot ({e:#})"),
+    }
     let exe = std::env::current_exe().context("locating keep-at executable")?;
     // Root-owned binary in /usr/local/bin or /usr/bin: a plain replace
     // fails with permission denied. Elevate (re-exec self, same policy as

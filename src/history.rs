@@ -60,6 +60,11 @@ pub enum Cause {
     Stalled,
     /// No longer listed on Academic Torrents.
     DeletedFromCatalog,
+    /// Broken-piece quarantine: the swarm kept feeding bytes that never
+    /// passed hash validation (poisoned/mis-seeded swarm); removed and
+    /// cooling down for a periodic re-probe. See
+    /// notes/DESIGN-broken-piece-quarantine.md.
+    Quarantined,
 }
 
 impl Cause {
@@ -69,6 +74,7 @@ impl Cause {
             Cause::Swap => "swap",
             Cause::Stalled => "stalled",
             Cause::DeletedFromCatalog => "deleted-from-catalog",
+            Cause::Quarantined => "quarantined",
         }
     }
 }
@@ -299,14 +305,29 @@ pub fn cap_text_file(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
 // Reader (CLI side)
 // ---------------------------------------------------------------------------
 
-/// Parse the whole history file: `(events, unparseable lines skipped)`.
-/// Unparseable lines are torn writes (crash mid-append) or lines from a
-/// newer format; skipping keeps `history` working across both.
+/// Parse the history: the live file PLUS the immediately previous
+/// generation (`<path>.1`) when rotation has produced one. Trip storms
+/// (many removals in one pass) can rotate events into `.1`, which the
+/// commands never read before — a forensically relevant removal could
+/// then be invisible to every history view (the wipe-recovery recipe in
+/// RECOVERY.md included).
 pub fn read_events(path: &Path) -> (Vec<Event>, usize) {
-    let Ok(data) = std::fs::read(path) else {
-        return (Vec::new(), 0);
-    };
-    parse_lines(&data)
+    let mut events = Vec::new();
+    let mut skipped = 0usize;
+    let mut prev = path.as_os_str().to_owned();
+    prev.push(".1");
+    let prev = std::path::PathBuf::from(prev);
+    if let Ok(data) = std::fs::read(&prev) {
+        let (mut evs, sk) = parse_lines(&data);
+        events.append(&mut evs);
+        skipped += sk;
+    }
+    if let Ok(data) = std::fs::read(path) {
+        let (mut evs, sk) = parse_lines(&data);
+        events.append(&mut evs);
+        skipped += sk;
+    }
+    (events, skipped)
 }
 
 fn parse_lines(data: &[u8]) -> (Vec<Event>, usize) {
@@ -604,13 +625,13 @@ mod tests {
         }
         let rotated = dir.path().join("history.jsonl.1");
         assert!(rotated.exists(), "rotation produced a .1 file");
+        // read_events merges BOTH generations chronologically (.1 first,
+        // then live): rotated-away events stay auditable.
         let (events, skipped) = read_events(&path);
         assert_eq!(skipped, 0);
-        assert_eq!(events.len(), 1, "live file holds only the newest event");
-        assert_eq!(event_title(&events[0]), "title-3");
-        let (old_events, _) = read_events(&rotated);
-        assert_eq!(old_events.len(), 1, ".1 holds the previous generation");
-        assert_eq!(event_title(&old_events[0]), "title-2");
+        assert_eq!(events.len(), 2, "previous generation + live file");
+        assert_eq!(event_title(&events[0]), "title-2");
+        assert_eq!(event_title(&events[1]), "title-3");
     }
 
     fn event_title(ev: &Event) -> &str {

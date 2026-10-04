@@ -88,7 +88,21 @@ pub async fn remove_torrent(
     // errored torrents re-creates storage through the pooled factory, which
     // still needs the registry entry for output_folder.
     if let Err(e) = session.delete(TorrentIdOrHash::Hash(id), true).await {
+        // rqbit removes the torrent from its db FIRST, then deletes files;
+        // a file-deletion failure (EIO, EBUSY, perms) leaves the data
+        // orphaned on disk with the torrent gone from every view. Eviction
+        // intent here is unconditional (every caller passed delete=true),
+        // so clean the hash dir recursively best-effort instead of leaving
+        // silent orphans that only device_free_bytes ever reveals.
         tracing::warn!("delete({info_hash_hex}) reported an error: {e:#}");
+        if output_dir.exists() {
+            if let Err(e2) = std::fs::remove_dir_all(output_dir) {
+                tracing::error!(
+                    "orphaned data at {} could not be removed either: {e2:#}",
+                    output_dir.display()
+                );
+            }
+        }
     }
     crate::engine::pool_storage::unregister_torrent(id.0);
     // Belt and suspenders: delete(true) removes torrent files; also drop the

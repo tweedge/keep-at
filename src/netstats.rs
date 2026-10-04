@@ -66,6 +66,10 @@ pub struct RuntimeStats {
     pub seeding_torrents: usize,
     #[serde(default)]
     pub downloading_torrents: usize,
+    /// Hashes currently in the broken-piece quarantine registry
+    /// (removed from the session, not re-selectable until cooldown).
+    #[serde(default)]
+    pub quarantined_torrents: usize,
     #[serde(default)]
     pub disk_used_bytes: u64,
     #[serde(default)]

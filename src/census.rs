@@ -223,8 +223,12 @@ impl RateState {
         if now < self.next_allowed {
             tokio::time::sleep(self.next_allowed - now).await;
         }
-        self.next_allowed =
-            tokio::time::Instant::now() + Duration::from_secs_f64(1.0 / self.per_second);
+        // try_from, not from: 1/rate overflows Duration for tiny rates
+        // (panic = abort in release); validate() floors rates, so this
+        // clamp is unreachable belt-and-braces.
+        let gap = Duration::try_from_secs_f64(1.0 / self.per_second)
+            .unwrap_or(Duration::from_secs(365 * 24 * 3600));
+        self.next_allowed = tokio::time::Instant::now() + gap;
     }
 }
 

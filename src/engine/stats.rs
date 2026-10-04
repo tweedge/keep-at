@@ -17,11 +17,13 @@ pub fn runtime_stats_path(data_dir: &Path) -> std::path::PathBuf {
 }
 
 /// Collect a RuntimeStats from live session + state + disk.
+#[allow(clippy::too_many_arguments)]
 pub fn collect(
     api: &librqbit::Api,
     started_at: Instant,
     held: usize,
     seeding: usize,
+    quarantined: usize,
     disk_used: u64,
     disk_limit: u64,
     disk_committed: u64,
@@ -34,6 +36,7 @@ pub fn collect(
         held_torrents: held,
         seeding_torrents: seeding,
         downloading_torrents: held.saturating_sub(seeding),
+        quarantined_torrents: quarantined,
         disk_used_bytes: disk_used,
         disk_limit_bytes: disk_limit,
         disk_committed_bytes: disk_committed,

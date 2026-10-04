@@ -172,6 +172,10 @@ async fn collapse_guard_zero_disables_and_removal_proceeds() {
         1 << 30,
     );
     cfg3.catalog_collapse_percent = 0; // operator disables the guard
+                                       // Immediate deleted-removal like the rest of the suite (the suite-wide
+                                       // assumption used to ride on the derived zero-default timeout; now it
+                                       // is explicit — see maintenance.rs).
+    cfg3.scan.vanished_eviction_timeout = std::time::Duration::ZERO;
     let mut engine3 = with_timeout(
         60,
         "engine3 new",

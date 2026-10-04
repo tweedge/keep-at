@@ -2,6 +2,7 @@
 //! stall eviction, and plain on-disk storage.
 
 pub mod pool_storage;
+pub mod quarantine;
 pub mod ram;
 pub mod scan;
 pub mod session;

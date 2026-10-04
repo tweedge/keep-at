@@ -117,6 +117,7 @@ fn print_live(v: &live::RuntimeView) {
         v.held_torrents,
         v.seeding_torrents,
         v.downloading_torrents,
+        v.quarantined_torrents,
         v.disk_used_bytes,
         v.disk_limit_bytes,
         v.disk_committed_bytes,
@@ -179,6 +180,7 @@ fn print_snapshot(rs: &netstats::RuntimeStats) {
         rs.held_torrents,
         rs.seeding_torrents,
         rs.downloading_torrents,
+        rs.quarantined_torrents,
         rs.disk_used_bytes,
         rs.disk_limit_bytes,
         rs.disk_committed_bytes,
@@ -202,6 +204,7 @@ fn print_numbers(
     held: usize,
     seeding: usize,
     downloading: usize,
+    quarantined: usize,
     disk_used: u64,
     disk_limit: u64,
     disk_committed: u64,
@@ -211,6 +214,14 @@ fn print_numbers(
     rss: u64,
 ) {
     println!("  torrents: {held} held, {seeding} seeding, {downloading} downloading");
+    // Only printed when nonzero: most nodes carry no quarantine entries,
+    // and the empty case is pure noise.
+    if quarantined > 0 {
+        let plural = if quarantined == 1 { "" } else { "s" };
+        println!(
+            "  quarantined: {quarantined} broken-swarm torrent{plural} (removed, re-probed after cooldown)"
+        );
+    }
     if disk_limit > 0 {
         let pct = if disk_limit > 0 {
             (disk_used as f64 / disk_limit as f64 * 100.0).min(100.0)

@@ -167,6 +167,69 @@ pub fn torrent_info_hash(raw: &[u8]) -> String {
     hex::encode(md.info_hash)
 }
 
+/// A single-file fixture torrent whose piece hashes match `content` for
+/// real: an integrity check over files holding `content` PASSES and the
+/// torrent counts as complete (fixture torrents built by `torrent_bytes`
+/// carry an all-zero hash table, so no check can ever pass on them).
+/// Same wire layout as `torrent_bytes`.
+pub fn torrent_bytes_with_real_pieces(
+    fixture: &Fixture,
+    tracker_url: &str,
+    content: &[u8],
+) -> Vec<u8> {
+    use sha1::Digest;
+    assert_eq!(
+        content.len() as u64,
+        fixture.size,
+        "real-pieces builder is single-file, content must match fixture size"
+    );
+    let piece_len = fixture.piece_len.max(1) as usize;
+    let mut pieces = Vec::new();
+    for chunk in content.chunks(piece_len) {
+        let mut h = sha1::Sha1::new();
+        h.update(chunk);
+        pieces.extend_from_slice(&h.finalize());
+    }
+    let safe_title: String = fixture
+        .title
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = format!("{safe_title}.bin");
+    let mut info = vec![b'd'];
+    let mut field = |k: &[u8], raw_value: Vec<u8>| {
+        info.extend_from_slice(format!("{}:", k.len()).as_bytes());
+        info.extend_from_slice(k);
+        info.extend_from_slice(&raw_value);
+    };
+    field(b"length", bencode_int(fixture.size as i64));
+    field(b"name", bencode_str(name.as_bytes()));
+    field(
+        b"piece length",
+        bencode_int(fixture.piece_len.max(1) as i64),
+    );
+    field(b"pieces", bencode_raw(&pieces));
+    info.push(b'e');
+    let mut real = vec![b'd'];
+    let mut rf = |k: &[u8], s: &[u8]| {
+        real.extend_from_slice(format!("{}:", k.len()).as_bytes());
+        real.extend_from_slice(k);
+        real.extend_from_slice(format!("{}:", s.len()).as_bytes());
+        real.extend_from_slice(s);
+    };
+    rf(b"announce", tracker_url.as_bytes());
+    real.extend_from_slice(b"4:info");
+    real.extend_from_slice(&info);
+    real.push(b'e');
+    real
+}
+
 fn bencode_int(v: i64) -> Vec<u8> {
     format!("i{v}e").into_bytes()
 }

@@ -191,3 +191,261 @@ async fn floor_gates_second_scan() {
     assert_eq!(stats2.total, 0, "everything already held: nothing pending");
     let _ = Duration::ZERO;
 }
+
+/// The broken-piece quarantine registry gates acting: a hash under an
+/// active cooldown is never added (while other candidates are), and a
+/// lapsed cooldown passes through — the hash is re-probed by the next
+/// scan while the entry (and its attempts count) stays in the registry.
+/// See notes/DESIGN-broken-piece-quarantine.md.
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantined_hash_skipped_until_cooldown_lapses() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let fixtures = vec![
+        Fixture::new("quarantined-one", 50_000, 1),
+        Fixture::new("fresh-two", 50_000, 4),
+    ];
+    let (_stub, catalog_base, hexes) = setup(&fixtures);
+    let (hex_a, hex_b) = (hexes[0].clone(), hexes[1].clone());
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+
+    // Pre-seed the registry: hash A under an active cooldown, nothing held.
+    {
+        let mut st =
+            keep_at::state::State::load(&data_dir.join("state.json")).expect("state loads");
+        st.quarantine_put(
+            hex_a.clone(),
+            keep_at::state::Quarantine {
+                title: "quarantined-one".to_string(),
+                reason: "discarded 300 MiB across 2 zero-progress passes (attempt 1)".to_string(),
+                quarantined_at: chrono::Utc::now(),
+                cooldown_until: chrono::Utc::now() + chrono::Duration::try_hours(1).unwrap(),
+                attempts: 1,
+                wasted_bytes: 300 * 1024 * 1024,
+            },
+        )
+        .expect("registry seed");
+    }
+
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(81),
+        1 << 30,
+    );
+    cfg.scan.quarantine_check_interval = Duration::ZERO; // watchdog off; gate only
+    let mut engine = with_timeout(
+        60,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(
+            cfg,
+            test_options(&catalog_base, &_stub.base_url),
+        ),
+    )
+    .await
+    .expect("engine new");
+    with_timeout(180, "scan 1", engine.scan_once())
+        .await
+        .expect("scan 1");
+    engine.close().await;
+
+    let held = engine.held_torrents();
+    assert!(
+        held.iter().all(|t| t.info_hash != hex_a),
+        "actively-quarantined hash must not be added"
+    );
+    assert!(
+        held.iter().any(|t| t.info_hash == hex_b),
+        "other candidates are unaffected"
+    );
+    assert_eq!(held.len(), 1);
+    let st = keep_at::state::State::load(&data_dir.join("state.json")).unwrap();
+    assert_eq!(st.quarantine_count(), 1, "entry survives the scan");
+    let (events, _) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, keep_at::history::Event::Add { hash, .. } if hash == &hex_a)),
+        "no Add recorded for the quarantined hash"
+    );
+
+    // Phase 2: the cooldown lapses. The gate passes the hash through and
+    // the next scan re-probes it: A is added like any candidate.
+    {
+        let mut st = keep_at::state::State::load(&data_dir.join("state.json")).unwrap();
+        st.quarantine_put(
+            hex_a.clone(),
+            keep_at::state::Quarantine {
+                cooldown_until: chrono::Utc::now() - chrono::Duration::try_seconds(1).unwrap(),
+                ..st.quarantine_get(&hex_a).expect("entry still there")
+            },
+        )
+        .expect("registry update");
+    }
+    let mut cfg2 = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(82),
+        1 << 30,
+    );
+    cfg2.scan.quarantine_check_interval = Duration::ZERO;
+    let mut engine2 = with_timeout(
+        60,
+        "engine2 new",
+        keep_at::engine::Engine::new_with_options(
+            cfg2,
+            test_options(&catalog_base, &_stub.base_url),
+        ),
+    )
+    .await
+    .expect("engine2 new");
+    with_timeout(180, "scan 2", engine2.scan_once())
+        .await
+        .expect("scan 2");
+    engine2.close().await;
+
+    let held2 = engine2.held_torrents();
+    assert!(
+        held2.iter().any(|t| t.info_hash == hex_a),
+        "lapsed cooldown re-probes the hash"
+    );
+    // The entry STAYS after the lapse (the gate passes through without
+    // deleting): the attempts count must survive so max_retries can
+    // escalate repeat offenders. It is lifted only when the re-probe
+    // COMPLETES against the registered hashes — this fixture torrent can
+    // never complete (zero piece hashes), so the entry remains.
+    let st2 = keep_at::state::State::load(&data_dir.join("state.json")).unwrap();
+    let q2 = st2
+        .quarantine_get(&hex_a)
+        .expect("lapsed entry retained for attempts");
+    assert_eq!(q2.attempts, 1);
+}
+
+/// A lapsed re-probe must never DISPLACE a held torrent: the probe is
+/// speculative (expected to fail and re-quarantine), while try_swap
+/// DELETES the displaced torrent's data — so a full node trading a
+/// healthy, better-seeded holding for a likely failure would erode the
+/// library one torrent per cooldown, forever under the unlimited (0)
+/// max_retries default. Economics mirror tests/swaps.rs: the candidate
+/// fits the location only by displacing, the margin favors the probe (it
+/// IS the rarer torrent), and the seed-scarcity bypass would swap it in —
+/// until the free-space-only rule stops it at the probe guard. The held
+/// torrent must survive with its data; the registry entry keeps its
+/// attempts count for a later probe once space frees up.
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantine_probe_never_displaces_held() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let held_fx = Fixture::new("held-safe", 100_000_000, 10);
+    let probe_fx = Fixture::new("probe-broken", 51_200_000, 1);
+    let (_stub, _cat, hexes) = setup(&[held_fx.clone(), probe_fx.clone()]);
+    let (held_hex, probe_hex) = (hexes[0].clone(), hexes[1].clone());
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+
+    // Phase 1: hold the 10-seeder torrent alone (the future swap victim).
+    let (cat1, _s1) = common::serve_catalog(Stub::catalog_xml(&[(
+        held_fx.title.clone(),
+        held_hex.clone(),
+        held_fx.size,
+    )]));
+    std::mem::forget(_s1);
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(83),
+        150_000_000,
+    );
+    cfg.scan.min_seed_margin = 4;
+    cfg.scan.quarantine_check_interval = Duration::ZERO; // watchdog off; gate only
+    let mut engine = with_timeout(
+        60,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&cat1, &_stub.base_url)),
+    )
+    .await
+    .expect("engine new");
+    with_timeout(180, "scan 1", engine.scan_once())
+        .await
+        .expect("scan 1");
+    engine.close().await;
+    let held1 = engine.held_torrents();
+    assert!(
+        held1.iter().any(|t| t.info_hash == held_hex),
+        "phase 1 holds the victim"
+    );
+    let out_dir = storage_dir.join(&held_hex);
+    assert!(out_dir.exists(), "victim data on disk");
+
+    // Phase 2: the probe candidate is listed and lapsed; the location is
+    // full enough that only a swap could fit it.
+    {
+        let mut st =
+            keep_at::state::State::load(&data_dir.join("state.json")).expect("state loads");
+        st.quarantine_put(
+            probe_hex.clone(),
+            keep_at::state::Quarantine {
+                title: probe_fx.title.clone(),
+                reason: "discarded 300 MiB across 2 zero-progress passes (attempt 1)".to_string(),
+                quarantined_at: chrono::Utc::now() - chrono::Duration::try_hours(4).unwrap(),
+                cooldown_until: chrono::Utc::now() - chrono::Duration::try_seconds(1).unwrap(),
+                attempts: 1,
+                wasted_bytes: 300 * 1024 * 1024,
+            },
+        )
+        .expect("registry seed");
+    }
+    let (cat2, _s2) = common::serve_catalog(Stub::catalog_xml(&[(
+        probe_fx.title.clone(),
+        probe_hex.clone(),
+        probe_fx.size,
+    )]));
+    std::mem::forget(_s2);
+    let mut cfg2 = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(84),
+        150_000_000,
+    );
+    cfg2.scan.min_seed_margin = 4;
+    cfg2.scan.quarantine_check_interval = Duration::ZERO;
+    let mut engine2 = with_timeout(
+        60,
+        "engine2 new",
+        keep_at::engine::Engine::new_with_options(cfg2, test_options(&cat2, &_stub.base_url)),
+    )
+    .await
+    .expect("engine2 new");
+    with_timeout(180, "scan 2", engine2.scan_once())
+        .await
+        .expect("scan 2");
+    engine2.close().await;
+
+    let held2 = engine2.held_torrents();
+    assert!(
+        held2.iter().any(|t| t.info_hash == held_hex),
+        "the healthy held torrent survives a lapsed re-probe (probes never displace)"
+    );
+    assert!(
+        held2.iter().all(|t| t.info_hash != probe_hex),
+        "the probe was deferred, not added via swap"
+    );
+    assert!(
+        storage_dir.join(&held_hex).exists(),
+        "victim data intact — no displacement deleted it"
+    );
+    let st2 = keep_at::state::State::load(&data_dir.join("state.json")).unwrap();
+    let q2 = st2
+        .quarantine_get(&probe_hex)
+        .expect("entry survives the deferred probe (attempts preserved)");
+    assert_eq!(q2.attempts, 1);
+    let (events, skipped) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert_eq!(skipped, 0);
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, keep_at::history::Event::Remove { hash, .. } if hash == &held_hex)
+        ),
+        "no removal recorded for the victim"
+    );
+}

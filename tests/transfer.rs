@@ -11,7 +11,7 @@ mod common;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use common::{torrent_bytes, torrent_info_hash, Fixture};
+use common::{torrent_bytes, torrent_bytes_with_real_pieces, torrent_info_hash, Fixture};
 use librqbit::storage::StorageFactoryExt;
 
 fn run_tracker(
@@ -57,69 +57,6 @@ fn run_tracker(
         }
     });
     format!("http://{addr}")
-}
-
-/// Build `.torrent` bytes like the shared generator, but with REAL piece
-/// hashes of `content` so a session holding those files counts as a seed.
-/// (The shared generator emits zero hashes: fine for metadata-only Engine
-/// tests, useless for byte transfer.)
-fn torrent_bytes_with_pieces(fx: &Fixture, tracker_url: &str, content: &[u8]) -> Vec<u8> {
-    use sha1::Digest;
-    let piece_len = fx.piece_len.max(1) as usize;
-    let mut pieces = Vec::new();
-    for chunk in content.chunks(piece_len) {
-        let mut h = sha1::Sha1::new();
-        h.update(chunk);
-        pieces.extend_from_slice(&h.finalize());
-    }
-    // Same layout as common::torrent_bytes, with real hashes spliced in.
-    let safe_title: String = fx
-        .title
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let name = format!("{safe_title}.bin");
-    let mut info = vec![b'd'];
-    let mut field = |k: &[u8], raw_value: Vec<u8>| {
-        info.extend_from_slice(format!("{}:", k.len()).as_bytes());
-        info.extend_from_slice(k);
-        info.extend_from_slice(&raw_value);
-    };
-    // Values here are already bencoded forms (int / prefixed string).
-    field(b"length", format!("i{}e", fx.size).into_bytes());
-    field(b"name", {
-        let mut v = format!("{}:", name.len()).into_bytes();
-        v.extend_from_slice(name.as_bytes());
-        v
-    });
-    field(
-        b"piece length",
-        format!("i{}e", fx.piece_len.max(1)).into_bytes(),
-    );
-    field(b"pieces", {
-        let mut v = format!("{}:", pieces.len()).into_bytes();
-        v.extend_from_slice(&pieces);
-        v
-    });
-    info.push(b'e');
-    let mut real = vec![b'd'];
-    let mut rf = |k: &[u8], s: &[u8]| {
-        real.extend_from_slice(format!("{}:", k.len()).as_bytes());
-        real.extend_from_slice(k);
-        real.extend_from_slice(format!("{}:", s.len()).as_bytes());
-        real.extend_from_slice(s);
-    };
-    rf(b"announce", tracker_url.as_bytes());
-    real.extend_from_slice(b"4:info");
-    real.extend_from_slice(&info);
-    real.push(b'e');
-    real
 }
 
 fn session_options(port: u16) -> librqbit::SessionOptions {
@@ -174,7 +111,7 @@ async fn two_session_byte_transfer() {
     // Rebuild the .torrent with REAL piece hashes of the content (the shared
     // fixture generator emits zero hashes, fine for metadata-only Engine
     // tests, but a seeder must hash-match its files to count as complete).
-    let raw = torrent_bytes_with_pieces(&fx, &tracker_url, &content);
+    let raw = torrent_bytes_with_real_pieces(&fx, &tracker_url, &content);
     let _hex = torrent_info_hash(&raw);
 
     // Seeder session: add with overwrite=true so it hashes existing files

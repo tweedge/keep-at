@@ -53,3 +53,17 @@ If an older build (pre-0.8.24) already wiped the library:
      /backups/keep-at/$(date +%F)/
    ```
    `state.json` alone is enough to restore holdings after a restart; `history.jsonl` is the durable ledger.
+
+## Rollback and state.json compatibility
+
+`completed_pieces` in state.json has stored verified-byte counts since the progress tracking moved to bytes, and since the broken-piece quarantine release (0.8.30) it is a full `u64`: torrents larger than 4 GiB hold their real byte counts instead of the old u32-saturated sentinel value.
+
+A binary from BEFORE that release parses the field as `u32` and **fails fatally** when a state.json written by the new binary contains a value above 4294967295 - and a failed state load aborts the boot, so the watchdog restarts the daemon into a crash loop. Rolling back is therefore a one-way door once the new binary has refreshed state (first scan, or the first broken-piece watchdog pass at most 30 minutes after boot).
+
+Before promoting the new binary, snapshot the state so rollback is possible:
+
+```
+cp <data_dir>/state.json <data_dir>/state.json.pre-0.8.30
+```
+
+To roll back: stop the daemon, restore the snapshot (or hand-clamp every `completed_pieces` value to at most `4294967295`), then start the old binary. The `quarantined` key the new binary adds is harmless to older binaries (they ignore unknown keys), so the snapshot is the only blocker.

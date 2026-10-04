@@ -76,6 +76,17 @@ pub struct Engine {
     /// Append-only record of additions, swaps, and removals
     /// (<data_dir>/history.jsonl, rendered by `keep-at history`).
     history: crate::history::Writer,
+    /// Broken-piece watchdog state (per-torrent receive-counter deltas).
+    /// In-memory; the persistent half of the feature is the quarantine
+    /// registry inside state.json.
+    detector: crate::engine::quarantine::Detector,
+    /// Hash set of the most recent catalog fetch, kept for the quarantine
+    /// registry GC: an entry may only be dropped when its hash is neither
+    /// held, in the session, nor catalog-listed (a listed hash must keep
+    /// its entry — and its attempts count — until the lapsed cooldown
+    /// re-probe runs). None until the first catalog fetch of this boot
+    /// completes; GC waits rather than guessing until then.
+    last_catalog: Option<HashSet<String>>,
 }
 
 /// Counters from the most recent scan, for tests and status callers.
@@ -122,7 +133,12 @@ impl RateLimiter {
         if now < self.next_allowed {
             tokio::time::sleep(self.next_allowed - now).await;
         }
-        let gap = Duration::from_secs_f64(1.0 / self.per_second);
+        // try_from, not from: a rate of 1e-300 passes the NaN/positivity
+        // guard but 1/rate overflows Duration (panic = abort in release);
+        // validate() floors rates at 1e-6, so this clamp is unreachable
+        // belt-and-braces.
+        let gap = Duration::try_from_secs_f64(1.0 / self.per_second)
+            .unwrap_or(Duration::from_secs(365 * 24 * 3600));
         self.next_allowed = tokio::time::Instant::now() + gap;
     }
 }
@@ -668,6 +684,8 @@ impl Engine {
             completed_seen: std::sync::Mutex::new(std::collections::HashSet::new()),
             live: None,
             history,
+            detector: crate::engine::quarantine::Detector::new(),
+            last_catalog: None,
         };
         eng.blocklist = KeywordBlocklist::new(eng.cfg.keyword_blocklist.clone());
         {
@@ -723,6 +741,7 @@ impl Engine {
         handle.activate(
             self.session.clone(),
             self.api.clone(),
+            self.state.quarantine_count(),
             snapshot_entries(&self.state),
         );
         self.live = Some(handle);
@@ -731,7 +750,7 @@ impl Engine {
     /// Push current state to the live handle (no-op when no server).
     fn push_live(&self) {
         if let Some(live) = &self.live {
-            live.refresh(snapshot_entries(&self.state));
+            live.refresh(self.state.quarantine_count(), snapshot_entries(&self.state));
         }
     }
 
@@ -760,12 +779,11 @@ impl Engine {
         self.log_and_save_runtime("startup");
 
         // Periodic runtime stats tick on their own interval. The ticker is
-        // created BEFORE the next-scan delay wait and armed in both select
-        // loops: a host sleeping out a long scan-interval (e.g. 336h with a
-        // recent completion) still gets periodic stats passes and tracker
-        // feeds — previously the ticker was created after the delay, so the
-        // whole sleep went without stats and the persisted snapshot went
-        // stale for days.
+        // created BEFORE the single run loop's first wait: a host sleeping
+        // out a long scan delay (e.g. 336h with a recent completion) still
+        // gets periodic stats passes and tracker feeds — previously the
+        // ticker was created after the delay, so the whole sleep went
+        // without stats and the persisted snapshot went stale for days.
         let stats_interval = self.cfg.stats_interval;
         let mut stats_tick = tokio::time::interval(stats_interval.max(Duration::from_secs(60)));
         if stats_interval <= Duration::ZERO {
@@ -773,70 +791,127 @@ impl Engine {
             stats_tick = tokio::time::interval(Duration::from_secs(3600 * 24 * 365));
         } else {
             // Consume the immediate first tick (startup already logged its
-            // stats line above); periodic passes then come at the proper
-            // cadence from whichever select is live.
+            // stats line above); periodic passes then fire from the single
+            // run loop at the proper cadence.
             stats_tick.tick().await;
         }
 
-        if self.delay_until_next_scan() > Duration::ZERO {
-            let d = self.delay_until_next_scan();
+        // Broken-piece watchdog on its own cadence (also disabled via 0).
+        // Same arming pattern as stats_tick: armed in the single run-loop
+        // select, so passes fire during both the post-boot wait and the
+        // between-scan waits. Delay (not the default Burst) on purpose: a
+        // burst of back-to-back catch-up passes after a long scan would
+        // inflate the detector's zero-progress window count with sub-second
+        // gaps, breaking the documented "two passes one interval apart"
+        // guarantee. Delay reschedules one interval after the last pass.
+        let quarantine_interval = self.cfg.scan.quarantine_check_interval;
+        let quarantine_on = quarantine_interval > Duration::ZERO;
+        let mut quarantine_tick =
+            tokio::time::interval(quarantine_interval.max(Duration::from_secs(60)));
+        quarantine_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        if !quarantine_on {
+            quarantine_tick = tokio::time::interval(Duration::from_secs(3600 * 24 * 365));
+        } else {
+            quarantine_tick.tick().await;
+        }
+
+        // ONE loop, scans deadline-driven. The deadline derives from
+        // delay_until_next_scan() (scan_completed_at + interval), so the
+        // schedule is anchored to actual scan completions with no interval
+        // ticker to drift, and the periodic arms exist in exactly one
+        // place. The previous two-loop structure (bare-select wait, then a
+        // tickered main loop) duplicated these arms, and both of its bugs
+        // were of exactly that drift class: the ticker was once created
+        // after the delay (whole sleep went without stats), and the bare
+        // select ended the post-boot wait on the first stats tick
+        // (observed live: Sep 21 + Sep 26 boots scanned ~30min in, days
+        // early).
+        let first_wait = self.delay_until_next_scan();
+        let mut deadline = tokio::time::Instant::now() + first_wait;
+        let mut first_scan = true;
+        if first_wait > Duration::ZERO {
             tracing::info!(
                 "next scan is not due yet; waiting {} instead of scanning immediately",
-                crate::humanize::human_duration(d)
+                crate::humanize::human_duration(first_wait)
             );
-            let mut shutdown_rx3 = shutdown.clone();
-            tokio::select! {
-                _ = tokio::time::sleep(d) => {}
-                _ = stats_tick.tick() => { self.log_and_save_runtime("periodic"); }
-                _ = shutdown_rx3.changed() => return Ok(()),
-            }
         }
-        // Consume the immediate first tick: tokio intervals fire at once on
-        // creation, which would otherwise launch a second full scan the
-        // instant the initial scan finishes (observed live: two back-to-back
-        // full catalog walks per boot, doubling AT load for no reason).
-        // The cadence starts counting after the initial scan completes.
-        let mut scan_interval =
-            tokio::time::interval(self.cfg.scan.interval.max(Duration::from_secs(60)));
-        scan_interval.tick().await;
-
-        self.run_scan_logged("initial", shutdown.clone()).await;
-        self.log_and_save_runtime("post-initial-scan");
 
         // NOTE: while a scan runs, the task is inside run_scan_logged and
-        // the select below is not live, so periodic ticks only fire between
-        // scans. Post-scan saves (above) guarantee fresh stats after every
-        // scan regardless.
-
+        // this select is not live, so periodic ticks only fire between
+        // scans. The watchdog arm uses MissedTickBehavior::Delay (no
+        // catch-up bursts into the detector); stats_tick may burst, which
+        // only costs duplicate stats lines. Post-scan saves below
+        // guarantee fresh stats after every scan regardless.
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
-                _ = scan_interval.tick() => {
-                    self.run_scan_logged("periodic", shutdown.clone()).await;
-                    self.log_and_save_runtime("post-scan");
+                _ = tokio::time::sleep_until(deadline) => {
+                    let kind = if first_scan { "initial" } else { "periodic" };
+                    let completed_ok = self
+                        .run_scan_logged(kind, shutdown.clone())
+                        .await;
+                    self.log_and_save_runtime(if first_scan {
+                        "post-initial-scan"
+                    } else {
+                        "post-scan"
+                    });
+                    first_scan = false;
+                    // A failed scan leaves scan_completed_at unset, which
+                    // delay_until_next_scan reports as "due now" — pacing
+                    // the retry by the full interval instead, so a
+                    // persistently failing scan (AT outage) can never
+                    // hot-loop. The 60s floor keeps degenerate
+                    // `scan.interval: 0` configs paced like the old
+                    // interval ticker did.
+                    let wait = if completed_ok {
+                        self.delay_until_next_scan()
+                    } else {
+                        self.cfg.scan.interval
+                    };
+                    deadline =
+                        tokio::time::Instant::now() + wait.max(Duration::from_secs(60));
                 }
-                _ = stats_tick.tick(), if stats_interval > Duration::ZERO => { self.log_and_save_runtime("periodic"); }
+                _ = stats_tick.tick(), if stats_interval > Duration::ZERO => {
+                    self.log_and_save_runtime("periodic");
+                }
+                _ = quarantine_tick.tick(), if quarantine_on => {
+                    self.quarantine_pass().await;
+                }
             }
         }
         Ok(())
     }
 
-    async fn run_scan_logged(&mut self, kind: &str, shutdown: tokio::sync::watch::Receiver<bool>) {
+    /// Run one scan, log duration/outcome, restore the Seeding activity
+    /// state. Returns whether the scan COMPLETED (success) — the run loop
+    /// paces failed-scan retries by the interval on this signal, because a
+    /// failure leaves scan_completed_at unset (which reads as "due now").
+    async fn run_scan_logged(
+        &mut self,
+        kind: &str,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
         self.set_activity(crate::live::Activity::Scanning);
         tracing::info!("scan starting (kind={kind})");
         let start = std::time::Instant::now();
         let result = self.scan_once_shutdown(shutdown).await;
         self.set_activity(crate::live::Activity::Seeding);
         match result {
-            Ok(()) => tracing::info!(
-                "scan completed (kind={kind}, duration={:?})",
-                start.elapsed()
-            ),
-            Err(e) => tracing::error!(
-                "scan failed (kind={kind}, duration={:?}): {e:#}",
-                start.elapsed()
-            ),
-        };
+            Ok(()) => {
+                tracing::info!(
+                    "scan completed (kind={kind}, duration={:?})",
+                    start.elapsed()
+                );
+                true
+            }
+            Err(e) => {
+                tracing::error!(
+                    "scan failed (kind={kind}, duration={:?}): {e:#}",
+                    start.elapsed()
+                );
+                false
+            }
+        }
     }
 
     fn delay_until_next_scan(&self) -> Duration {
@@ -855,6 +930,317 @@ impl Engine {
             }
             None => Duration::ZERO,
         }
+    }
+
+    // ---- broken-piece quarantine ----
+
+    /// One watchdog pass: read every live torrent's receive counters, feed
+    /// the detector, refresh state.json progress bookkeeping, and remove +
+    /// quarantine any torrent whose swarm keeps sending bytes that never
+    /// pass hash validation. Runs on `scan.quarantine_check_interval`
+    /// between scans (and inside the inter-scan sleep); scans refresh the
+    /// same bookkeeping. See notes/DESIGN-broken-piece-quarantine.md.
+    async fn quarantine_pass(&mut self) {
+        if self.cfg.scan.quarantine_check_interval <= Duration::ZERO {
+            return;
+        }
+        let threshold = self.cfg.scan.broken_piece_discard_bytes;
+        let min_windows = self.cfg.scan.broken_piece_min_windows;
+        let session = self.session.clone();
+        // with_torrents takes an Fn closure, so mutable state rides in
+        // Cell/RefCell (the established pattern here — see
+        // log_and_save_runtime); the detector is swapped out wholesale.
+        let detector = std::cell::RefCell::new(std::mem::take(&mut self.detector));
+        let trips =
+            std::cell::RefCell::new(Vec::<(String, crate::engine::quarantine::Trip)>::new());
+        let progress = std::cell::RefCell::new(Vec::<(String, u64)>::new());
+        let seen = std::cell::RefCell::new(std::collections::HashSet::<String>::new());
+        // Registry snapshot for lift discovery inside the closure (self is
+        // not reachable there); lifts are applied after the sweep.
+        let quarantined_keys = self.state.quarantined_keys();
+        let lifts = std::cell::RefCell::new(Vec::<String>::new());
+        session.with_torrents(|it| {
+            for (_, h) in it {
+                let hex = h.info_hash().as_string();
+                seen.borrow_mut().insert(hex.clone());
+                let st = h.stats();
+                if st.finished {
+                    detector.borrow_mut().forget(&hex);
+                    // A FINISHED torrent with a registry entry means its
+                    // re-probe completed against the registered hashes:
+                    // upstream fixed the data. Lift (applied below).
+                    // Deliberately strict: only a COMPLETE re-probe lifts,
+                    // so a mixed swarm (one poisoned piece among valid
+                    // ones — the NotaBug shape) never lifts and its
+                    // attempts keep accumulating for max_retries
+                    // escalation.
+                    if quarantined_keys.contains(&hex) {
+                        lifts.borrow_mut().push(hex.clone());
+                    }
+                    continue;
+                }
+                // Paused/error/initializing torrents expose no live counters:
+                // a mid-check torrent's counter movement is check reads, not
+                // peer wire data, and must not count as waste.
+                let Some(live) = st.live.as_ref() else {
+                    continue;
+                };
+                let checked = st.progress_bytes;
+                let fetched = live.snapshot.fetched_bytes;
+                if let Some(trip) =
+                    detector
+                        .borrow_mut()
+                        .observe(&hex, checked, fetched, threshold, min_windows)
+                {
+                    trips.borrow_mut().push((hex.clone(), trip));
+                }
+                if checked > 0 {
+                    progress.borrow_mut().push((hex, checked));
+                }
+            }
+        });
+        self.detector = detector.into_inner();
+        let progress = progress.into_inner();
+        let trips = trips.into_inner();
+        // Prune stale entries in the same breath: anything the session no
+        // longer holds (swap displacement, stall/vanished evictions, failed
+        // adds, census teardown) cannot trip again, and re-adding
+        // re-baselines from zero anyway.
+        let seen = seen.into_inner();
+        self.detector.retain_only(&seen);
+        // Progress bookkeeping (design gap #2): last_progress_at used to
+        // freeze between scans, leaving the stall-eviction clock anchored
+        // to scan times. ONE save for the whole pass (the per-entry
+        // State::update version rewrote the full file per progressing
+        // torrent — hundreds of saves on a mass-progress pass).
+        let now = Utc::now();
+        let mut lift_hexes: Vec<String> = lifts.into_inner();
+        let quarantined_keys = self.state.quarantined_keys();
+        for (hex, checked) in &progress {
+            // Race catch for the sweep's finished branch: every piece
+            // validated but rqbit's finished flag has not flipped yet.
+            // Same completion rule, unit-tested as state::completion_lifts
+            // (and via State::lift_completed).
+            if quarantined_keys.contains(hex) {
+                let size = self.state.get(hex).map(|t| t.size_bytes).unwrap_or(0);
+                if state::completion_lifts(*checked, size) {
+                    lift_hexes.push(hex.clone());
+                }
+            }
+        }
+        let changed = self
+            .state
+            .update_progress_many(&progress, now)
+            .map_err(|e| tracing::error!("progress bookkeeping failed: {e:#}"))
+            .unwrap_or(false);
+        // Apply lifts discovered in the sweep AND the race catch: the
+        // re-probe completed, so the cooldown is over. Attempts reset here
+        // on purpose — the problem is RESOLVED (locally complete +
+        // hash-valid); a later re-break starts a fresh cycle count.
+        let mut lifted_any = false;
+        match self.state.quarantine_remove_many(&lift_hexes) {
+            Ok(0) => {}
+            Ok(_) => {
+                lifted_any = true;
+                for hex in &lift_hexes {
+                    let title = self
+                        .state
+                        .get(hex)
+                        .map(|t| t.title.clone())
+                        .unwrap_or_else(|| hex.clone());
+                    tracing::info!(
+                        "quarantine lifted for {title} ({hex}): re-probe completed (upstream data fixed)"
+                    );
+                }
+            }
+            Err(e) => tracing::error!("failed to lift quarantines: {e:#}"),
+        }
+        // Registry GC: an entry whose hash is in NEITHER the held set NOR
+        // the session NOR the last fetched catalog can never be re-probed
+        // (the gate consults catalog candidates at scan time, so a still
+        // listed hash must keep its entry — and its attempts count — until
+        // the lapsed-cooldown probe runs) — drop it so
+        // delisted/stall-evicted/hand-deleted hashes don't accumulate
+        // forever. Active-cooldown entries stay: the catalog may relist the
+        // hash before the cooldown lapses. Until a catalog fetch has
+        // completed this boot (last_catalog is None) GC waits entirely:
+        // dropping listed hashes there would silently cancel the documented
+        // re-probe and reset attempts escalation.
+        let listed = self.last_catalog.as_ref();
+        let mut gc: Vec<String> = self
+            .state
+            .quarantined_keys()
+            .into_iter()
+            .filter(|k| {
+                !seen.contains(k)
+                    && self.state.get(k).is_none()
+                    && listed.is_some_and(|c| !c.contains(k))
+                    && self
+                        .state
+                        .quarantine_get(k)
+                        .map(|q| now >= q.cooldown_until)
+                        .unwrap_or(false)
+            })
+            .collect();
+        if !gc.is_empty() {
+            gc.sort();
+            match self.state.quarantine_remove_many(&gc) {
+                Ok(n) if n > 0 => {
+                    lifted_any = true;
+                    tracing::info!(
+                        "quarantine GC dropped {} orphaned entr{} (hash no longer held, listed, or in session)",
+                        n,
+                        if n == 1 { "y" } else { "ies" }
+                    );
+                }
+                Err(e) => tracing::error!("quarantine GC failed: {e:#}"),
+                Ok(_) => {}
+            }
+        }
+        if trips.is_empty() {
+            // A lift or GC still changes the live quarantined count — push
+            // it before bailing, or `status` shows a stale count until the
+            // next mutation (up to a full scan interval away). Idle passes
+            // (no trips, no lifts, no GC, no progress) still write nothing.
+            if lifted_any || changed {
+                self.push_live();
+            }
+            return;
+        }
+        // Calendar math hardened: from_std failure clamps to the
+        // indefinite sentinel, and every add is checked (chrono's DateTime
+        // + TimeDelta PANICS on overflow — abort-in-release crash loop —
+        // so a huge cooldown value must never reach a bare `now + d`).
+        // validate() bounds the knob at 366 days, so both clamps are
+        // unreachable belt-and-braces.
+        let cooldown_chrono = chrono::Duration::from_std(self.cfg.scan.quarantine_cooldown)
+            .unwrap_or_else(|_| chrono::Duration::weeks(520));
+        let max_retries = self.cfg.scan.quarantine_max_retries;
+        let now = Utc::now();
+        for (hex, trip) in trips {
+            let Some(held) = self.state.get(&hex).cloned() else {
+                // Session-managed but UNTRACKED. Normally impossible, but
+                // two real shapes leave exactly this: a state.put that
+                // failed right after a successful add (data-dir device
+                // full), and a session delete that failed during an
+                // earlier trip (hash already gated in the registry, state
+                // entry gone, session copy still live). Enforcement MUST
+                // still happen — the torrent is live and burning — and
+                // discarding here turned detection into a permanent
+                // no-op. Enforce with a best-effort identity: no state
+                // entry means no history event (no size/seeder facts),
+                // and ERROR-level visibility since status can't show it.
+                let prev = self.state.quarantine_get(&hex);
+                let title = prev
+                    .as_ref()
+                    .map(|q| q.title.clone())
+                    .unwrap_or_else(|| format!("untracked {hex}"));
+                let q = crate::engine::quarantine::next_quarantine_entry(
+                    prev.as_ref(),
+                    title.clone(),
+                    |attempts| {
+                        format!(
+                            "discarded {} across {} zero-progress pass{} (attempt {attempts}, untracked ghost)",
+                            crate::humanize::human_bytes(trip.wasted_bytes as i64),
+                            trip.windows,
+                            if trip.windows == 1 { "" } else { "es" },
+                        )
+                    },
+                    trip,
+                    now,
+                    cooldown_chrono,
+                    max_retries,
+                );
+                let attempts = q.attempts;
+                let reason = q.reason.clone();
+                let cooldown_until = q.cooldown_until;
+                tracing::error!(
+                    "quarantined UNTRACKED torrent {} ({}): {}; removing and gating until {} (attempt {}, no state entry: history and status cannot track this)",
+                    title,
+                    hex,
+                    reason,
+                    cooldown_until.to_rfc3339(),
+                    attempts
+                );
+                // rqbit's delete(true) removes the data itself; the
+                // keep-at dir cleanup is skipped (location unknown).
+                if let Err(e) =
+                    engtorrents::remove_torrent(&self.session, &hex, std::path::Path::new("")).await
+                {
+                    tracing::error!("failed to remove untracked quarantined torrent {hex}: {e:#}");
+                }
+                let _ = std::fs::remove_file(self.torrent_cache_path(&hex));
+                if let Err(e) = self.state.quarantine_put(hex.clone(), q) {
+                    tracing::error!("failed to persist quarantine for {}: {e:#}", hex);
+                }
+                self.detector.forget(&hex);
+                continue;
+            };
+            let attempts_prev = self.state.quarantine_get(&hex);
+            let q = crate::engine::quarantine::next_quarantine_entry(
+                attempts_prev.as_ref(),
+                held.title.clone(),
+                |attempts| {
+                    format!(
+                        "discarded {} across {} zero-progress pass{} (attempt {attempts})",
+                        crate::humanize::human_bytes(trip.wasted_bytes as i64),
+                        trip.windows,
+                        if trip.windows == 1 { "" } else { "es" },
+                    )
+                },
+                trip,
+                now,
+                cooldown_chrono,
+                max_retries,
+            );
+            let attempts = q.attempts;
+            let reason = q.reason.clone();
+            let cooldown_until = q.cooldown_until;
+            tracing::warn!(
+                "quarantined {} ({}): {}; removed and re-probed after {} (cooldown until {})",
+                held.title,
+                hex,
+                reason,
+                crate::humanize::human_duration(self.cfg.scan.quarantine_cooldown),
+                cooldown_until.to_rfc3339(),
+            );
+            let out_dir = engtorrents::torrent_output_dir(&held.storage_location, &hex);
+            if let Err(e) = engtorrents::remove_torrent(&self.session, &hex, &out_dir).await {
+                tracing::error!("failed to remove quarantined torrent {}: {e:#}", held.title);
+            }
+            let _ = std::fs::remove_file(self.torrent_cache_path(&hex));
+            let q = state::Quarantine {
+                title: held.title.clone(),
+                reason: reason.clone(),
+                quarantined_at: now,
+                cooldown_until,
+                attempts,
+                wasted_bytes: trip.wasted_bytes,
+            };
+            // ONE atomic save replaces the old put-then-remove pair (kill
+            // window between them used to persist the hash into BOTH
+            // maps — a zombie that could never re-enter the session and,
+            // with escalation, stayed gated for the indefinite cooldown).
+            if let Err(e) = self.state.quarantine_and_remove(hex.clone(), q) {
+                tracing::error!("failed to persist quarantine for {}: {e:#}", hex);
+                // The in-memory mutation already happened; only the disk
+                // lagged. Skip history — the ledger must not claim a drop
+                // the authoritative file doesn't reflect yet.
+                self.detector.forget(&hex);
+                continue;
+            }
+            self.history.record(&history::remove_event(
+                &hex,
+                &held.title,
+                held.size_bytes,
+                held.last_known_seeders,
+                &held.storage_location,
+                history::Cause::Quarantined,
+                &reason,
+            ));
+            self.detector.forget(&hex);
+        }
+        self.push_live();
     }
 
     // ---- one scan ----
@@ -893,6 +1279,10 @@ impl Engine {
 
         let catalog_hashes: HashSet<String> =
             items.iter().map(|i| hex::encode(i.info_hash)).collect();
+        // Remember the catalog set for the watchdog's registry GC: an
+        // orphaned quarantine entry may only be dropped when its hash is
+        // absent from this set (see quarantine_pass).
+        self.last_catalog = Some(catalog_hashes.clone());
         let held = self.state.all();
         let held_hashes: HashSet<String> = held.iter().map(|h| h.info_hash.clone()).collect();
 
@@ -1402,6 +1792,36 @@ impl Engine {
         _stats: &ScanStats,
     ) {
         let hex = hex::encode(c.info_hash);
+        // Quarantine gate: a hash under an active cooldown is not selectable
+        // (free-space adds included — this is the single choke point for
+        // both paths). A LAPSED entry passes through unchanged: the
+        // re-probe runs like any candidate, and the entry stays in the
+        // registry so its attempts count survives for max_retries
+        // escalation. Only the watchdog lifts an entry — once the
+        // re-probe COMPLETES against the registered hashes (upstream
+        // fixed the data); if the swarm is still broken, it re-quarantines
+        // after min_windows zero-progress passes.
+        let (active_quarantine, quarantine_probe) = self.quarantine_gate(&hex);
+        if let Some(q) = active_quarantine {
+            tracing::debug!(
+                "skipping quarantined candidate {} (attempt {}, until {}): {}",
+                c.title,
+                q.attempts,
+                q.cooldown_until.to_rfc3339(),
+                q.reason
+            );
+            return;
+        }
+        // A lapsed cooldown (quarantine_probe) re-probes the hash. The
+        // probe bypasses the seed-scarcity roll: a broken-but-well-seeded
+        // swarm (the NotaBug shape has live seeders by definition) would
+        // otherwise face chance = aggressiveness^(seeders - floor) ≈ 0
+        // and never actually re-enter the session — the lift could never
+        // happen and the entry would sit lapsed forever while logs
+        // claimed "re-eligible" every scan. The bypass is bounded twice
+        // over: probes fill FREE SPACE only (never displace a healthy
+        // held torrent — see below), and max_retries escalation locks
+        // repeat offenders into indefinite cooldown.
         // Re-read metadata from cache (never kept in memory during evaluation).
         let md = match self.fetch_metadata(&hex).await {
             Ok(md) => md,
@@ -1476,7 +1896,15 @@ impl Engine {
                 {
                     let loc = self.cfg.storage[idx].path.clone();
                     let (added, d) = self
-                        .try_add(&c, &md, size_bytes, &loc, &[], seeder_floor)
+                        .try_add(
+                            &c,
+                            &md,
+                            size_bytes,
+                            &loc,
+                            &[],
+                            seeder_floor,
+                            quarantine_probe,
+                        )
                         .await;
                     decision = d;
                     if added {
@@ -1501,6 +1929,23 @@ impl Engine {
         // with free space plentiful - swap exists for space/RAM pressure,
         // gated by margin, not as a scarcity-roll retry.
         if decision.seed_scarcity_blocked() {
+            return;
+        }
+
+        // Re-probes fill FREE SPACE only. A probe is speculative — it is
+        // expected to fail and re-quarantine — and try_swap DELETES the
+        // displaced torrent's data, so letting a probe displace would trade
+        // a healthy, better-seeded holding for a swarm about to be removed
+        // again: one healthy torrent destroyed per cooldown, forever under
+        // the unlimited (0) max_retries default. A full node's probe simply
+        // waits for space to free up; the gate keeps blocking the hash in
+        // the meantime and the registry entry (with its attempts count)
+        // survives until the probe runs (or the hash delists).
+        if quarantine_probe {
+            tracing::debug!(
+                "quarantine re-probe deferred: no free space (probes never displace held torrents) (title={})",
+                c.title
+            );
             return;
         }
 
@@ -1535,6 +1980,30 @@ impl Engine {
         self.ram_budget.saturating_sub(used)
     }
 
+    /// Quarantine lookup with lazy re-probe handling. Returns
+    /// `(Some(active_entry), false)` when the hash must be skipped,
+    /// `(None, true)` when the cooldown has LAPSED (the hash is re-eligible
+    /// as a probe; the entry stays in the registry so its attempts count
+    /// survives for max_retries escalation), `(None, false)` when never
+    /// quarantined. The entry is lifted later, by `quarantine_pass`, once
+    /// the re-probe completes against the registered hashes (upstream
+    /// fixed the data).
+    fn quarantine_gate(&mut self, info_hash_hex: &str) -> (Option<state::Quarantine>, bool) {
+        let Some(q) = self.state.quarantine_get(info_hash_hex) else {
+            return (None, false);
+        };
+        if Utc::now() >= q.cooldown_until {
+            tracing::info!(
+                "quarantine re-probe for {} ({}): cooldown lapsed after {} attempt(s); hash re-eligible",
+                q.title,
+                info_hash_hex,
+                q.attempts
+            );
+            return (None, true);
+        }
+        (Some(q), false)
+    }
+
     fn log_decision(&self, c: &Candidate, d: &selector::SwapDecision) {
         if d.seed_scarcity_blocked() {
             return; // routine outcome for well-seeded candidates: not logged.
@@ -1548,6 +2017,7 @@ impl Engine {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_add(
         &mut self,
         c: &Candidate,
@@ -1556,8 +2026,18 @@ impl Engine {
         location: &Path,
         displaced: &[Held],
         seeder_floor: u32,
+        quarantine_probe: bool,
     ) -> (bool, selector::SwapDecision) {
         let mut rng = rand::thread_rng();
+        // A quarantine re-probe bypasses the roll (roll < 0 beats any
+        // chance >= 0): see act_on_candidate. The availability and margin
+        // vetoes still apply — a probe with no live seed simply waits for
+        // the swarm to gain one.
+        let roll = if quarantine_probe {
+            -1.0
+        } else {
+            selector::roll(&mut rng)
+        };
         let decision = selector::evaluate_swap(
             &selector::Candidate {
                 info_hash: c.info_hash,
@@ -1571,7 +2051,7 @@ impl Engine {
             displaced,
             self.cfg.scan.min_seed_margin,
             self.cfg.aggressiveness,
-            selector::roll(&mut rng),
+            roll,
         );
         if !decision.should_swap {
             tracing::debug!(
@@ -1738,8 +2218,11 @@ impl Engine {
                     seeders: h.last_known_seeders,
                 })
                 .collect();
+            // Probe bypass of the seed-scarcity roll is free-space-only
+            // (act_on_candidate never routes a probe into try_swap), so
+            // swaps always draw the real roll.
             let (ok, decision) = self
-                .try_add(c, md, size_bytes, &location, &sel_held, seeder_floor)
+                .try_add(c, md, size_bytes, &location, &sel_held, seeder_floor, false)
                 .await;
             if ok {
                 let mut removed_any = false;
@@ -1872,11 +2355,14 @@ impl Engine {
             {
                 Ok(sw) => {
                     // Progress = verified bytes on disk; grows iff new data lands.
+                    // completed_pieces is a u64 byte count now: a u32 cap used to
+                    // saturate past 4 GiB, making every later refresh look like
+                    // "progress" and freezing the stall clock at scan times.
                     let progress = self.held_progress_bytes(&h);
                     if let Ok(true) = self.state.update(&hex, |t| {
                         t.last_known_seeders = sw.seeders;
-                        if progress > t.completed_pieces as u64 || t.last_progress_at.is_none() {
-                            t.completed_pieces = progress.min(u32::MAX as u64) as u32;
+                        if progress > t.completed_pieces || t.last_progress_at.is_none() {
+                            t.completed_pieces = progress;
                             t.last_progress_at = Some(Utc::now());
                         }
                     }) {
@@ -1914,20 +2400,74 @@ impl Engine {
             if !catalog_hashes.contains(&h.info_hash) {
                 continue;
             }
-            if h.last_known_seeders > 0 {
-                continue;
-            }
+            // CHEAP CHECK FIRST: almost every held torrent is healthy, so
+            // judge on the state snapshot before touching the session.
+            // (This used to run last, after two O(n) session sweeps per
+            // held torrent per scan.) No progress stamp yet = still
+            // settling; not past the timeout = not evictable either way.
             let Some(since) = h.last_progress_at.and_then(|t| (now - t).to_std().ok()) else {
                 continue;
             };
             if since < timeout {
                 continue;
             }
-            tracing::warn!(
-                "removing stalled torrent {}: zero seeders and no download progress for {}",
-                h.title,
-                crate::humanize::human_duration(since)
-            );
+            // Past the timeout: only now pay for the session lookups (one
+            // find_torrent serves all three checks below).
+            let handle = engtorrents::find_torrent(&self.session, &h.info_hash)
+                .ok()
+                .flatten();
+            // A torrent running its integrity check reads as "incomplete"
+            // (progress = bytes the check has walked so far) even when the
+            // data is all there — boot windows run hundreds of these. Skip
+            // checks in flight; the NEXT scan judges them on settled state.
+            let checking = handle
+                .as_ref()
+                .map(|t| {
+                    t.with_state(|s| matches!(s, librqbit::ManagedTorrentState::Initializing(_)))
+                })
+                .unwrap_or(false);
+            if checking {
+                continue;
+            }
+            // Fully-present torrents are complete and healthy: their
+            // progress clock froze at completion (nothing left to verify),
+            // so the stall timeout must never apply to them. The progress
+            // comparison alone can never satisfy torrents declaring
+            // padding files (rqbit excludes padding from piece selection,
+            // so progress tops out below the all-files size) — rqbit's own
+            // finished flag is the exact complete signal for those.
+            let finished = handle.as_ref().map(|t| t.stats().finished).unwrap_or(false);
+            let progress = match &handle {
+                Some(t) => t.stats().progress_bytes,
+                // Not in the session: fall back to the on-disk dir size as
+                // a conservative proxy (also the recovery path when the
+                // data dir was deleted externally — 0 → judged incomplete).
+                None => dir_size_bytes(&engtorrents::torrent_output_dir(
+                    &h.storage_location,
+                    &h.info_hash,
+                )),
+            };
+            if finished || progress >= h.size_bytes {
+                continue;
+            }
+            // Stall timeout applies to anything still INCOMPLETE regardless
+            // of swarm depth: zero-seeders (the original rule) and
+            // seeded-but-stuck swarms (e.g. broken-piece loops) alike.
+            // Incomplete + alive swarm is the quarantine's territory well
+            // before 90d; this is the long-tail backstop.
+            let reason = if h.last_known_seeders == 0 {
+                format!(
+                    "zero seeders and no download progress for {}",
+                    crate::humanize::human_duration(since)
+                )
+            } else {
+                format!(
+                    "no download progress for {} ({} seeders, incomplete)",
+                    crate::humanize::human_duration(since),
+                    h.last_known_seeders
+                )
+            };
+            tracing::warn!("removing stalled torrent {}: {}", h.title, reason);
             let out_dir = engtorrents::torrent_output_dir(&h.storage_location, &h.info_hash);
             if let Err(e) = engtorrents::remove_torrent(&self.session, &h.info_hash, &out_dir).await
             {
@@ -1945,10 +2485,7 @@ impl Engine {
                     h.last_known_seeders,
                     &h.storage_location,
                     history::Cause::Stalled,
-                    &format!(
-                        "zero seeders and no download progress for {}",
-                        crate::humanize::human_duration(since)
-                    ),
+                    &reason,
                 ));
             }
         }
@@ -2071,14 +2608,16 @@ impl Engine {
             self.started_at,
             held.len(),
             seeding.min(held.len()),
+            self.state.quarantine_count(),
             used,
             limit,
             committed,
         );
         tracing::info!(
-            "runtime stats (kind={kind} held={} seeding={} disk={}/{} committed={} up={} down={} peers={} rss={} uptime={}s)",
+            "runtime stats (kind={kind} held={} seeding={} quarantined={} disk={}/{} committed={} up={} down={} peers={} rss={} uptime={}s)",
             s.held_torrents,
             s.seeding_torrents,
+            s.quarantined_torrents,
             crate::humanize::human_bytes(s.disk_used_bytes as i64),
             crate::humanize::human_bytes(s.disk_limit_bytes as i64),
             crate::humanize::human_bytes(s.disk_committed_bytes as i64),

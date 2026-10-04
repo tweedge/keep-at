@@ -144,6 +144,22 @@ pub struct ConfigArgs {
     /// How long a torrent missing from the AT catalog can sit before removal (0 disables)
     #[arg(long, value_parser = parse_duration, help_heading = "Selection")]
     pub vanished_eviction_timeout: Option<std::time::Duration>,
+    /// How often the broken-piece watchdog runs (e.g. 30m; 0 disables)
+    #[arg(long, value_parser = parse_duration, help_heading = "Selection")]
+    pub quarantine_check_interval: Option<std::time::Duration>,
+    /// Discarded-download volume that marks a swarm broken, e.g. 256M
+    /// (received bytes that never pass hash validation)
+    #[arg(long, help_heading = "Selection")]
+    pub broken_piece_discard_bytes: Option<String>,
+    /// Consecutive watchdog passes with zero verified progress required before quarantine
+    #[arg(long, help_heading = "Selection")]
+    pub broken_piece_min_windows: Option<u32>,
+    /// How long a quarantined hash waits before the next re-probe (e.g. 3d)
+    #[arg(long, value_parser = parse_duration, help_heading = "Selection")]
+    pub quarantine_cooldown: Option<std::time::Duration>,
+    /// Re-probes tolerated before a quarantine becomes permanent (0 = unlimited)
+    #[arg(long, help_heading = "Selection")]
+    pub quarantine_max_retries: Option<u32>,
     /// Comma-separated keywords to block, matched against title and description
     #[arg(long, help_heading = "Selection")]
     pub keyword_blocklist: Option<String>,
@@ -227,6 +243,10 @@ pub struct SelfUpdateArgs {
     /// Track development builds (x.y.z-beta) instead of stable releases (x.y)
     #[arg(long, default_value_t = false)]
     pub beta: bool,
+    /// Flattened so the pre-update state snapshot can find the data dir
+    /// (same resolution as `status`/`hosted-torrents`).
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 /// Service config path when installed (pub for read-only commands' config
@@ -258,6 +278,11 @@ impl ConfigArgs {
             || self.rate_limit.is_some()
             || self.stall_eviction_timeout.is_some()
             || self.vanished_eviction_timeout.is_some()
+            || self.quarantine_check_interval.is_some()
+            || self.broken_piece_discard_bytes.is_some()
+            || self.broken_piece_min_windows.is_some()
+            || self.quarantine_cooldown.is_some()
+            || self.quarantine_max_retries.is_some()
             || self.keyword_blocklist.is_some()
             || self.preserve_deleted_torrents.is_some()
             || self.catalog_collapse_percent.is_some()
@@ -297,6 +322,22 @@ impl ConfigArgs {
         }
         if let Some(v) = self.vanished_eviction_timeout {
             cfg.scan.vanished_eviction_timeout = v;
+        }
+        if let Some(v) = self.quarantine_check_interval {
+            cfg.scan.quarantine_check_interval = v;
+        }
+        if let Some(v) = &self.broken_piece_discard_bytes {
+            cfg.scan.broken_piece_discard_bytes =
+                config::parse_byte_size(v).with_context(|| "--broken-piece-discard-bytes")?;
+        }
+        if let Some(v) = self.broken_piece_min_windows {
+            cfg.scan.broken_piece_min_windows = v;
+        }
+        if let Some(v) = self.quarantine_cooldown {
+            cfg.scan.quarantine_cooldown = v;
+        }
+        if let Some(v) = self.quarantine_max_retries {
+            cfg.scan.quarantine_max_retries = v;
         }
         if let Some(v) = &self.keyword_blocklist {
             cfg.keyword_blocklist = split_keywords(v);
