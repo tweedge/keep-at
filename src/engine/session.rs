@@ -42,8 +42,10 @@ pub fn listener_options(addr: SocketAddr, ipv4_only: bool) -> ListenerOptions {
 }
 
 /// Build the node's main rqbit session: TCP-only listener on cfg.port, DHT
-/// on, RAM-scaled per-torrent peer limit, global up/down rate limits,
-/// keep-at seeder identity for tracker User-Agent and extended handshake.
+/// OFF (a production heap leak in the DHT subsystem - see the comment on
+/// `dht: None` below and docs/DESIGN.md), RAM-scaled per-torrent peer limit,
+/// global up/down rate limits, keep-at seeder identity for tracker
+/// User-Agent and extended handshake.
 ///
 /// The peer limit scales with the RAM budget (see peer_limit_for_budget):
 /// peer buffers are the dominant per-torrent RAM term, so small hosts trade

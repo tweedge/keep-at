@@ -1,14 +1,26 @@
-//! File-descriptor budget: keep-at holds one fd per file of every held
-//! torrent (rqbit's FilesystemStorage opens all non-padding files at add
-//! time and keeps them open), plus one fd per live peer connection. A
-//! many-file candidate added near the RLIMIT_NOFILE ceiling fails with
-//! "Too many open files" (os error 24) — a host-capacity refusal, not a
-//! candidate defect. This module is the native prevention:
+//! File-descriptor budget and the many-file admission guard.
+//!
+//! Storage is no longer one-fd-per-file-forever: `engine::pool_storage`
+//! replaced stock rqbit's `FilesystemStorage` with a bounded LRU handle
+//! pool (`min(4096, hard_limit - 2048)` open fds, evicting on demand), so
+//! a file-heavy library no longer pins one fd per file for the torrent's
+//! lifetime. Live peer connections still cost one fd each, and the
+//! process-wide ceiling still matters - hence:
 //!
 //! - [`raise_soft_limit`]: at startup, raise the soft RLIMIT_NOFILE toward
 //!   the hard limit (best effort, logged, never fatal).
-//! - [`fd_headroom`]: the admission guard's input — how many more fds the
-//!   process can open before hitting the soft ceiling.
+//! - [`fd_headroom`]: how many more fds the process can open before hitting
+//!   the soft ceiling.
+//! - [`fits_in_headroom`]: the many-file admission guard's input.
+//!
+//! The guard is deliberately CONSERVATIVE. It still prices a candidate at
+//! one fd per file (`md.file_count`), which was exact under the old
+//! open-everything storage and is now an upper bound: the pool would
+//! typically serve a many-file torrent through far fewer live handles. The
+//! cost of that conservatism is refusing some many-file candidates on
+//! low-fd hosts until a roomier scan; the cost of pricing too low would be
+//! a hard EMFILE add failure. Re-pricing against the pool's real footprint
+//! needs its own design and test.
 //!
 //! Linux-only (getrlimit/setrlimit via raw bindings, like the statvfs
 //! binding in engine::storage; /proc/self/fd for the open count).

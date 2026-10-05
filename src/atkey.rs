@@ -134,11 +134,21 @@ pub fn at_trackers_only(
         .collect()
 }
 
+/// True when this tracker URL points at Academic Torrents' own host.
+///
+/// Exact-or-subdomain match, NOT a substring match: `contains` let
+/// lookalikes such as `evilacademictorrents.com.attacker.net` count as AT,
+/// which kept them in the filtered announce list (held torrents would
+/// announce to an attacker-chosen endpoint) while dropping the legitimate
+/// third-party trackers the filter exists to remove.
 pub fn is_at_tracker_url(url: &str) -> bool {
     match url::Url::parse(url) {
         Ok(u) => u
             .host_str()
-            .map(|h| h.contains("academictorrents.com"))
+            .map(|h| {
+                h.eq_ignore_ascii_case("academictorrents.com")
+                    || h.to_ascii_lowercase().ends_with(".academictorrents.com")
+            })
             .unwrap_or(false),
         Err(_) => false,
     }
@@ -182,5 +192,34 @@ mod tests {
             at_announce_url("http://academictorrents.com/announce.php", "K", ""),
             None
         );
+    }
+
+    /// `is_at_tracker_url` gates the "AT-only" announce filter and the AT
+    /// rate-limit classification. A substring match let lookalike hosts
+    /// through - keeping them in the announce list (peer IP + held-hash
+    /// disclosure to an attacker-chosen endpoint via one crafted catalog
+    /// row) while dropping legitimate third-party trackers. The key itself
+    /// was never at risk: `at_announce_url` requires an exact host.
+    #[test]
+    fn tracker_host_match_rejects_lookalikes() {
+        for good in [
+            "https://academictorrents.com/announce",
+            "https://academictorrents.com/announce.php",
+            "https://ipv6.academictorrents.com/announce",
+            "https://tracker.academictorrents.com/announce",
+        ] {
+            assert!(is_at_tracker_url(good), "{good} should count as AT");
+        }
+        for bad in [
+            "https://evilacademictorrents.com.attacker.net/announce",
+            "https://academictorrents.com.evil.net/announce",
+            "https://notacademictorrents.com/announce",
+            "https://academictorrents.com.evil.example/announce",
+        ] {
+            assert!(
+                !is_at_tracker_url(bad),
+                "{bad} must NOT count as an Academic Torrents tracker"
+            );
+        }
     }
 }

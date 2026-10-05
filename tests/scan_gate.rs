@@ -10,43 +10,17 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{test_config, test_options, test_port, with_timeout, Fixture, Stub, StubState};
+use common::{test_config, test_options, test_port, with_timeout, Fixture, Stub};
 
 /// Build a stub + catalog for fixtures with per-fixture seeder counts.
 /// Returns (stub, catalog_base, hexes in fixture order).
 fn setup(fixtures: &[Fixture]) -> (Stub, String, Vec<String>) {
-    let state = Arc::new(Mutex::new(StubState::default()));
-    // Placeholder tracker; replaced with the real one below (two-phase
-    // because hashes are only known after registering).
-    let tmp_tracker = "http://127.0.0.1:9/announce".to_string();
-    let mut raws: Vec<(Fixture, Vec<u8>)> = Vec::new();
-    for f in fixtures {
-        let raw = common::torrent_bytes(f, &tmp_tracker);
-        raws.push(((*f).clone(), raw));
-    }
-    // Real stub first (need its base URL for the tracker), then register.
-    let catalog_placeholder = Stub::catalog_xml(&[]);
-    let stub = Stub::start(catalog_placeholder, state.clone());
-    let tracker = stub.tracker_url();
-    let mut rows = Vec::new();
-    let mut hexes = Vec::new();
-    {
-        let mut st = state.lock().unwrap();
-        for (f, _) in &raws {
-            let (hex, raw) = st.add(f, &tracker);
-            rows.push((f.title.clone(), hex.clone(), f.size));
-            hexes.push(hex);
-            // Keep the raw bytes for potential debugging; the stub serves them.
-            let _ = raw;
-        }
-    }
-    let (catalog_base, _srv) = common::serve_catalog(Stub::catalog_xml(&rows));
     // The catalog server accepts unboundedly for the process lifetime (its
     // handle is dropped/detached; the listener thread outlives the test),
     // so any number of fetches and retries is served.
+    let (stub, catalog_base, hexes, _) = common::setup_with_catalog(fixtures);
     (stub, catalog_base, hexes)
 }
 

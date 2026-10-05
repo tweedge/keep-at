@@ -281,20 +281,15 @@ async fn run_evaluation(
         if *shutdown.borrow() {
             break;
         }
-        let hex = hex::encode(item.info_hash);
-        if held_hashes.contains(&hex) {
-            prefilter.skipped_held.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        if blocklist.blocks(&item.title, &item.description).is_some() {
-            prefilter.skipped_blocked.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        if max_fittable > 0 && item.size_bytes > max_fittable {
-            prefilter.skipped_too_big.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        pending.push(item.clone());
+        match prefilter_reason(item, &held_hashes, &blocklist, max_fittable) {
+            Prefilter::Held => prefilter.skipped_held.fetch_add(1, Ordering::Relaxed),
+            Prefilter::Blocked => prefilter.skipped_blocked.fetch_add(1, Ordering::Relaxed),
+            Prefilter::TooBig => prefilter.skipped_too_big.fetch_add(1, Ordering::Relaxed),
+            Prefilter::Pending => {
+                pending.push(item.clone());
+                continue;
+            }
+        };
     }
 
     let tx2 = emit.clone();
@@ -376,14 +371,18 @@ struct EvalCtx {
     scrape_backoff: Duration,
 }
 
-fn eval_torrent_cache_path(data_dir: &Path, info_hash_hex: &str) -> PathBuf {
+/// Where a fetched `.torrent` is cached. Single spelling on purpose: the
+/// engine, the spawned evaluation workers, and the census probe all have to
+/// agree on this path, and three near-identical copies of it had already
+/// spread across those callers.
+pub fn torrent_cache_path(data_dir: &Path, info_hash_hex: &str) -> PathBuf {
     data_dir
         .join("torrent-cache")
         .join(format!("{info_hash_hex}.torrent"))
 }
 
 async fn eval_fetch_metadata(ctx: &EvalCtx, info_hash_hex: &str) -> Result<TorrentMeta> {
-    let path = eval_torrent_cache_path(&ctx.data_dir, info_hash_hex);
+    let path = torrent_cache_path(&ctx.data_dir, info_hash_hex);
     if let Ok(data) = std::fs::read(&path) {
         if let Ok(md) = attorrent::parse_torrent_bytes(&data) {
             return Ok(md);
@@ -401,14 +400,34 @@ async fn eval_fetch_metadata(ctx: &EvalCtx, info_hash_hex: &str) -> Result<Torre
     Ok(md)
 }
 
-async fn eval_scrape_swarm(
-    ctx: &EvalCtx,
-    cache: &std::sync::Mutex<SwarmCache>,
+/// The shared scrape infrastructure: everything the tracker loop needs that
+/// is identical across its callers (the evaluation workers and the
+/// held-refresh pass). Bundled so [`scrape_swarm_cached`] stays about the
+/// protocol rather than about plumbing.
+struct ScrapeShared<'a> {
+    cache: &'a std::sync::Mutex<SwarmCache>,
+    rate: &'a Arc<tokio::sync::Mutex<RateLimiter>>,
+    http: &'a reqwest::Client,
+    shutdown: &'a tokio::sync::watch::Receiver<bool>,
+    scrape_backoff: Duration,
+}
+
+/// Scrape trackers in order (cached first); AT hosts go through the shared
+/// rate limiter.
+///
+/// THE scrape policy for this daemon, used by both the evaluation workers
+/// and the held-refresh pass. It used to exist as two byte-identical copies
+/// (`eval_scrape_swarm` and `Engine::scrape_swarm`) that had already drifted
+/// in their log wording; the 429 handling here is the most delicate shared
+/// behavior keep-at owns (it exists because AT throttled this project), and
+/// any fix to it must land in one place.
+async fn scrape_swarm_cached(
+    shared: &ScrapeShared<'_>,
     trackers: &[String],
     info_hash: &[u8; 20],
     stats: &ScanStats,
 ) -> Result<SwarmCounts> {
-    if let Ok(c) = cache.lock() {
+    if let Ok(c) = shared.cache.lock() {
         if let Some(hit) = c.get(info_hash) {
             stats.scrape_cached.fetch_add(1, Ordering::Relaxed);
             return Ok(hit);
@@ -417,7 +436,7 @@ async fn eval_scrape_swarm(
     let mut last_err: Option<anyhow::Error> = None;
     for tracker in trackers {
         if crate::atkey::is_at_tracker_url(tracker) {
-            ctx.rate.lock().await.wait().await;
+            shared.rate.lock().await.wait().await;
         }
         if !tracker.starts_with("http://") && !tracker.starts_with("https://") {
             // UDP trackers (BEP 15 scrape) are not implemented - skip
@@ -428,7 +447,7 @@ async fn eval_scrape_swarm(
         let call = tokio::time::timeout(
             SCRAPE_TIMEOUT,
             attorrent::scrape_http(
-                &ctx.http,
+                shared.http,
                 &buildinfo::scraper_user_agent(),
                 tracker,
                 info_hash,
@@ -437,7 +456,7 @@ async fn eval_scrape_swarm(
         .await;
         match call {
             Ok(Ok(c)) => {
-                if let Ok(mut cc) = cache.lock() {
+                if let Ok(mut cc) = shared.cache.lock() {
                     cc.insert(*info_hash, c);
                 }
                 return Ok(c);
@@ -448,10 +467,9 @@ async fn eval_scrape_swarm(
                     // fast so the scan stops burning the shared budget.
                     // Nothing is cached; the next scan retries these.
                     tracing::warn!("tracker rate-limited, backing off: {e:#}");
-                    let mut sd = ctx.shutdown.clone();
-                    let backoff = ctx.scrape_backoff;
+                    let mut sd = shared.shutdown.clone();
                     tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
+                        _ = tokio::time::sleep(shared.scrape_backoff) => {}
                         _ = sd.changed() => {
                             anyhow::bail!("scan interrupted by shutdown");
                         }
@@ -466,8 +484,25 @@ async fn eval_scrape_swarm(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no tracker returned scrape data")))
 }
 
+async fn eval_scrape_swarm(
+    ctx: &EvalCtx,
+    cache: &std::sync::Mutex<SwarmCache>,
+    trackers: &[String],
+    info_hash: &[u8; 20],
+    stats: &ScanStats,
+) -> Result<SwarmCounts> {
+    let shared = ScrapeShared {
+        cache,
+        rate: &ctx.rate,
+        http: &ctx.http,
+        shutdown: &ctx.shutdown,
+        scrape_backoff: ctx.scrape_backoff,
+    };
+    scrape_swarm_cached(&shared, trackers, info_hash, stats).await
+}
+
 /// True when an error looks like HTTP 429 / rate limiting from a tracker.
-fn is_rate_limited(e: &anyhow::Error) -> bool {
+pub fn is_rate_limited(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}");
     s.contains("429") || s.to_lowercase().contains("too many requests")
 }
@@ -762,10 +797,7 @@ impl Engine {
     }
 
     fn torrent_cache_path(&self, info_hash_hex: &str) -> PathBuf {
-        self.cfg
-            .data_dir
-            .join("torrent-cache")
-            .join(format!("{info_hash_hex}.torrent"))
+        torrent_cache_path(&self.cfg.data_dir, info_hash_hex)
     }
 
     // ---- main loop (Run) ----
@@ -1287,25 +1319,30 @@ impl Engine {
         let held_hashes: HashSet<String> = held.iter().map(|h| h.info_hash.clone()).collect();
 
         // Catalog collapse guard: a fresh fetch that parses but lists far
-        // fewer items than we hold is a parse/schema accident (e.g. AT
-        // renaming the infohash field silently skips every row), not a mass
-        // deletion - and the eviction pass below deletes downloaded data
-        // along with each state entry. Refuse it unless the fresh catalog
-        // lists at least catalog_collapse_percent% of the held set
-        // (default 30; 0 disables, 100 is strictest). If a collapse is real,
+        // fewer of our HELD torrents than we hold is a parse/schema accident
+        // (e.g. AT renaming the infohash field silently skips every row, or
+        // a well-formed feed of wrong rows), not a mass deletion - and the
+        // eviction pass below deletes downloaded data along with each state
+        // entry. Refuse it unless the fresh catalog still lists at least
+        // catalog_collapse_percent% of the held set (default 30; 0 disables,
+        // 100 is strictest). The check is the held CATALOG OVERLAP, not the
+        // catalog's total item count: a same-volume catalog sharing zero
+        // hashes with our holdings is exactly the accident this guard exists
+        // for, and a volume check cannot see it. If a collapse is real,
         // raise the percent or set preserve_deleted_torrents - see
         // docs/RECOVERY.md for recovery after a wipe.
+        let still_listed = catalog_hashes.intersection(&held_hashes).count();
         let collapse = !held.is_empty()
             && self.cfg.catalog_collapse_percent > 0
-            && catalog_hashes.len()
+            && still_listed
                 < (held.len() * self.cfg.catalog_collapse_percent as usize / 100).max(1);
         if collapse {
             tracing::warn!(
-                "catalog collapse guard: fresh catalog lists {} items but {} torrents are held \
+                "catalog collapse guard: fresh catalog still lists {} of {} held torrents \
                  (catalog_collapse_percent={}) - skipping removed-from-catalog eviction this scan; \
                  if the collapse is real, raise --catalog-collapse-percent (0 disables the guard) \
                  or set preserve_deleted_torrents - see docs/RECOVERY.md",
-                catalog_hashes.len(),
+                still_listed,
                 held.len(),
                 self.cfg.catalog_collapse_percent,
             );
@@ -1314,24 +1351,31 @@ impl Engine {
         }
         // Confirm the survivors: every held torrent the fresh catalog still
         // lists gets its vanished-eviction clock reset. Only unlisted ones
-        // keep counting toward the deleted-torrent grace window.
+        // keep counting toward the deleted-torrent grace window. Batched
+        // into one state write: this runs over the whole held set every
+        // scan, and a per-torrent `State::update` rewrote + fsynced the
+        // full state.json once per survivor.
         let now = Utc::now();
-        let mut confirmed_any = false;
-        for h in self.state.all() {
-            if catalog_hashes.contains(&h.info_hash)
-                && h.last_confirmed_in_catalog_at
-                    .map(|t| t < now)
-                    .unwrap_or(true)
-                && self
-                    .state
-                    .update(&h.info_hash, |t| {
+        let confirmations: Vec<(String, crate::state::TorrentUpdate)> = self
+            .state
+            .all()
+            .into_iter()
+            .filter(|h| {
+                catalog_hashes.contains(&h.info_hash)
+                    && h.last_confirmed_in_catalog_at
+                        .map(|t| t < now)
+                        .unwrap_or(true)
+            })
+            .map(|h| {
+                (
+                    h.info_hash.clone(),
+                    Box::new(move |t: &mut state::Torrent| {
                         t.last_confirmed_in_catalog_at = Some(now);
-                    })
-                    .unwrap_or(false)
-            {
-                confirmed_any = true;
-            }
-        }
+                    }) as crate::state::TorrentUpdate,
+                )
+            })
+            .collect();
+        let confirmed_any = self.state.update_each(confirmations).unwrap_or(0) > 0;
         if confirmed_any {
             self.push_live();
         }
@@ -1342,12 +1386,16 @@ impl Engine {
         self.evict_stalled_torrents(&catalog_hashes).await;
 
         let max_fittable = self.max_fittable_size();
+        // Same predicate as `total_candidates` below, so the two figures in
+        // the "disqualified N oversized" / "total=M" log lines can't
+        // contradict each other. (This loop used to check held + size only
+        // and so counted blocklisted+oversized items that `count_pending`
+        // excluded.)
         let mut too_big = 0u64;
         for item in &items {
-            if held_hashes.contains(&hex::encode(item.info_hash)) {
-                continue;
-            }
-            if max_fittable > 0 && item.size_bytes > max_fittable {
+            if prefilter_reason(item, &held_hashes, &self.blocklist, max_fittable)
+                == Prefilter::TooBig
+            {
                 too_big += 1;
             }
         }
@@ -1638,7 +1686,9 @@ impl Engine {
     }
 
     /// Scrape trackers in order (cached first); AT hosts go through the
-    /// shared rate limiter.
+    /// shared rate limiter. Thin adapter over the one shared
+    /// [`scrape_swarm_cached`] the evaluation workers use, so the 429 policy
+    /// cannot drift between the two callers.
     async fn scrape_swarm(
         &self,
         shutdown: &tokio::sync::watch::Receiver<bool>,
@@ -1646,60 +1696,14 @@ impl Engine {
         info_hash: &[u8; 20],
         stats: &ScanStats,
     ) -> Result<SwarmCounts> {
-        if let Ok(cache) = self.swarm_cache.lock() {
-            if let Some(c) = cache.get(info_hash) {
-                stats.scrape_cached.fetch_add(1, Ordering::Relaxed);
-                return Ok(c);
-            }
-        }
-        let mut last_err: Option<anyhow::Error> = None;
-        for tracker in trackers {
-            if crate::atkey::is_at_tracker_url(tracker) {
-                self.rate.lock().await.wait().await;
-            }
-            if !tracker.starts_with("http://") && !tracker.starts_with("https://") {
-                // UDP trackers (BEP 15 scrape) are not implemented; skip quietly.
-                continue;
-            }
-            stats.scrape_requests.fetch_add(1, Ordering::Relaxed);
-            let call = tokio::time::timeout(
-                SCRAPE_TIMEOUT,
-                attorrent::scrape_http(
-                    &self.http,
-                    &buildinfo::scraper_user_agent(),
-                    tracker,
-                    info_hash,
-                ),
-            )
-            .await;
-            match call {
-                Ok(Ok(c)) => {
-                    if let Ok(mut cache) = self.swarm_cache.lock() {
-                        cache.insert(*info_hash, c);
-                    }
-                    return Ok(c);
-                }
-                Ok(Err(e)) => {
-                    if is_rate_limited(&e) {
-                        tracing::warn!(
-                            "tracker rate-limited during held refresh, backing off: {e:#}"
-                        );
-                        let mut sd = shutdown.clone();
-                        let backoff = self.scrape_backoff;
-                        tokio::select! {
-                            _ = tokio::time::sleep(backoff) => {}
-                            _ = sd.changed() => {
-                                anyhow::bail!("scan interrupted by shutdown");
-                            }
-                        }
-                        return Err(anyhow::anyhow!("tracker rate-limited"));
-                    }
-                    last_err = Some(e)
-                }
-                Err(_) => last_err = Some(anyhow::anyhow!("scrape timed out")),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no tracker returned scrape data")))
+        let shared = ScrapeShared {
+            cache: &self.swarm_cache,
+            rate: &self.rate,
+            http: &self.http,
+            shutdown,
+            scrape_backoff: self.scrape_backoff,
+        };
+        scrape_swarm_cached(&shared, trackers, info_hash, stats).await
     }
 
     // ---- acting ----
@@ -1837,14 +1841,21 @@ impl Engine {
         let mut c = c.clone();
         c.piece_count = md.piece_count;
 
-        // FD-aware admission: rqbit opens one fd per non-padding file at add
-        // time and holds it for the torrent's lifetime. A many-file candidate
-        // that would push the process past RLIMIT_NOFILE is skipped here —
-        // before opening anything, before rolling, before touching state —
-        // so fd exhaustion is orderly selection (this candidate waits for a
-        // roomier scan), not a hard "Too many open files" add failure. The
-        // guard reads the live headroom per candidate (cheap: one getrlimit
-        // + one /proc readdir); unknown headroom admits.
+        // FD-aware admission: a many-file candidate that would push the
+        // process past RLIMIT_NOFILE is skipped here — before opening
+        // anything, before rolling, before touching state — so fd pressure
+        // is orderly selection (this candidate waits for a roomier scan),
+        // not a hard "Too many open files" add failure. The guard reads the
+        // live headroom per candidate (cheap: one getrlimit + one /proc
+        // readdir); unknown headroom admits.
+        //
+        // Pricing note: it charges one fd per file, which was exact when
+        // storage held every file open for the torrent's lifetime and is
+        // now an upper bound — `engine::pool_storage` serves IO through a
+        // bounded LRU handle pool, so a many-file torrent typically uses far
+        // fewer live fds than its file count. Deliberately conservative:
+        // refusing a candidate costs coverage, whereas pricing too low
+        // costs a hard add failure. See `fdlimit`'s module docs.
         if !crate::fdlimit::fits_in_headroom(md.file_count as u64, crate::fdlimit::fd_headroom()) {
             tracing::info!(
                 "skipping candidate: needs {} file fds but only {} free (title={})",
@@ -1861,7 +1872,24 @@ impl Engine {
             roll: 0.0,
             reason: "candidate not evaluated".to_string(),
         };
+
+        // ONE seed-scarcity roll per evaluation, drawn before any path split
+        // and shared by the fill and the swap path alike (DESIGN.md: "every
+        // candidate in every scan gets its own independent chance"). Drawing
+        // it per placement attempt would hand a candidate k independent rolls
+        // across k storage locations (P(admit) = 1-(1-p)^k) - and would do so
+        // on exactly the paths that skip the fill attempt entirely (torrent
+        // cap reached, no free space, RAM headroom exhausted), where the old
+        // per-try_add draw meant no roll had been consumed yet. A quarantine
+        // re-probe bypasses the roll (roll < 0 beats any chance >= 0): the
+        // probe bypass is bounded twice over - free space only (never
+        // displaces, see below) and max_retries escalation.
         let mut rng = rand::thread_rng();
+        let roll = if quarantine_probe {
+            -1.0
+        } else {
+            selector::roll(&mut rng)
+        };
 
         if *held_count < self.max_torrents {
             // Free-space fill still checks the RAM price: even below the
@@ -1896,15 +1924,7 @@ impl Engine {
                 {
                     let loc = self.cfg.storage[idx].path.clone();
                     let (added, d) = self
-                        .try_add(
-                            &c,
-                            &md,
-                            size_bytes,
-                            &loc,
-                            &[],
-                            seeder_floor,
-                            quarantine_probe,
-                        )
+                        .try_add(&c, &md, size_bytes, &loc, &[], seeder_floor, roll)
                         .await;
                     decision = d;
                     if added {
@@ -1922,12 +1942,13 @@ impl Engine {
         }
 
         // DESIGN.md: "candidates that lose the [seed-scarcity] roll are
-        // skipped entirely." The fill path already drew the roll; falling
-        // through to the swap path would hand the candidate a fresh roll per
-        // storage location (P(admit) = 1-(1-p)^k), so a roll-rejected
-        // candidate could displace strictly better-seeded held torrents even
-        // with free space plentiful - swap exists for space/RAM pressure,
-        // gated by margin, not as a scarcity-roll retry.
+        // skipped entirely." The roll above is shared by both placement
+        // paths, so a roll-rejected candidate is rejected everywhere - this
+        // early return is the fast path for that, not the mechanism. Without
+        // it a roll-rejected candidate would still walk the swap path and
+        // displace strictly better-seeded held torrents while free space is
+        // plentiful - swap exists for space/RAM pressure, gated by margin,
+        // not as a scarcity-roll retry.
         if decision.seed_scarcity_blocked() {
             return;
         }
@@ -1949,15 +1970,26 @@ impl Engine {
             return;
         }
 
-        let (swapped, d) = self
+        let (swapped, d, displaced_removed) = self
             .try_swap(
                 &c,
                 &md,
                 size_bytes,
                 *held_count >= self.max_torrents,
                 seeder_floor,
+                roll,
             )
             .await;
+        if swapped {
+            // A swap is 1-in / N-out. Keeping held_count in step with the
+            // real set matters within the scan: it gates the free-space
+            // fill path (`held_count < max_torrents`), so a drift upward
+            // would make later candidates skip fill and swap needlessly
+            // until the next scan re-derives the count from state.
+            *held_count = held_count
+                .saturating_add(1)
+                .saturating_sub(displaced_removed);
+        }
         if swapped || (!decision.seed_scarcity_blocked() && !d.reason.is_empty()) {
             self.log_decision(&c, &d);
         }
@@ -2026,18 +2058,15 @@ impl Engine {
         location: &Path,
         displaced: &[Held],
         seeder_floor: u32,
-        quarantine_probe: bool,
+        roll: f64,
     ) -> (bool, selector::SwapDecision) {
-        let mut rng = rand::thread_rng();
-        // A quarantine re-probe bypasses the roll (roll < 0 beats any
+        // `roll` is drawn ONCE per evaluation by act_on_candidate and shared
+        // by every placement attempt for this candidate, so a candidate can
+        // never earn a second chance by being retried against another
+        // location. A quarantine re-probe passes roll = -1.0 (beats any
         // chance >= 0): see act_on_candidate. The availability and margin
         // vetoes still apply — a probe with no live seed simply waits for
         // the swarm to gain one.
-        let roll = if quarantine_probe {
-            -1.0
-        } else {
-            selector::roll(&mut rng)
-        };
         let decision = selector::evaluate_swap(
             &selector::Candidate {
                 info_hash: c.info_hash,
@@ -2075,7 +2104,6 @@ impl Engine {
         if let Err(e) = engtorrents::add_torrent_bytes(
             &self.session,
             &hex_str,
-            md,
             &out_dir,
             keyed,
             &self.torrent_cache_path(&hex_str),
@@ -2130,6 +2158,13 @@ impl Engine {
         (true, decision)
     }
 
+    /// Swap in `c` at the best location that frees enough disk AND RAM
+    /// (see `select_displaceable`), removing the displaced set after a
+    /// successful add. One location attempt only (first that fits).
+    ///
+    /// Returns `(added, decision, displaced_removed)`: the last element is
+    /// how many held torrents actually left state, so the caller can keep
+    /// its running `held_count` honest (a swap is 1-in / N-out).
     async fn try_swap(
         &mut self,
         c: &Candidate,
@@ -2137,7 +2172,8 @@ impl Engine {
         size_bytes: u64,
         _ram_bound: bool,
         seeder_floor: u32,
-    ) -> (bool, selector::SwapDecision) {
+        roll: f64,
+    ) -> (bool, selector::SwapDecision, usize) {
         let held = self.state.all();
         let peer_limit = ram::peer_limit_for_budget(self.ram_budget);
         let ram_cost = ram::torrent_ram(md.piece_count, peer_limit);
@@ -2218,14 +2254,16 @@ impl Engine {
                     seeders: h.last_known_seeders,
                 })
                 .collect();
-            // Probe bypass of the seed-scarcity roll is free-space-only
-            // (act_on_candidate never routes a probe into try_swap), so
-            // swaps always draw the real roll.
+            // The seed-scarcity roll is shared with the fill path (one draw
+            // per evaluation, threaded in from act_on_candidate), so a
+            // candidate cannot earn extra chances by being retried against
+            // more locations. Probes never reach here: act_on_candidate
+            // routes them to free space only.
             let (ok, decision) = self
-                .try_add(c, md, size_bytes, &location, &sel_held, seeder_floor, false)
+                .try_add(c, md, size_bytes, &location, &sel_held, seeder_floor, roll)
                 .await;
             if ok {
-                let mut removed_any = false;
+                let mut removed = 0usize;
                 for h in &displaced {
                     tracing::info!(
                         "swapped out displaced torrent (title={} seeders={} size={} for candidate={})",
@@ -2245,18 +2283,18 @@ impl Engine {
                     if let Err(e) = self.state.remove(&h.info_hash) {
                         tracing::error!("failed to drop state for {}: {e:#}", h.title);
                     } else {
-                        removed_any = true;
+                        removed += 1;
                     }
                 }
-                if removed_any {
+                if removed > 0 {
                     self.push_live();
                 }
-                return (true, decision);
+                return (true, decision, removed);
             } else {
                 last = decision;
             }
         }
-        (false, last)
+        (false, last, 0)
     }
 
     // ---- maintenance ----
@@ -2330,7 +2368,13 @@ impl Engine {
     async fn refresh_held_seeder_counts(&mut self, shutdown: &tokio::sync::watch::Receiver<bool>) {
         let held = self.state.all();
         let total = held.len();
-        let mut updated_any = false;
+        // Collect the per-torrent updates during the async walk and apply
+        // them in ONE state write at the end: this pass covers the whole
+        // held set every scan, and per-entry `State::update` rewrote +
+        // fsynced the full state.json once per torrent (up to |held| full
+        // rewrites per scan - the exact anti-pattern `update_progress_many`
+        // already fixed for the watchdog pass).
+        let mut updates: Vec<(String, crate::state::TorrentUpdate)> = Vec::new();
         for (done, h) in held.into_iter().enumerate() {
             if *shutdown.borrow() {
                 tracing::info!("held refresh interrupted by shutdown ({done}/{total})");
@@ -2359,19 +2403,21 @@ impl Engine {
                     // saturate past 4 GiB, making every later refresh look like
                     // "progress" and freezing the stall clock at scan times.
                     let progress = self.held_progress_bytes(&h);
-                    if let Ok(true) = self.state.update(&hex, |t| {
-                        t.last_known_seeders = sw.seeders;
-                        if progress > t.completed_pieces || t.last_progress_at.is_none() {
-                            t.completed_pieces = progress;
-                            t.last_progress_at = Some(Utc::now());
-                        }
-                    }) {
-                        updated_any = true;
-                    }
+                    updates.push((
+                        hex,
+                        Box::new(move |t: &mut state::Torrent| {
+                            t.last_known_seeders = sw.seeders;
+                            if progress > t.completed_pieces || t.last_progress_at.is_none() {
+                                t.completed_pieces = progress;
+                                t.last_progress_at = Some(Utc::now());
+                            }
+                        }),
+                    ));
                 }
                 Err(e) => tracing::warn!("could not scrape held torrent {}: {e:#}", h.title),
             }
         }
+        let updated_any = self.state.update_each(updates).unwrap_or(0) > 0;
         if updated_any {
             self.push_live();
         }
@@ -2524,7 +2570,6 @@ impl Engine {
             if let Err(e) = engtorrents::add_torrent_bytes(
                 &self.session,
                 &h.info_hash,
-                &md,
                 &out_dir,
                 keyed,
                 &self.torrent_cache_path(&h.info_hash),
@@ -2670,26 +2715,50 @@ fn shuffle<T>(v: &mut [T]) {
     v.shuffle(&mut rand::thread_rng());
 }
 
+/// Why a catalog item is not a pending candidate.
+///
+/// Single spelling for the three sites that ask: `count_pending` (the
+/// `total_candidates` figure the snapshot and progress percent read), the
+/// evaluation prefilter, and the oversize log counter. They had already
+/// drifted apart - the oversize counter forgot the blocklist check, so the
+/// "disqualified N oversized candidates" line disagreed with the
+/// `total=...` printed in the same log record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prefilter {
+    Held,
+    Blocked,
+    TooBig,
+    Pending,
+}
+
+fn prefilter_reason(
+    item: &atcatalog::Item,
+    held: &HashSet<String>,
+    blocklist: &KeywordBlocklist,
+    max_fittable: u64,
+) -> Prefilter {
+    if held.contains(&hex::encode(item.info_hash)) {
+        return Prefilter::Held;
+    }
+    if blocklist.blocks(&item.title, &item.description).is_some() {
+        return Prefilter::Blocked;
+    }
+    if max_fittable > 0 && item.size_bytes > max_fittable {
+        return Prefilter::TooBig;
+    }
+    Prefilter::Pending
+}
+
 fn count_pending(
     items: &[atcatalog::Item],
     held: &HashSet<String>,
     blocklist: &KeywordBlocklist,
     max_fittable: u64,
 ) -> u64 {
-    let mut n = 0u64;
-    for item in items {
-        if held.contains(&hex::encode(item.info_hash)) {
-            continue;
-        }
-        if blocklist.blocks(&item.title, &item.description).is_some() {
-            continue;
-        }
-        if max_fittable > 0 && item.size_bytes > max_fittable {
-            continue;
-        }
-        n += 1;
-    }
-    n
+    items
+        .iter()
+        .filter(|i| prefilter_reason(i, held, blocklist, max_fittable) == Prefilter::Pending)
+        .count() as u64
 }
 
 fn tiers_of(flat: &[String]) -> Vec<Vec<String>> {
@@ -2900,6 +2969,83 @@ struct StoredEntry {
     seeders: u32,
     leechers: u32,
     at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod prefilter_tests {
+    use super::*;
+
+    fn item(hash_byte: u8, title: &str, size: u64) -> atcatalog::Item {
+        atcatalog::Item {
+            title: title.to_string(),
+            category: String::new(),
+            info_hash: [hash_byte; 20],
+            guid: String::new(),
+            link: String::new(),
+            description: String::new(),
+            size_bytes: size,
+        }
+    }
+
+    /// The three sites that ask "is this a pending candidate?" share one
+    /// answer. The oversize counter used to spell the rule itself (held ->
+    /// size, no blocklist), so it counted blocklisted+oversized items that
+    /// `count_pending` excluded - the "disqualified N oversized" line and
+    /// the `total=M` figure in the same log record could contradict.
+    #[test]
+    fn one_predicate_answers_for_every_caller() {
+        let held: HashSet<String> = [hex::encode([1u8; 20])].into_iter().collect();
+        let blocklist = KeywordBlocklist::new(vec!["blocked".to_string()]);
+
+        let held_item = item(1, "fine", 10);
+        let blocked_item = item(2, "a blocked title", 10);
+        let blocked_and_big = item(3, "blocked and huge", u64::MAX);
+        let too_big = item(4, "fine but huge", u64::MAX);
+        let pending = item(5, "fine", 10);
+
+        let all = [
+            &held_item,
+            &blocked_item,
+            &blocked_and_big,
+            &too_big,
+            &pending,
+        ];
+        let max_fittable = 1_000u64;
+
+        // The classification itself.
+        for (i, want) in [
+            (&held_item, Prefilter::Held),
+            (&blocked_item, Prefilter::Blocked),
+            (&blocked_and_big, Prefilter::Blocked),
+            (&too_big, Prefilter::TooBig),
+            (&pending, Prefilter::Pending),
+        ] {
+            assert_eq!(
+                prefilter_reason(i, &held, &blocklist, max_fittable),
+                want,
+                "misclassified: {}",
+                i.title
+            );
+        }
+
+        // count_pending sees exactly the Pending one...
+        let items: Vec<atcatalog::Item> = all.iter().map(|i| (*i).clone()).collect();
+        assert_eq!(
+            count_pending(&items, &held, &blocklist, max_fittable),
+            1,
+            "only the clean small item is a pending candidate"
+        );
+        // ...and the oversize counter sees only items whose ONLY disqualifier
+        // is size - never a blocklisted one, however large.
+        let too_big_count = items
+            .iter()
+            .filter(|i| prefilter_reason(i, &held, &blocklist, max_fittable) == Prefilter::TooBig)
+            .count();
+        assert_eq!(
+            too_big_count, 1,
+            "a blocklisted+oversized item must not be counted as oversized"
+        );
+    }
 }
 
 #[cfg(test)]

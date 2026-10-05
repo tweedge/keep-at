@@ -65,11 +65,6 @@ pub const SYSTEM_RAM_FRACTION_HARD_CAP: f64 = 0.8;
 /// stay world-readable for `status`/`hosted-torrents` as any user.
 pub const API_KEY_FILE: &str = "api_key";
 
-/// Legacy flat per-torrent estimate. Superseded by the measured model in
-/// engine::ram (BASE + per-piece + per-peer at the budget's peer limit);
-/// kept so the hard-cap log line and external callers still compile.
-pub const PER_TORRENT_RAM_BASE: u64 = 1 << 20; // 1 MiB
-
 fn default_scan_interval() -> Duration {
     DEFAULT_SCAN_INTERVAL
 }
@@ -509,19 +504,13 @@ impl Config {
         };
         let mut cfg: Config = serde_yaml::from_slice(&data)
             .with_context(|| format!("parsing config {}", path.display()))?;
-        // Fill defaults for fields a partial YAML left at zero values.
-        if cfg.port == 0 {
-            cfg.port = DEFAULT_PORT;
-        }
-        if cfg.data_dir.as_os_str().is_empty() {
-            cfg.data_dir = default_data_dir();
-        }
-        if cfg.aggressiveness == 0.0 {
-            cfg.aggressiveness = DEFAULT_AGGRESSIVENESS;
-        }
-        if cfg.scan.rate_limit_per_second == 0.0 {
-            cfg.scan.rate_limit_per_second = DEFAULT_RATE_LIMIT_PER_SEC;
-        }
+        // Zero values are NOT silently defaulted here. Each of these fields
+        // carries a serde `default = ...` for the *omitted* case; a zero the
+        // operator wrote explicitly is a units mistake or a policy statement
+        // (aggressiveness: 0 meaning "never auto-select"), and it must reach
+        // validate() and be refused exactly like the equivalent CLI flag.
+        // Rewriting zeros to defaults first meant `--aggressiveness 0` errored
+        // while `aggressiveness: 0` in the file silently ran at the default.
         // API key from the secret file (authoritative at runtime). Unreadable
         // (non-owner) => keep whatever the config field said, never fatal —
         // an anonymous node is a supported mode.
@@ -679,22 +668,7 @@ impl Config {
         if self.port == 0 {
             bail!("port {} is out of range", self.port);
         }
-        if self.scan.rate_limit_per_second.is_nan() || self.scan.rate_limit_per_second <= 0.0 {
-            // !(x > 0.0), not x <= 0.0: NaN compares false against both and
-            // would otherwise sail through validation into
-            // Duration::from_secs_f64(1.0/NaN), which panics - and the
-            // release profile is panic=abort, so that is a boot loop.
-            bail!("scan.rate_limit_per_second must be a positive finite number");
-        }
-        if self.scan.rate_limit_per_second < MIN_RATE_LIMIT_PER_SECOND {
-            bail!(
-                "scan.rate_limit_per_second must be at least {} (one request every \
-                 {}s at that rate would wedge a scan for months) - got {}",
-                MIN_RATE_LIMIT_PER_SECOND,
-                (1.0 / MIN_RATE_LIMIT_PER_SECOND) as u64,
-                self.scan.rate_limit_per_second
-            );
-        }
+        check_rate_limit(self.scan.rate_limit_per_second)?;
         for (name, d) in [
             ("scan.interval", self.scan.interval),
             ("scan.moderation_delay", self.scan.moderation_delay),
@@ -883,6 +857,33 @@ const MAX_DURATION_KNOB: Duration = Duration::from_secs(366 * 24 * 3600);
 /// every `1/rate` seconds wedges a multi-thousand-request scan for
 /// months while activity reads "Scanning".
 pub const MIN_RATE_LIMIT_PER_SECOND: f64 = 1e-6;
+
+/// Validate an Academic Torrents request rate.
+///
+/// Shared by [`Config::validate`] and the census resolver (`cli::
+/// resolve_census`) so every entry point applies the same rule. The census
+/// path used to stop at "is it positive", so a `rate_limit_per_second` of
+/// 0.001 (one request every ~17 minutes) slipped past `network-status` and
+/// would have wedged its probe for months.
+pub fn check_rate_limit(per_second: f64) -> Result<()> {
+    // `is_nan() || <= 0.0`, not `!(x > 0.0)`: NaN compares false against
+    // both and would otherwise sail through into
+    // Duration::from_secs_f64(1.0/NaN), which panics - and the release
+    // profile is panic=abort, so that is a boot loop.
+    if per_second.is_nan() || per_second <= 0.0 {
+        bail!("scan.rate_limit_per_second must be a positive finite number");
+    }
+    if per_second < MIN_RATE_LIMIT_PER_SECOND {
+        bail!(
+            "scan.rate_limit_per_second must be at least {} (one request every \
+             {}s at that rate would wedge a scan for months) - got {}",
+            MIN_RATE_LIMIT_PER_SECOND,
+            (1.0 / MIN_RATE_LIMIT_PER_SECOND) as u64,
+            per_second
+        );
+    }
+    Ok(())
+}
 
 fn check_duration_knob(name: &str, d: Duration) -> Result<()> {
     if d > Duration::ZERO && d > MAX_DURATION_KNOB {
@@ -1226,6 +1227,77 @@ mod tests {
         assert_eq!(cfg.scan.stall_eviction_timeout, Duration::ZERO);
         assert_eq!(cfg.scan.vanished_eviction_timeout, Duration::ZERO);
         assert_eq!(cfg.scan.quarantine_check_interval, Duration::ZERO);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Zero is NOT a meaningful value for `aggressiveness`,
+    /// `scan.rate_limit_per_second`, or `port` - it's the units mistake
+    /// `validate()` exists to catch, and `--aggressiveness 0` correctly
+    /// errors. A config file used to silently rewrite those zeros to the
+    /// defaults before validation, so an operator writing
+    /// `aggressiveness: 0` (meaning "never auto-select") got a node running
+    /// at 0.6 and downloading. Same value, same meaning, same error.
+    #[test]
+    fn explicit_zero_policy_values_reject_like_the_cli() {
+        for (field, value, body) in [
+            ("aggressiveness", "0", "aggressiveness: 0".to_string()),
+            ("aggressiveness", "0.0", "aggressiveness: 0.0".to_string()),
+            (
+                "scan.rate_limit_per_second",
+                "0",
+                "scan:\n  rate_limit_per_second: 0".to_string(),
+            ),
+            ("port", "0", "port: 0".to_string()),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "keep-at-cfgpolicy-{}-{}",
+                std::process::id(),
+                field.replace('.', "-")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("policy.yaml");
+            std::fs::write(
+                &path,
+                format!(
+                    "data_dir: {}\nstorage:\n- path: {}/s\n  limit: 200M\n{}\n",
+                    dir.display(),
+                    dir.display(),
+                    body
+                ),
+            )
+            .unwrap();
+            let res = Config::load(&path);
+            assert!(
+                res.is_err(),
+                "{field}: {value} must be rejected like the CLI flag, got {:?}",
+                res.map(|c| (c.port, c.aggressiveness, c.scan.rate_limit_per_second))
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The counterpart: omitting these fields still lands on their defaults
+    /// (that's serde's job, not the coercer's).
+    #[test]
+    fn omitted_policy_values_get_defaults() {
+        let dir = std::env::temp_dir().join(format!("keep-at-cfgomit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("omitted.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "data_dir: {}\nstorage:\n- path: {}/s\n  limit: 200M\n",
+                dir.display(),
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("omitted fields load");
+        assert_eq!(cfg.port, DEFAULT_PORT);
+        assert_eq!(cfg.aggressiveness, DEFAULT_AGGRESSIVENESS);
+        assert_eq!(cfg.scan.rate_limit_per_second, DEFAULT_RATE_LIMIT_PER_SEC);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

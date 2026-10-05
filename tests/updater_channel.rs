@@ -76,42 +76,15 @@ fn release_json(tag: &str, asset_name: &str, download_url: &str) -> String {
     )
 }
 
-/// The exact decision block from bin/keep-at.rs cmd_self_update, replicated
-/// verbatim so the decision under test is the shipped logic
-/// (latest_version output feeds straight into it).
+/// The shipped self-update guard. `cmd_self_update` calls
+/// `updater::decide`, so this exercises production logic rather than a
+/// verbatim replica of it (the old copy here stayed green no matter what
+/// happened to the real guard).
 fn would_install(latest: &str, current: &str, _beta: bool) -> bool {
-    if latest.trim_start_matches('v') == current.trim_start_matches('v') || latest == current {
-        return false;
-    }
-    if version_older_or_equal(latest, current) {
-        return false;
-    }
-    true
-}
-
-fn version_older_or_equal(a: &str, b: &str) -> bool {
-    fn parts(v: &str) -> Vec<u64> {
-        v.trim_start_matches('v')
-            .split('.')
-            .map(|p| {
-                p.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0)
-            })
-            .collect()
-    }
-    let (a, b) = (parts(a), parts(b));
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        if x != y {
-            return x < y;
-        }
-    }
-    true
+    matches!(
+        updater::decide(latest, current),
+        updater::UpdateDecision::Upgrade
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]

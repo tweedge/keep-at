@@ -96,7 +96,7 @@ pub async fn cmd_network_status(args: &NetworkStatusArgs) -> Result<()> {
 
     for item in &items {
         let hex = hex::encode(item.info_hash);
-        let md = match cached_or_fetch(&cfg.data_dir, &torrent_fetcher, &hex).await {
+        let md = match cached_or_fetch(&cfg.data_dir, &torrent_fetcher, &mut rate, &hex).await {
             Ok(md) => md,
             Err(_) => {
                 result.failed += 1;
@@ -232,19 +232,23 @@ impl RateState {
     }
 }
 
+/// Cached `.torrent` fetch, throttled like every other request to AT's
+/// infrastructure. The throttle used to cover only the scrape side of the
+/// census, so the metadata fetches ahead of it went out in an unpolite
+/// burst.
 async fn cached_or_fetch(
     data_dir: &std::path::Path,
     fetcher: &attorrent::Fetcher,
+    rate: &mut RateState,
     hex: &str,
 ) -> Result<attorrent::TorrentMeta> {
-    let path = data_dir
-        .join("torrent-cache")
-        .join(format!("{hex}.torrent"));
+    let path = crate::engine::scan::torrent_cache_path(data_dir, hex);
     if let Ok(data) = std::fs::read(&path) {
         if let Ok(md) = attorrent::parse_torrent_bytes(&data) {
             return Ok(md);
         }
     }
+    rate.wait().await;
     let md = fetcher.fetch_torrent(hex, Some(&path)).await?.0;
     Ok(md)
 }
@@ -263,14 +267,25 @@ async fn scrape_one(
         if !tracker.starts_with("http://") && !tracker.starts_with("https://") {
             continue;
         }
+        // Same timeout as the daemon's scrape (was a hardcoded 15s here,
+        // drifting from engine::scan::SCRAPE_TIMEOUT).
         let call = tokio::time::timeout(
-            Duration::from_secs(15),
+            crate::engine::scan::SCRAPE_TIMEOUT,
             attorrent::scrape_http(http, &buildinfo::scraper_user_agent(), tracker, info_hash),
         )
         .await;
         match call {
             Ok(Ok(c)) => return Ok(c),
-            Ok(Err(e)) => last_err = Some(e),
+            Ok(Err(e)) => {
+                // Same 429 rule as the daemon: fail fast on throttling
+                // instead of walking the rest of the tracker list into a
+                // rate limit this diagnostic started. (This copy used to
+                // have no 429 handling at all.)
+                if crate::engine::scan::is_rate_limited(&e) {
+                    return Err(e.context("tracker rate-limited during census"));
+                }
+                last_err = Some(e)
+            }
             Err(_) => last_err = Some(anyhow::anyhow!("scrape timed out")),
         }
     }
@@ -306,11 +321,10 @@ async fn probe_swarm(
     };
     // Raw bytes loaded here and dropped with the response; never held across
     // probe iterations.
-    let raw = std::fs::read(
-        data_dir
-            .join("torrent-cache")
-            .join(format!("{info_hash_hex}.torrent")),
-    )
+    let raw = std::fs::read(crate::engine::scan::torrent_cache_path(
+        data_dir,
+        info_hash_hex,
+    ))
     .with_context(|| format!("loading cached .torrent for {info_hash_hex}"))?;
     let resp = session
         .add_torrent(AddTorrent::TorrentFileBytes(raw.into()), Some(opts))
@@ -380,7 +394,7 @@ fn keep_at_peers(
     for (addr, peer) in &snap.peers {
         if let Some(name) = &peer.client_name {
             if crate::buildinfo::is_keep_at_seeder(name) {
-                let host = addr.split(':').next().unwrap_or(addr).to_string();
+                let host = peer_host_key(addr);
                 // A keep-at seeder with our torrent complete locally is
                 // seeding (it must hold it complete to advertise seeder
                 // identity truthfully); otherwise count as leeching.
@@ -391,14 +405,57 @@ fn keep_at_peers(
     out
 }
 
+/// Stable per-node key for a peer address: the IP without its port.
+///
+/// `PeerStats` keys are `SocketAddr` display strings. Splitting on the
+/// first `:` (the obvious-looking way to drop a port) mangles IPv6 -
+/// `[2001:db8::1]:51413` became `"[2001"`, collapsing every IPv6 peer that
+/// shares a first hextet into one bogus "node" in `network-status`'s node
+/// count. Parse the address and use its IP; fall back to the rsplit form
+/// only if the key somehow isn't a socket address.
+pub fn peer_host_key(addr: &str) -> String {
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        return sa.ip().to_string();
+    }
+    match addr.rsplit_once(':') {
+        Some((host, _)) => host.trim_matches(['[', ']']).to_string(),
+        None => addr.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod peer_key_tests {
+    use super::*;
+
+    /// `network-status`'s node count is "distinct IP addresses seen
+    /// claiming to be keep-at". Keying on the first `:` of a `SocketAddr`
+    /// display string mangles IPv6 (`[2001:db8::1]:51413` -> `"[2001"`),
+    /// collapsing every IPv6 peer sharing a first hextet into one bogus
+    /// node - the number is presented to operators without qualification.
+    #[test]
+    fn peer_host_key_handles_ipv6() {
+        assert_eq!(peer_host_key("1.2.3.4:51413"), "1.2.3.4");
+        assert_eq!(peer_host_key("[2001:db8::1]:51413"), "2001:db8::1");
+        assert_eq!(peer_host_key("[2001:db8::2]:51413"), "2001:db8::2");
+        assert_eq!(peer_host_key("[::1]:1"), "::1");
+        // Distinct IPv6 peers must stay distinct.
+        assert_ne!(
+            peer_host_key("[2001:db8::1]:1"),
+            peer_host_key("[2001:db8::2]:2")
+        );
+    }
+}
+
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
 
     /// A NaN rate limit used to panic RateState::wait
     /// (Duration::from_secs_f64(1.0/NaN)); the defensive predicate keeps it
-    /// a no-op. Non-positive remains fail-open inside the limiter (the
-    /// CLI/config entry points reject it - see resolve_census/validate).
+    /// a no-op. Non-positive remains fail-open inside the limiter itself:
+    /// the shared `config::check_rate_limit` is what rejects a bad rate, and
+    /// it runs on every entry point (`Config::validate` and
+    /// `cli::resolve_census`).
     #[tokio::test]
     async fn rate_state_wait_does_not_panic_on_nan() {
         let mut rs = RateState::new(f64::NAN);

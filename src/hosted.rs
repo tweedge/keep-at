@@ -86,9 +86,11 @@ pub fn cmd_hosted(args: &CommonArgs) -> Result<()> {
     for t in rows {
         let out_dir = torrent_output_dir(&t.storage_location, &t.info_hash);
         let on_disk = dir_size_bytes(&out_dir);
-        // Seeding heuristic without a live session: fully present when the
-        // completed-bytes marker says so, else compare on-disk to nominal.
-        // Plain storage writes sparse, so on-disk < nominal while downloading.
+        // Seeding heuristic without a live session: compare on-disk size to
+        // nominal. Plain storage writes sparse, so on-disk < nominal while
+        // downloading. (There is no separate completed-bytes marker to
+        // consult here - state's `completed_pieces` is a progress estimate
+        // refreshed at scan time, not a completion proof.)
         let seeding = on_disk >= t.size_bytes && t.size_bytes > 0;
         println!("{}", crate::humanize::sanitize_title(&t.title));
         println!(

@@ -23,11 +23,13 @@ pub struct TorrentMeta {
     /// bookkeeping scales ~32 B/piece (measured), so piece count - not byte
     /// size - is what makes one torrent cost more RAM than another.
     pub piece_count: u32,
-    /// Number of non-padding files rqbit will open and hold for this
-    /// torrent's lifetime (one fd each, opened at add time). Feeds the
-    /// fd-aware admission guard: a many-file candidate that would push the
-    /// process past RLIMIT_NOFILE is skipped before opening anything, so a
-    /// hard "Too many open files" add failure becomes orderly selection.
+    /// Number of non-padding files this torrent has. Feeds the fd-aware
+    /// admission guard, which charges one fd per file as an upper bound
+    /// (storage is a bounded LRU handle pool since `engine::pool_storage`,
+    /// so real fd use is typically lower - see `fdlimit`'s module docs).
+    /// A many-file candidate that would push the process past RLIMIT_NOFILE
+    /// is skipped before opening anything, so a hard "Too many open files"
+    /// add failure becomes orderly selection.
     pub file_count: u32,
     pub name: String,
 }
@@ -175,10 +177,11 @@ pub fn parse_torrent_bytes(body: &[u8]) -> Result<TorrentMeta> {
         .context("validating torrent info")?;
     let total_length = validated.lengths().total_length();
     let piece_count = validated.lengths().total_pieces();
-    // Same fd model as rqbit's FilesystemStorage::init: one open fd per
-    // non-padding file (padding entries get dummy handles, no fd). Padding
-    // rarely appears in AT content; counting it would only make the guard
-    // conservative, never unsound.
+    // Count the files the fd-aware admission guard should charge for:
+    // non-padding files (padding entries get dummy handles, no fd). This is
+    // an upper bound on live fds now that storage is a bounded LRU handle
+    // pool; padding rarely appears in AT content, and counting it would
+    // only make the guard more conservative, never unsound.
     let file_count = validated
         .iter_file_details()
         .filter(|d| !d.attrs().padding)

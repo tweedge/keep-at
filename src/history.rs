@@ -218,8 +218,18 @@ impl Writer {
     }
 
     pub fn record(&mut self, ev: &Event) {
-        let Ok(mut line) = serde_json::to_string(ev) else {
-            return;
+        // Never drop silently: the ledger is the operator's audit trail for
+        // what was added, swapped, and removed. A serialize failure here has
+        // historically meant a non-finite `chance` reaching an Add event
+        // (see selector::selection_chance) - exactly the case where the
+        // record matters most. Log loudly and keep going rather than
+        // vanishing without a trace.
+        let mut line = match serde_json::to_string(ev) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("history: could not serialize event, ledger entry dropped: {e:#}");
+                return;
+            }
         };
         line.push('\n');
         // Rotate on the write that would cross the cap, so the live file

@@ -69,6 +69,9 @@ pub fn completion_lifts(checked: u64, size_bytes: u64) -> bool {
     size_bytes > 0 && checked >= size_bytes
 }
 
+/// One pending per-torrent mutation for a batched [`State::update_each`].
+pub type TorrentUpdate = Box<dyn FnOnce(&mut Torrent)>;
+
 pub struct State {
     path: PathBuf,
     torrents: HashMap<String, Torrent>,
@@ -205,6 +208,32 @@ impl State {
             return Ok(false);
         }
         self.quarantine_remove(info_hash_hex)
+    }
+
+    /// Apply one mutation per named torrent, then persist ONCE.
+    ///
+    /// Prefer this over a loop of [`State::update`] for a whole pass over the
+    /// held set: `update` saves the full file (rewrite + fsync) per entry, so
+    /// the catalog-confirmation and seeder-refresh loops used to rewrite
+    /// `state.json` up to 2x|held| times per scan - on a Pi/SD node with
+    /// ~900 holdings that is hundreds of full-file rewrites and fsyncs per
+    /// scan. Same shape as [`update_progress_many`], kept generic so each
+    /// call site keeps its own per-torrent mutation.
+    ///
+    /// Unknown hashes are ignored. Returns how many torrents were actually
+    /// mutated; nothing is written when that is 0.
+    pub fn update_each(&mut self, updates: Vec<(String, TorrentUpdate)>) -> Result<usize> {
+        let mut changed = 0usize;
+        for (hex, f) in updates {
+            if let Some(t) = self.torrents.get_mut(&hex) {
+                f(t);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.save()?;
+        }
+        Ok(changed)
     }
 
     /// Progress bookkeeping for a whole watchdog pass in ONE save: pairs
@@ -508,6 +537,78 @@ mod tests {
             .update_progress_many(&[("aa".to_string(), 10)], now)
             .unwrap());
         assert_eq!(st.get("aa").unwrap().completed_pieces, 50);
+    }
+
+    /// A whole pass over the held set must cost ONE write, not one write
+    /// per torrent - the catalog-confirm and seeder-refresh loops run every
+    /// scan and used to rewrite the full file up to 2x|held| times.
+    #[test]
+    fn update_each_persists_once_for_a_whole_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut st = State::load(&path).unwrap();
+        for hash in ["aa", "bb", "cc"] {
+            st.put(Torrent {
+                info_hash: hash.to_string(),
+                title: format!("t-{hash}"),
+                size_bytes: 100,
+                storage_location: PathBuf::from("/loc"),
+                added_at: Utc::now(),
+                piece_count: 0,
+                last_known_seeders: 0,
+                completed_pieces: 0,
+                last_progress_at: None,
+                last_confirmed_in_catalog_at: None,
+            })
+            .unwrap();
+        }
+        let stamp = Utc::now();
+        let n = st
+            .update_each(vec![
+                (
+                    "aa".to_string(),
+                    Box::new(|t: &mut Torrent| {
+                        t.last_known_seeders = 7;
+                    }) as Box<dyn FnOnce(&mut Torrent)>,
+                ),
+                (
+                    "bb".to_string(),
+                    Box::new(move |t: &mut Torrent| {
+                        t.last_confirmed_in_catalog_at = Some(stamp);
+                    }),
+                ),
+                // Unknown hash: ignored, not an error.
+                (
+                    "zz".to_string(),
+                    Box::new(|t: &mut Torrent| {
+                        t.last_known_seeders = 99;
+                    }),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(n, 2, "only the two known hashes mutate");
+        assert_eq!(st.get("aa").unwrap().last_known_seeders, 7);
+        assert_eq!(
+            st.get("bb").unwrap().last_confirmed_in_catalog_at,
+            Some(stamp)
+        );
+        assert_eq!(st.get("cc").unwrap().last_known_seeders, 0);
+        // Reload: the single save carried both mutations.
+        let reloaded = State::load(&path).unwrap();
+        assert_eq!(reloaded.get("aa").unwrap().last_known_seeders, 7);
+        assert_eq!(
+            reloaded.get("bb").unwrap().last_confirmed_in_catalog_at,
+            Some(stamp)
+        );
+        // Nothing mutated -> no write at all.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(st.update_each(Vec::new()).unwrap(), 0);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime,
+            "an empty pass must not rewrite the file"
+        );
     }
 
     #[test]

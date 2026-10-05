@@ -778,20 +778,6 @@ impl LiveHandle {
     }
 }
 
-/// Snapshot the held set into live-query entries (title/hash/size/seeders).
-pub fn snapshot_entries(state: &crate::state::State) -> Vec<StateEntry> {
-    state
-        .all()
-        .into_iter()
-        .map(|t| StateEntry {
-            title: t.title,
-            info_hash: t.info_hash,
-            size_bytes: t.size_bytes,
-            last_known_seeders: t.last_known_seeders,
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone)]
 pub struct StateEntry {
     pub title: String,

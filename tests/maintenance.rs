@@ -11,28 +11,7 @@ use std::time::Duration;
 use common::{test_config, test_options, test_port, with_timeout, Fixture, Stub, StubState};
 
 fn setup(fixtures: &[Fixture]) -> (Stub, String, Vec<String>) {
-    let state = Arc::new(Mutex::new(StubState::default()));
-    let mut raws = Vec::new();
-    for f in fixtures {
-        raws.push((
-            f.clone(),
-            common::torrent_bytes(f, "http://127.0.0.1:9/announce"),
-        ));
-    }
-    let stub = Stub::start(Stub::catalog_xml(&[]), state.clone());
-    let tracker = stub.tracker_url();
-    let mut rows = Vec::new();
-    let mut hexes = Vec::new();
-    {
-        let mut st = state.lock().unwrap();
-        for (f, _) in &raws {
-            let (hex, _) = st.add(f, &tracker);
-            rows.push((f.title.clone(), hex.clone(), f.size));
-            hexes.push(hex);
-        }
-    }
-    let (catalog_base, _srv) = common::serve_catalog(Stub::catalog_xml(&rows));
-    std::mem::forget(_srv);
+    let (stub, catalog_base, hexes, _) = common::setup_with_catalog(fixtures);
     (stub, catalog_base, hexes)
 }
 

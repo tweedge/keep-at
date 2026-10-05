@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use keep_at::config::{Config, StorageLimit, StorageLocation};
 
+mod common;
+
 struct SmokeItem {
     title: &'static str,
     info_hash: &'static str,
@@ -82,72 +84,12 @@ fn test_config(data_dir: PathBuf, storage_dir: PathBuf, port: u16, rate: f64) ->
 
 /// Spin a tiny local HTTP server serving `xml` at /database.xml; returns base URL.
 ///
-/// Accepts unboundedly for the process lifetime, one thread per connection,
-/// reading until the request headers complete — same hardening as the shared
-/// fixture (a bounded accept count or a single `read()` per request flakes
-/// under load).
+/// Serve the catalog from the shared fixture (same hardening as the offline
+/// tests: unbounded accept, one thread per connection, read until the
+/// request headers complete). The local copy of that server and its request
+/// reader used to live here under the telling name `common_read_request`.
 fn serve_catalog(xml: String) -> (String, std::thread::JoinHandle<()>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind smoke catalog server");
-    let addr = listener.local_addr().unwrap();
-    let xml = std::sync::Arc::new(xml);
-    let handle = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { break };
-            let xml = xml.clone();
-            std::thread::spawn(move || {
-                use std::io::Write;
-                let mut stream = stream;
-                if common_read_request(&mut stream).is_err() {
-                    return;
-                }
-                let body = &*xml;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
-            });
-        }
-    });
-    (format!("http://{addr}"), handle)
-}
-
-/// Read one HTTP request (until the header terminator, EOF, or a size cap).
-fn common_read_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
-    use std::io::Read as _;
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 4096];
-    loop {
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 256 * 1024 {
-            break;
-        }
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-#[allow(dead_code)]
-fn wait_for_completion(data_dir: &std::path::Path, info_hash: &str, timeout: Duration) -> bool {
-    // Poll state.json: a torrent whose on-disk bytes reach nominal size counts
-    // as complete (plain storage: files land at final size, sparse).
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if let Ok(st) = keep_at::state::State::load(&data_dir.join("state.json")) {
-            if let Some(t) = st.get(info_hash) {
-                let dir = keep_at::engine::torrent_output_dir(&t.storage_location, &t.info_hash);
-                if keep_at::engine::dir_size_bytes(&dir) >= t.size_bytes && t.size_bytes > 0 {
-                    return true;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(2000));
-    }
-    false
+    common::serve_catalog(xml)
 }
 
 #[tokio::test(flavor = "multi_thread")]

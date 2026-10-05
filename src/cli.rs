@@ -535,13 +535,45 @@ pub fn resolve_census(args: &NetworkStatusArgs) -> Result<Config> {
         cfg.api_key = k.clone();
     }
     if let Some(r) = args.rate_limit {
-        // The daemon config path validates this in Config::validate; census
-        // flags bypass that, so reject non-positive/NaN here (NaN would
-        // panic the probe limiter; <=0 silently disables AT politeness).
-        if r.is_nan() || r <= 0.0 {
-            bail!("--rate-limit must be a positive finite number, got {r}");
-        }
+        // Same rule as the daemon's Config::validate (which census does not
+        // run wholesale: it has no storage/port concerns) — the shared
+        // check keeps a rate that would wedge a probe for months off this
+        // path too.
+        crate::config::check_rate_limit(r)?;
         cfg.scan.rate_limit_per_second = r;
     }
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod census_resolve_tests {
+    use super::*;
+
+    fn census_args(rate_limit: Option<f64>) -> NetworkStatusArgs {
+        NetworkStatusArgs {
+            common: CommonArgs {
+                config: None,
+                data_dir: None,
+            },
+            probe_timeout: None,
+            api_key: None,
+            rate_limit,
+        }
+    }
+
+    /// The census path used to validate its rate limit with a bare
+    /// "is it positive" check while `Config::validate` also enforces a
+    /// `MIN_RATE_LIMIT_PER_SECOND` floor: a config/flag of `1e-9` (one
+    /// request every ~31 years) wedges a scan/census and slipped through
+    /// `network-status`. Every entry point must apply the same rule.
+    #[test]
+    fn census_rate_limit_gets_the_same_floor_as_the_daemon() {
+        assert!(resolve_census(&census_args(Some(1e-9))).is_err());
+        assert!(resolve_census(&census_args(Some(0.0))).is_err());
+        assert!(resolve_census(&census_args(Some(f64::NAN))).is_err());
+        assert!(resolve_census(&census_args(Some(-1.0))).is_err());
+        // A sane rate passes; None keeps the config default.
+        assert!(resolve_census(&census_args(Some(10.0))).is_ok());
+        assert!(resolve_census(&census_args(None)).is_ok());
+    }
 }

@@ -196,6 +196,92 @@ async fn collapse_guard_zero_disables_and_removal_proceeds() {
     engine3.close().await;
 }
 
+/// A same-volume catalog that shares NO hashes with the held library: it
+/// parses cleanly and lists plenty of items, but the overlap with holdings
+/// is zero. This is the "perfectly-formed catalog with wrong rows" accident
+/// (RECOVERY.md) - a volume-count guard cannot see it, an intersection
+/// guard can.
+fn disjoint_catalog(row_count: usize) -> String {
+    let rows: Vec<(String, String, u64)> = (0..row_count)
+        .map(|i| (format!("stranger-{i}"), format!("{i:040x}"), 100_000u64))
+        .collect();
+    Stub::catalog_xml(&rows)
+}
+
+/// The collapse guard must key on held-and-still-listed overlap, not raw
+/// catalog item count. A catalog of N well-formed items that lists zero of
+/// what we hold is a schema accident, not a real mass deletion - and with
+/// `vanished_eviction_timeout: 0` (a documented, supported setting) the
+/// removal pass would otherwise wipe the library and its data on this very
+/// scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn disjoint_catalog_same_volume_must_not_wipe_library() {
+    let _dht_guard = DHT_STATE.lock().await;
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    hold_one_fixture(test_port(75), &data_dir, &storage_dir, "survivor").await;
+
+    let held_hash = engine_held_hash(&data_dir).expect("held hash present");
+    let out_dir = storage_dir.join(&held_hash);
+    assert!(
+        !data_files_recursive(&out_dir).is_empty(),
+        "sanity: seeded data exists at {out_dir:?}"
+    );
+
+    // 5 well-formed items, none of them ours. Against 1 held torrent and the
+    // default 30% guard, a volume-count check reads "5 >= 1" and stands
+    // aside; only an overlap check sees that the catalog lists 0 of 1 held.
+    let state = Arc::new(Mutex::new(StubState::default()));
+    let stub = Stub::start(Stub::catalog_xml(&[]), state.clone());
+    let (disjoint_base, _srv) = common::serve_catalog(disjoint_catalog(5));
+    std::mem::forget(_srv);
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(76),
+        1 << 30,
+    );
+    // Documented supported setting: no grace window, so a mistaken removal
+    // would land on this exact scan. The guard is the only thing standing
+    // between the schema accident and data loss.
+    cfg.scan.vanished_eviction_timeout = std::time::Duration::ZERO;
+    let mut engine = with_timeout(
+        60,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(
+            cfg,
+            test_options(&disjoint_base, &stub.base_url),
+        ),
+    )
+    .await
+    .expect("engine new");
+    with_timeout(120, "scan", engine.scan_once())
+        .await
+        .expect("scan");
+
+    let held_after = engine.held_torrents();
+    let after_files = data_files_recursive(&out_dir);
+    if held_after.is_empty() || after_files.is_empty() {
+        eprintln!(
+            "FLAKE DEBUG: held={held_after:?} state.json={} out_dir={} exists={}",
+            std::fs::read_to_string(data_dir.join("state.json")).unwrap_or_default(),
+            out_dir.display(),
+            out_dir.exists(),
+        );
+    }
+    assert!(
+        held_after.iter().any(|t| t.info_hash == held_hash),
+        "a zero-overlap same-volume catalog must not remove the held library \
+         (held_after={held_after:?})"
+    );
+    assert!(
+        !after_files.is_empty(),
+        "a zero-overlap same-volume catalog must not delete downloaded data"
+    );
+    engine.close().await;
+}
+
 /// Read the single held hash out of state.json (phase 1 wrote exactly one).
 fn engine_held_hash(data_dir: &std::path::Path) -> Option<String> {
     let data = std::fs::read_to_string(data_dir.join("state.json")).ok()?;

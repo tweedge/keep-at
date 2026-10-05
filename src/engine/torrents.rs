@@ -23,7 +23,6 @@ pub type ManagedTorrentHandle = Arc<librqbit::ManagedTorrent>;
 pub async fn add_torrent_bytes(
     session: &Arc<Session>,
     info_hash_hex: &str,
-    md: &crate::attorrent::TorrentMeta,
     output_dir: &Path,
     trackers: Vec<Vec<String>>,
     cache_path: &Path,
@@ -31,7 +30,6 @@ pub async fn add_torrent_bytes(
 ) -> Result<String> {
     let raw = std::fs::read(cache_path)
         .with_context(|| format!("loading cached .torrent for {info_hash_hex}"))?;
-    let _ = md;
     let opts = AddTorrentOptions {
         output_folder: Some(output_dir.to_string_lossy().into_owned()),
         overwrite: true,
@@ -129,23 +127,6 @@ pub fn find_torrent(
         }
     });
     Ok(found.into_inner())
-}
-
-/// Completed pieces and total pieces for stall tracking; None when the
-/// torrent isn't managed (treat as no progress signal).
-pub fn piece_progress(handle: &ManagedTorrentHandle) -> (u32, u32) {
-    let stats = handle.stats();
-    let total = stats.total_bytes; // bytes-based fallback below
-    let _ = total;
-    // TorrentStats exposes progress_bytes/total_bytes; piece counts come from
-    // chunk tracking when live. Use bytes as the progress signal: it grows
-    // if and only if new verified data lands.
-    (stats.progress_bytes as u32, stats.total_bytes as u32)
-}
-
-/// Whether the torrent is fully downloaded (seeding).
-pub fn is_finished(handle: &ManagedTorrentHandle) -> bool {
-    handle.stats().finished
 }
 
 fn parse_id20(hex_str: &str) -> Result<librqbit_core::Id20> {

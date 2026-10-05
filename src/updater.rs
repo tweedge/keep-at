@@ -118,6 +118,70 @@ async fn fetch_latest(
         })
 }
 
+/// What `self-update` should do given the latest release tag and the
+/// running version. Lives here, not in the binary, so the decision is the
+/// same code the tests exercise - the integration test used to replicate
+/// `cmd_self_update`'s `if`s verbatim and stayed green no matter what
+/// happened to the shipped guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateDecision {
+    /// Same version (tag spelling may differ, e.g. `v0.9` vs `0.9`).
+    AlreadyCurrent,
+    /// The "latest" release is not newer than what's running. Never update
+    /// sideways or backwards on EITHER channel: GitHub's release list is
+    /// ordered by created_at, not version, so a re-published older release
+    /// (this project re-tags for md5-verified promotions) is "newest" by
+    /// list position, and the stable channel can legitimately lag a running
+    /// beta (e.g. running 0.9.1-beta while stable is 0.9).
+    NotNewer,
+    /// A genuine upgrade.
+    Upgrade,
+}
+
+/// Decide whether `latest` should be installed over `current`.
+///
+/// The guard never blocks a genuine upgrade: `0.9` -> `0.9.1-beta` compares
+/// newer. See [`version_older_or_equal`] for the comparison rules.
+pub fn decide(latest: &str, current: &str) -> UpdateDecision {
+    if latest.trim_start_matches('v') == current.trim_start_matches('v') || latest == current {
+        return UpdateDecision::AlreadyCurrent;
+    }
+    if version_older_or_equal(latest, current) {
+        return UpdateDecision::NotNewer;
+    }
+    UpdateDecision::Upgrade
+}
+
+/// Compare dotted version strings (leading `v` stripped): true when `a` is
+/// older than or equal to `b`. Non-numeric segments compare as 0. Used to
+/// refuse downgrades on the stable channel (running beta vs lagging stable).
+pub fn version_older_or_equal(a: &str, b: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.trim_start_matches('v')
+            .split('.')
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+    let (pa, pb) = (parts(a), parts(b));
+    let n = pa.len().max(pb.len());
+    for i in 0..n {
+        let (x, y) = (
+            pa.get(i).copied().unwrap_or(0),
+            pb.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x < y;
+        }
+    }
+    true // equal
+}
+
 pub async fn latest_version(
     client: &reqwest::Client,
     user_agent: &str,
@@ -254,5 +318,34 @@ mod tests {
         assert_eq!(channel_of("v0.9.1-next"), None);
         assert_eq!(channel_of("nightly"), None);
         assert_eq!(channel_of(""), None);
+    }
+
+    #[test]
+    fn version_ordering() {
+        assert!(version_older_or_equal("v0.7.2", "0.8.6"));
+        assert!(version_older_or_equal("0.8.6", "0.8.6"));
+        assert!(version_older_or_equal("v0.8.6", "v0.8.6-beta"));
+        assert!(!version_older_or_equal("0.8.6", "v0.7.2"));
+        assert!(!version_older_or_equal("v0.9.0", "0.8.6"));
+        assert!(version_older_or_equal("1.2", "1.2.0"));
+    }
+
+    /// The self-update guard. This is the shipped decision - `cmd_self_update`
+    /// calls `decide` - so pinning it here is pinning production behavior,
+    /// not a replica of it.
+    #[test]
+    fn update_decision() {
+        use UpdateDecision::{AlreadyCurrent, NotNewer, Upgrade};
+        // Same version, tag spelling aside.
+        assert_eq!(decide("v0.9", "0.9"), AlreadyCurrent);
+        assert_eq!(decide("0.9", "0.9"), AlreadyCurrent);
+        // Never sideways or backwards on either channel.
+        assert_eq!(decide("v0.8", "0.9"), NotNewer);
+        assert_eq!(decide("v0.9", "0.9.1-beta"), NotNewer);
+        assert_eq!(decide("0.9.1-beta", "0.9.1-beta"), AlreadyCurrent);
+        // A genuine upgrade always goes through.
+        assert_eq!(decide("v0.9.1-beta", "0.9"), Upgrade);
+        assert_eq!(decide("v0.10", "0.9"), Upgrade);
+        assert_eq!(decide("1.0", "0.9.1-beta"), Upgrade);
     }
 }

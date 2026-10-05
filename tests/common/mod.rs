@@ -527,6 +527,39 @@ pub fn serve_catalog(xml: String) -> (String, std::thread::JoinHandle<()>) {
     (format!("http://{addr}"), handle)
 }
 
+/// Register the fixtures with a fresh stub and serve a catalog listing them
+/// all. Returns the stub, the catalog base URL, and the infohash of each
+/// fixture in order (plus the shared stub state for tests that need to
+/// inspect it).
+///
+/// This sequence is subtle — the tracker URL must exist before the fixture
+/// bytes are built (the announce URL is baked into the infohash), so a
+/// naive "register first" order silently collides every fixture's hash —
+/// and it was forked verbatim across four test files, each copy also doing
+/// a pointless pre-pass that built `.torrent` bytes it then threw away
+/// (`StubState::add` regenerates them with the real tracker URL). One
+/// spelling here, dead work gone.
+pub fn setup_with_catalog(
+    fixtures: &[Fixture],
+) -> (Stub, String, Vec<String>, Arc<Mutex<StubState>>) {
+    let state = Arc::new(Mutex::new(StubState::default()));
+    let stub = Stub::start(Stub::catalog_xml(&[]), state.clone());
+    let tracker = stub.tracker_url();
+    let mut rows = Vec::new();
+    let mut hexes = Vec::new();
+    {
+        let mut st = state.lock().unwrap();
+        for f in fixtures {
+            let (hex, _raw) = st.add(f, &tracker);
+            rows.push((f.title.clone(), hex.clone(), f.size));
+            hexes.push(hex);
+        }
+    }
+    let (catalog_base, _srv) = serve_catalog(Stub::catalog_xml(&rows));
+    std::mem::forget(_srv);
+    (stub, catalog_base, hexes, state)
+}
+
 /// Read one HTTP request: keep reading until the header block terminator
 /// arrives (a single `read()` can return a partial request when TCP splits
 /// it across segments — the resulting bogus path once made a stub serve 404

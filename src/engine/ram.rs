@@ -33,11 +33,6 @@ pub const PER_PIECE_RAM: u64 = 64;
 /// channel overhead; 48 KiB/peer is the measured-planning figure.
 pub const PER_PEER_RAM: u64 = 48 * 1024;
 
-/// Deprecated flat estimate, kept for the hard-cap log line only.
-pub fn per_torrent_ram() -> u64 {
-    crate::config::PER_TORRENT_RAM_BASE + 12 * 256 * 1024
-}
-
 /// RAM footprint of one torrent with `piece_count` pieces at `peer_limit`
 /// live peers. Unknown piece counts (0) price as 1 piece — never free.
 pub fn torrent_ram(piece_count: u32, peer_limit: usize) -> u64 {

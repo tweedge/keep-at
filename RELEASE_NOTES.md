@@ -1,33 +1,49 @@
 # keep-at release notes
 
-## v0.8.30-beta - broken-piece quarantine: stop silently-broken swarms burning bandwidth forever
+## v0.8.31-beta - selection-gate and library-safety fixes: catalog-collapse guard, one scarcity roll per candidate, eviction order
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
 
-### Broken-piece quarantine (the NotaBug incident shape)
+This release is a code-quality pass over the selection, eviction, and persistence core: no new features, but several places where the code did not do what its own documentation promised, including one that could delete a healthy library.
 
-Some swarms are quietly poisoned: the seeders hold data that contradicts the torrent's registered piece hashes (an uploader re-generated a README after creating the torrent — the actual Oct 2026 incident), so every client downloads a piece, fails its hash check, and retries from another peer forever: megabytes per second of download with zero progress. A real swarm ran like that for a week at ~2.3 GiB/h (~55 GiB/day) before anyone noticed.
+### The catalog-collapse guard now checks what it says it checks
 
-keep-at now watches the gap between received wire bytes and hash-validated bytes on every live torrent (rqbit's `fetched_bytes` vs `downloaded_and_checked_bytes`, counted since process start). A torrent that burns `scan.broken_piece_discard_bytes` (default `256M`) of received-but-never-validated bytes across `scan.broken_piece_min_windows` consecutive zero-progress watchdog passes (default 2, one pass per `scan.quarantine_check_interval`, default 30m) is a broken swarm. Any verified byte resets the counters, counter regressions (restarts) re-baseline, and in-flight bytes are credited when their piece completes — healthy-but-slow torrents never trip.
+The guard that stands between a bad catalog fetch and deleting your library was comparing the *total item count* of the fetched catalog against the number of torrents held - so a well-formed catalog of entirely the wrong entries (a schema accident, a redirect to a different feed, RECOVERY.md's "perfectly-formed catalog with wrong rows" case) sailed straight past it and the removed-from-catalog pass then deleted the held torrents **and their downloaded data**.
 
-A trip removes the torrent (data included) and records a cooldown entry in `<data_dir>/state.json` under `scan.quarantine_cooldown` (default 3d). The selection gate refuses the hash while the cooldown is active — even though the catalog keeps listing it. When the cooldown lapses, the next scan re-adds the torrent as a probe (bypassing the seed-scarcity roll, which would otherwise never re-admit a well-seeded broken swarm) into free space only: a speculative probe never displaces and deletes a healthy held torrent just to test upstream. If upstream fixed their seeders' data, the re-probe completes against the registered piece hashes and the quarantine lifts automatically; if the swarm is still broken it re-quarantines within about an hour and its attempts counter climbs toward `scan.quarantine_max_retries` (default 0 = unlimited; past the limit the cooldown becomes indefinite until you delete the entry from the `quarantined` map in state.json). `keep-at status` shows a `quarantined:` line while any hash is under cooldown; drops are recorded in history with the `quarantined` cause; entries whose hash is delisted, lapsed, and in neither the held set nor the session are garbage-collected automatically. See docs/CONFIG.md ("Broken-piece quarantine") for every knob.
+The guard now measures the overlap it was always documented to measure: what fraction of the held set the fresh catalog still lists. A same-volume catalog sharing no hashes with your library is refused exactly like a truncated one. This is the failure mode docs/RECOVERY.md describes; with `vanished_eviction_timeout: 0` (which disables the grace window) the old behavior wiped the library on the very next scan.
 
-### Scan loop: multi-day waits are no longer cut short by periodic ticks
+### One seed-scarcity roll per candidate, not one per storage location
 
-The post-boot scan wait (up to `scan.interval` after a recently completed scan) used a bare `select!` against the stats ticker, so the first periodic tick fired an early scan ~30 minutes into a multi-day wait — observed on the Sep 21 and Sep 26 boots. The run loop is now a single deadline-driven loop anchored to actual scan completions: ticks no longer end the wait, failed scans retry at the interval floor (never hot-loop), and periodic stats/watchdog passes run during the wait as well as between scans.
+The seed-scarcity gate is the polite-admission mechanism that keeps keep-at from piling onto already-healthy swarms. A candidate is supposed to get exactly one independent chance per scan (DESIGN.md). The swap path drew a fresh roll for every storage location it tried, so on a multi-location node - and on any node whose fill path was skipped because the torrent cap was reached, the disk was full, or the RAM budget was exhausted - a candidate got `1-(1-p)^k` chances to displace a *better-seeded* held torrent instead of the documented `p`. The roll is now drawn once per evaluation and shared by both placement paths.
 
-### Stall eviction: broken loops can no longer hide behind their seeders
+### Well-seeded swarms could be admitted with certainty
 
-The old rule shielded any incomplete torrent with live seeders from stall eviction forever — exactly how the broken-piece loop sat hidden for weeks. Incomplete torrents with seeders are now evictable after `scan.stall_eviction_timeout` (default 90d) without verified-byte progress, with two protections intact: a fully-present torrent is never evicted regardless of how stale its progress clock looks (rqbit's finished flag covers padding-file torrents, where progress tops out below the registered size), and torrents running an integrity check are exempt (post-crash boots run hundreds of these — without the exemption a boot would evict healthy data en masse). A held torrent the session lost (no cached .torrent) whose data is missing now evicts via a dir-size fallback instead of sitting in the library forever.
+`complete` in a tracker scrape parses to any 32-bit number, and the seed-scarcity exponent was being narrowed to a signed 32-bit integer for the power function. A reported seeder count past 2^31 wrapped the exponent negative and turned `aggressiveness^n` into infinity - i.e. "always admit this swarm", the exact inversion of the gate's purpose. The exponent is clamped now, and the resulting `chance` is always finite.
 
-### Persistence, validation, and upgrade hardening
+Worse, a non-finite `chance` made the history event unserializable, and the ledger **silently dropped** the record - so the poisoned add left no trace in `keep-at history`. History now logs loudly if an event ever fails to serialize instead of vanishing.
 
-- `completed_pieces` in state.json is now a full u64. The u32 cap saturated past 4 GiB and froze the stall clock at every scan for big torrents (every refresh looked like progress), so nothing large was ever stall-evicted. The one-way door bites only once a value above 4294967295 lands: `keep-at self-update` snapshots `state.json.pre-<version>` before replacing the binary, and old binaries refuse to load newer state — see docs/RECOVERY.md before downgrading.
-- state.json writes fsync the temp file and parent directory before the rename, so power loss can no longer leave a truncated state file that boot-loops the daemon under the watchdog.
-- Duration knobs validate to 0..=366 days and rate limits to >= 1e-6/s at startup — a bad config now fails loudly at boot instead of misbehaving. A YAML `null` on a duration knob no longer silently falls back to `scan.interval`'s default (this used to make `stall_eviction_timeout: null` mean 14 days instead of 90), and configs without a `scan:` section get real defaults instead of a zero scan interval and zero seed margin.
-- The quarantine watchdog's missed passes reschedule instead of bursting, so its zero-progress windows always count real intervals.
-- `keep-at history` and the history views see the rotated `.1` generation again (trip storms used to rotate events out of every view).
+### Zero-bias eviction dropped the most urgent swarm first
 
-### Upgrade notes
+With no size bias to order by (a location whose total size couldn't be read), eviction fell back to seeding order - and the ordering was inverted, evicting the *fewest*-seeded qualifying torrent first. That removes keep-at's support from the swarms that need it most, and is the reverse of both the documented legacy order and the ranking it is supposed to mirror. Fixed, with the pending ATTACK C regression test that had been noted but never written.
 
-Safe to roll over the running daemon the usual way (watchdog promote, or `keep-at self-update --beta`). No config changes required; the quarantine registry starts empty and is a strict no-op until the first trip. Operators who pinned duration knobs above 366 days (or rate limits below 1e-6/s) must adjust those first — validation now rejects them at boot.
+### Config files now reject bad values the way flags do
+
+`aggressiveness: 0`, `scan.rate_limit_per_second: 0`, and `port: 0` in a YAML config were silently rewritten to their defaults before validation, while the identical values on the command line were correctly refused. An operator writing `aggressiveness: 0` meaning "never auto-select anything" got a daemon quietly running at 0.6 and downloading. Omitted fields still get their defaults; explicit zeros now fail validation like every other entry point.
+
+The `network-status` rate limit also now gets the same floor as the daemon (a rate of one request per ~31 years used to be accepted and would wedge the probe), and its `.torrent` fetches are throttled like its scrapes - they used to go out in an unpolite burst ahead of a rate-limited scrape.
+
+### Operational fixes
+
+- A swap that displaced more torrents than it added left the in-scan fill gate counting too high, so later candidates in the same scan refused free space and walked the swap path until the next scan re-derived the count from state. The count now follows the real held set.
+- `network-status`'s node count mangled IPv6 peers: addresses were truncated at the first colon, collapsing every IPv6 peer sharing a first hextet into one bogus "node". The number is now a real distinct-IP count on IPv6 swarms.
+- The "AT-only" tracker filter matched on a substring, so a lookalike host such as `evilacademictorrents.com.attacker.net` was kept in the announce list - held torrents would have announced to it - while legitimate third-party trackers were dropped. It now matches the exact host or a real subdomain. The API key was never at risk: it is only ever attached to an exact https `academictorrents.com` URL.
+- The self-update downgrade guard is now tested against the code that ships. The integration test used to replicate `cmd_self_update`'s decision inline, so it stayed green no matter what happened to the real guard; the decision lives in `updater::decide` and both call it.
+- `keep-at` processes installed under a renamed binary (e.g. `my-keep-at`) were found by the process scan and then immediately called dead by the PID-file liveness check, because the two used different argv0 rules. One predicate now answers both.
+
+### Performance
+
+state.json was being fully rewritten and fsynced once per held torrent by two loops that run every scan - catalog confirmation and seeder refresh - which is up to twice the held count in full-file writes per scan (hundreds of rewrites and fsyncs per scan on a Pi/SD node with a large library). Both now apply the whole pass in a single write, matching what the watchdog progress pass already did.
+
+### Corrected documentation
+
+docs/DESIGN.md claimed the seeder session runs with DHT on; it has been off since a production heap leak was traced to the DHT subsystem (`notes/PROD-TEST-LOG.md`, 2026-09-21), and session.rs still carried a stale "DHT on" comment above the code that disables it. The stall-eviction rule was documented as "zero seeders AND no progress" when the code deliberately applies to any incomplete torrent regardless of swarm depth. The file-descriptor comments still described stock rqbit's one-fd-per-file storage, which `pool_storage` replaced with a bounded handle pool - the many-file admission guard is a documented conservative upper bound against that newer model, not an exact price.

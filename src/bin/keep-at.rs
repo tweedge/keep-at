@@ -491,24 +491,21 @@ async fn cmd_self_update(beta: bool, common: &keep_at::cli::CommonArgs) -> Resul
     let ua = keep_at::buildinfo::user_agent();
     let current = keep_at::buildinfo::VERSION;
     let latest = keep_at::updater::latest_version(&http, &ua, beta).await?;
-    if latest.trim_start_matches('v') == current.trim_start_matches('v') || latest == current {
-        println!("keep-at is already up to date ({current})");
-        return Ok(());
-    }
-    // Never "update" sideways or backwards - on EITHER channel: GitHub's
-    // release list is ordered by created_at, not version, so a re-published
-    // older release (this project re-tags for md5-verified promotions) is
-    // "newest" by list position, and the stable channel can legitimately
-    // lag a running beta (e.g. running 0.9.1-beta while stable is 0.9).
-    // Suggest --beta instead of downloading an older binary over a newer
-    // one. The guard never blocks a genuine upgrade: 0.9 -> 0.9.1-beta
-    // compares newer.
-    if version_older_or_equal(&latest, current) {
-        println!(
-            "latest {channel} release is {latest}, but this binary is {current} (newer). Nothing to do.",
-            channel = if beta { "beta" } else { "stable" }
-        );
-        return Ok(());
+    // The decision (and its rationale) lives in updater::decide so the
+    // integration tests exercise the shipped guard rather than a copy.
+    match keep_at::updater::decide(&latest, current) {
+        keep_at::updater::UpdateDecision::AlreadyCurrent => {
+            println!("keep-at is already up to date ({current})");
+            return Ok(());
+        }
+        keep_at::updater::UpdateDecision::NotNewer => {
+            println!(
+                "latest {channel} release is {latest}, but this binary is {current} (newer). Nothing to do.",
+                channel = if beta { "beta" } else { "stable" }
+            );
+            return Ok(());
+        }
+        keep_at::updater::UpdateDecision::Upgrade => {}
     }
     println!("updating keep-at {current} -> {latest}...");
     // Snapshot state.json BEFORE the binary is replaced: the new release
@@ -552,36 +549,6 @@ async fn cmd_self_update(beta: bool, common: &keep_at::cli::CommonArgs) -> Resul
     Ok(())
 }
 
-/// Compare dotted version strings (leading 'v' stripped): true when `a` is
-/// older than or equal to `b`. Non-numeric segments compare as 0. Used to
-/// refuse downgrades on the stable channel (running beta vs lagging stable).
-fn version_older_or_equal(a: &str, b: &str) -> bool {
-    fn parts(v: &str) -> Vec<u64> {
-        v.trim_start_matches('v')
-            .split('.')
-            .map(|p| {
-                p.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0)
-            })
-            .collect()
-    }
-    let (pa, pb) = (parts(a), parts(b));
-    let n = pa.len().max(pb.len());
-    for i in 0..n {
-        let (x, y) = (
-            pa.get(i).copied().unwrap_or(0),
-            pb.get(i).copied().unwrap_or(0),
-        );
-        if x != y {
-            return x < y;
-        }
-    }
-    true // equal
-}
-
 /// Can this process replace `exe` in place? Probes writability of the
 /// binary's directory (where the atomic-replace temp file lands) without
 /// writing anything lasting: if the directory isn't writable, self-update
@@ -598,21 +565,6 @@ fn can_replace_file(exe: &std::path::Path) -> Result<()> {
             Ok(())
         }
         Err(e) => Err(e).with_context(|| format!("{} is not writable", dir.display())),
-    }
-}
-
-#[cfg(test)]
-mod self_update_tests {
-    use super::version_older_or_equal;
-
-    #[test]
-    fn version_ordering() {
-        assert!(version_older_or_equal("v0.7.2", "0.8.6"));
-        assert!(version_older_or_equal("0.8.6", "0.8.6"));
-        assert!(version_older_or_equal("v0.8.6", "v0.8.6-beta"));
-        assert!(!version_older_or_equal("0.8.6", "v0.7.2"));
-        assert!(!version_older_or_equal("v0.9.0", "0.8.6"));
-        assert!(version_older_or_equal("1.2", "1.2.0"));
     }
 }
 

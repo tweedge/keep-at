@@ -99,14 +99,18 @@ fn size_bias_score(c: &Candidate, size_bias: f64, peer_limit: usize) -> f64 {
 /// lowest score first. This is the same adjusted ratio as
 /// [`size_bias_score`] (public so the engine's displaceable-set ordering
 /// stays identical to ranking by construction, not by duplication).
-/// Zero bias preserves the legacy order (largest seeders evicted first is
-/// handled by the caller only when bias is zero — see below).
+///
+/// Zero bias is the one place eviction is deliberately NOT the mirror of
+/// ranking: with no size signal there is no bytes-per-RAM order to invert,
+/// so eviction falls back to the legacy order, evicting the
+/// **highest**-seeded qualifying torrent first (drop support from the
+/// healthiest swarm, keep the under-seeded ones). Callers sort ascending
+/// and take from the front, so that order means the seeder count has to be
+/// *negated* here — returning it raw put the most urgent held torrent at
+/// the head of the eviction queue.
 pub fn eviction_score(c: &Candidate, size_bias: f64, peer_limit: usize) -> f64 {
     if size_bias == 0.0 {
-        // Legacy swap path evicted highest-seeded qualifying first; with no
-        // bias there is no size signal, so keep that order by returning the
-        // seeder count as the score. Callers pass seeders through.
-        return c.seeders as f64;
+        return -(c.seeders as f64);
     }
     size_bias_score(c, size_bias, peer_limit)
 }
@@ -114,11 +118,23 @@ pub fn eviction_score(c: &Candidate, size_bias: f64, peer_limit: usize) -> f64 {
 /// n: the probability keep-at proceeds with a candidate given its seeder
 /// count relative to the catalog's p10 floor:
 /// n = aggressiveness ^ max(0, seeders - floor).
+///
+/// The exponent is clamped to `i32::MAX` before `powi`: seeder counts come
+/// from tracker scrapes (untrusted — `complete` parses to any u32), and an
+/// `as i32` cast past 2^31 wraps the exponent negative, which turns
+/// `powi` into `1 / aggressiveness^|n|` = +inf and inverts the gate into
+/// "always admit". The result is always finite and in (0, 1].
 pub fn selection_chance(aggressiveness: f64, seeders: u32, seeder_floor: u32) -> f64 {
     let seeders = seeders.max(1);
     let floor = seeder_floor.max(1);
     let exponent = seeders.saturating_sub(floor);
-    aggressiveness.powi(exponent as i32)
+    let exponent = i32::try_from(exponent).unwrap_or(i32::MAX);
+    let chance = aggressiveness.powi(exponent);
+    debug_assert!(
+        chance.is_finite() && chance <= 1.0,
+        "selection_chance must be finite and <= 1, got {chance}"
+    );
+    chance
 }
 
 /// Nearest-rank p10 over positive seeder counts; 0 when nothing is seeded.
@@ -332,6 +348,27 @@ mod tests {
         }
     }
 
+    /// ATTACK C: at `size_bias == 0` there is no size signal to break ties,
+    /// so eviction falls back to the documented legacy order - the
+    /// *highest*-seeded qualifying torrent goes first (drop support from the
+    /// healthiest swarm, keep the under-seeded ones). `select_displaceable`
+    /// sorts by [`eviction_score`] ascending and takes from the front, so
+    /// the highest seeder must score LOWEST. Returning the raw seeder count
+    /// here used to invert that: the most urgent held torrent was evicted
+    /// first.
+    #[test]
+    fn zero_bias_evicts_highest_seeded_first() {
+        let well = cand(30, 100);
+        let poorly = cand(5, 100);
+        let sw = eviction_score(&well, 0.0, 8);
+        let sp = eviction_score(&poorly, 0.0, 8);
+        assert!(
+            sw < sp,
+            "zero bias must evict the highest-seeded qualifying torrent first: \
+             score(30 seeders)={sw} must be < score(5 seeders)={sp}"
+        );
+    }
+
     #[test]
     fn chance_math() {
         // floor 0/1 -> aggressiveness^(seeders-1)
@@ -341,6 +378,40 @@ mod tests {
         assert!((selection_chance(0.6, 3, 5) - 1.0).abs() < 1e-12);
         assert!((selection_chance(0.6, 5, 5) - 1.0).abs() < 1e-12);
         assert!((selection_chance(0.6, 6, 5) - 0.6).abs() < 1e-12);
+    }
+
+    /// A tracker-reported seeder count is untrusted input (`complete` parses
+    /// to any u32). `aggressiveness.powi(exponent as i32)` used to wrap the
+    /// exponent negative past 2^31, turning the gate INTO "always admit":
+    /// 0.6^(-n) is +inf, and `roll < +inf` is true for every roll. The gate
+    /// exists to back off from well-seeded swarms, so this inverts it on
+    /// exactly the input it exists for - and the resulting non-finite
+    /// `chance` then fails serde_json and silently drops the history entry.
+    #[test]
+    fn huge_seeder_count_must_not_invert_the_gate() {
+        // exponent = seeders - floor must exceed i32::MAX for the cast to
+        // wrap negative, so seeders has to clear 2^31 + floor.
+        let huge = (1u32 << 31) + 10;
+        let c = selection_chance(0.6, huge, 1);
+        assert!(
+            c.is_finite(),
+            "chance must stay finite for huge seeder counts, got {c}"
+        );
+        assert!(
+            c < 1.0,
+            "a {huge}-seeder swarm must be admitted with probability < 1, got {c}"
+        );
+        // And the decision must actually refuse it at a mid-range roll.
+        let mut cand = cand(1, 10);
+        cand.seeders = huge;
+        cand.seeder_floor = 1;
+        let d = evaluate_swap(&cand, &[], 2, 0.6, 0.5);
+        assert!(
+            !d.should_swap,
+            "a {huge}-seeder candidate must not be admitted (chance={}, roll={})",
+            d.chance, d.roll
+        );
+        assert!(d.chance.is_finite(), "decision chance must stay finite");
     }
 
     #[test]
