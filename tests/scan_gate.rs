@@ -423,3 +423,134 @@ async fn quarantine_probe_never_displaces_held() {
         "no removal recorded for the victim"
     );
 }
+
+/// The OTHER half of the probe rule, and the one nothing pinned: a lapsed
+/// quarantine re-probe must be admitted even when the seed-scarcity gate
+/// would refuse it outright.
+///
+/// `act_on_candidate` bypasses the roll for a probe (`roll = -1.0`), because
+/// the NotaBug shape is a *well-seeded* swarm holding bad data — its chance
+/// is `aggressiveness^(seeders - floor)`, which for a busy swarm underflows
+/// to exactly 0.0. Without the bypass the entry would sit lapsed forever,
+/// logs claiming "re-eligible" every scan while the hash never re-entered
+/// the session and the quarantine could never lift.
+///
+/// The sibling test above cannot see this: its probe fixture has 1 seeder,
+/// so its chance is already 1.0 and it passes with or without the bypass.
+/// This one runs a two-way A/B instead — a lapsed probe and a plain
+/// candidate that are identical down to their seeder counts, so only the
+/// bypass can separate them. Both are priced at chance = 0.0, which makes
+/// the outcome deterministic rather than a matter of odds: `roll < 0.0` is
+/// never true for a real roll in [0,1), while the bypass's `roll = -1.0`
+/// always is.
+#[tokio::test(flavor = "multi_thread")]
+async fn lapsed_quarantine_probe_bypasses_a_zero_chance_gate() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    // Same size and same seeders: the ONLY difference between these two is
+    // that one carries a lapsed quarantine entry.
+    let probe_fx = Fixture::new("probe-well-seeded", 100_000, 2000);
+    let control_fx = Fixture::new("control-well-seeded", 100_000, 2000);
+    let (_stub, _cat, hexes) = setup(&[probe_fx.clone(), control_fx.clone()]);
+    let (probe_hex, control_hex) = (hexes[0].clone(), hexes[1].clone());
+
+    // Pin the floor at 1 so the gate's exponent is (2000 - 1): with
+    // aggressiveness 0.5 that underflows f64 to exactly 0.0.
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    keep_at::netstats::save_snapshot(
+        &data_dir.join("network-stats.json"),
+        &keep_at::netstats::Snapshot {
+            scan_started_at: Some(chrono::Utc::now()),
+            scan_completed_at: Some(chrono::Utc::now()),
+            total_candidates: 0,
+            processed_candidates: 0,
+            seeder_floor: 1,
+        },
+    )
+    .expect("seed floor");
+
+    // Preconditions the whole test rests on, asserted rather than assumed.
+    assert_eq!(
+        keep_at::selector::selection_chance(0.5, 2000, 1),
+        0.0,
+        "a 2000-seeder swarm must price at chance exactly 0.0 - if this no \
+         longer underflows, the control half of this test is not a proof of \
+         anything and the fixtures need a higher seeder count"
+    );
+
+    // Lapsed cooldown: eligible for re-probe.
+    {
+        let mut st = keep_at::state::State::load(&data_dir.join("state.json")).expect("state");
+        st.quarantine_put(
+            probe_hex.clone(),
+            keep_at::state::Quarantine {
+                title: probe_fx.title.clone(),
+                reason: "discarded 1.5 GiB across 2 zero-progress passes (attempt 1)".to_string(),
+                quarantined_at: chrono::Utc::now() - chrono::Duration::try_hours(4).unwrap(),
+                cooldown_until: chrono::Utc::now() - chrono::Duration::try_seconds(1).unwrap(),
+                attempts: 1,
+                wasted_bytes: 1_500_000_000,
+            },
+        )
+        .expect("registry seed");
+    }
+
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(85),
+        150_000_000,
+    );
+    cfg.aggressiveness = 0.5;
+    cfg.scan.min_seed_margin = 4;
+    cfg.scan.quarantine_check_interval = Duration::ZERO; // watchdog off; gate only
+    let mut engine = with_timeout(
+        60,
+        "engine new",
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&_cat, &_stub.base_url)),
+    )
+    .await
+    .expect("engine new");
+    with_timeout(180, "scan", engine.scan_once())
+        .await
+        .expect("scan");
+
+    let held: Vec<String> = engine
+        .held_torrents()
+        .into_iter()
+        .map(|t| t.info_hash)
+        .collect();
+
+    assert!(
+        held.contains(&probe_hex),
+        "the lapsed probe must be admitted despite chance = 0.0 - this is the \
+         `roll = -1.0` bypass in act_on_candidate, without which a broken but \
+         well-seeded swarm can never re-enter the session and its quarantine \
+         can never lift. held: {held:?}"
+    );
+    assert!(
+        !held.contains(&control_hex),
+        "the identical non-probe candidate must be refused: at chance = 0.0 \
+         no roll in [0,1) can pass. If this holds, the probe assertion above \
+         proves the bypass and not a leaky gate. held: {held:?}"
+    );
+
+    // The bypass is admission, not displacement: with free space present and
+    // only these two candidates, nothing else may have been touched.
+    assert_eq!(
+        held.len(),
+        1,
+        "exactly the probe, nothing displaced: {held:?}"
+    );
+
+    let (events, skipped) = keep_at::history::read_events(&data_dir.join("history.jsonl"));
+    assert_eq!(skipped, 0);
+    let probe_adds = events
+        .iter()
+        .filter(|e| matches!(e, keep_at::history::Event::Add { hash, .. } if hash == &probe_hex))
+        .count();
+    assert_eq!(probe_adds, 1, "the probe is recorded as a real add");
+
+    engine.close().await;
+}
