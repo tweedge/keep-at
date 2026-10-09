@@ -907,7 +907,8 @@ impl Engine {
                     self.log_and_save_runtime("periodic");
                 }
                 _ = quarantine_tick.tick(), if quarantine_on => {
-                    self.quarantine_pass().await;
+                    let sd = shutdown.clone();
+                    self.quarantine_pass(&sd).await;
                 }
             }
         }
@@ -972,7 +973,170 @@ impl Engine {
     /// pass hash validation. Runs on `scan.quarantine_check_interval`
     /// between scans (and inside the inter-scan sleep); scans refresh the
     /// same bookkeeping. See notes/DESIGN-broken-piece-quarantine.md.
-    async fn quarantine_pass(&mut self) {
+    /// Re-probe lapsed quarantine entries — on the WATCHDOG's cadence.
+    ///
+    /// The cooldown expiry is documented to BE the periodic re-probe, but
+    /// the re-add used to live only inside the scan's candidate evaluation,
+    /// so "after the cooldown lapses" silently meant "…and up to a whole
+    /// scan interval later". On a 7-day scan cadence a 3-day cooldown
+    /// waited up to 10 days (observed on mercury: cooldown lapsed Oct 7,
+    /// next scan not due until Oct 10).
+    ///
+    /// Placement goes through [`Engine::act_on_candidate`] exactly like a
+    /// scan candidate, so the probe rules have ONE spelling rather than a
+    /// second copy: the seed-scarcity roll is bypassed (a broken-but-well-
+    /// seeded swarm prices at chance ≈ 0 and would otherwise never
+    /// re-enter the session), and the fill-only guard keeps a probe from
+    /// displacing a healthy held torrent.
+    ///
+    /// Probing deliberately does NOT increment `attempts`: that counter
+    /// counts quarantines (trips), so `quarantine_cooldown` remains the
+    /// clock pacing `quarantine_max_retries` escalation and probing sooner
+    /// cannot lock out a recoverable torrent any faster than before. The
+    /// cooldown IS re-armed per attempt, which is what bounds this to one
+    /// probe per cooldown period no matter how often the watchdog fires.
+    async fn quarantine_reprobe(&mut self, shutdown: &tokio::sync::watch::Receiver<bool>) {
+        let now = Utc::now();
+        // Lapsed entries whose hash is not already held: a held hash is
+        // already under test by that very probe, and the lift/trip branches
+        // above resolve it.
+        let mut lapsed: Vec<(String, state::Quarantine)> = self
+            .state
+            .quarantined_keys()
+            .into_iter()
+            .filter_map(|k| {
+                let q = self.state.quarantine_get(&k)?;
+                (now >= q.cooldown_until && self.state.get(&k).is_none()).then_some((k, q))
+            })
+            .collect();
+        if lapsed.is_empty() {
+            return;
+        }
+        lapsed.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Confirm the hash is still wanted before spending a download on a
+        // known-poisoned swarm. Same rule the registry GC applies: with no
+        // catalog fetched this boot we cannot tell, and dropping the
+        // re-probe entirely would strand the entry until a scan anyway.
+        let listed = match self.last_catalog.clone() {
+            Some(c) => c,
+            None => match self.catalog.load(self.cfg.scan.interval).await {
+                Ok((catalog, _fresh)) => {
+                    let set: std::collections::HashSet<String> = catalog
+                        .items
+                        .iter()
+                        .map(|i| hex::encode(i.info_hash))
+                        .collect();
+                    // Also unblocks the GC, which waits on exactly this.
+                    self.last_catalog = Some(set.clone());
+                    set
+                }
+                Err(e) => {
+                    tracing::warn!("quarantine re-probe skipped: catalog unavailable: {e:#}");
+                    return;
+                }
+            },
+        };
+
+        let seeder_floor = netstats::load_snapshot(&self.network_stats_path())
+            .map(|s| s.seeder_floor)
+            .unwrap_or(0);
+        let mut held_count = self.state.all().len();
+        let stats = ScanStats::default();
+        let cooldown = chrono::Duration::from_std(self.cfg.scan.quarantine_cooldown)
+            .unwrap_or_else(|_| chrono::Duration::weeks(520));
+
+        for (hex, q) in lapsed {
+            if self.state.get(&hex).is_some() {
+                continue;
+            }
+            if !listed.contains(&hex) {
+                tracing::debug!(
+                    "quarantine re-probe skipped for {} ({hex}): no longer in the catalog",
+                    q.title
+                );
+                continue;
+            }
+            tracing::info!(
+                "quarantine re-probe for {} ({hex}): cooldown lapsed after {} attempt(s); re-testing on the watchdog cadence",
+                q.title,
+                q.attempts
+            );
+            // Metadata first: the tracker list is what we scrape, and
+            // act_on_candidate re-reads it from cache anyway.
+            let md = match self.fetch_metadata(&hex).await {
+                Ok(md) => md,
+                Err(e) => {
+                    tracing::warn!("quarantine re-probe deferred for {}: {e:#}", q.title);
+                    continue;
+                }
+            };
+            // A scrape is required, not optional: the availability veto
+            // ("a probe with no live seed waits for the swarm to gain one")
+            // needs a real seeder count, and fabricating one would admit a
+            // dead swarm that can never make progress.
+            let hash = decode_hash(&hex).unwrap_or([0u8; 20]);
+            let sw = match self
+                .scrape_swarm(shutdown, &md.trackers, &hash, &stats)
+                .await
+            {
+                Ok(sw) => sw,
+                Err(e) => {
+                    tracing::warn!(
+                        "quarantine re-probe deferred for {} (scrape): {e:#}",
+                        q.title
+                    );
+                    continue;
+                }
+            };
+            let c = Candidate {
+                info_hash: hash,
+                title: q.title.clone(),
+                size_bytes: md.total_length,
+                piece_count: md.piece_count,
+                seeders: sw.seeders,
+                leechers: sw.leechers,
+                seeder_floor,
+            };
+            self.act_on_candidate(&c, &mut held_count, seeder_floor, &stats)
+                .await;
+            // Re-arm AFTER acting: act_on_candidate calls quarantine_gate,
+            // which would otherwise see a live cooldown and block the very
+            // probe we just decided to run.
+            // Re-arm floor: never sooner than the watchdog's own cadence.
+            // `quarantine_cooldown: 0` is a legal config meaning "no
+            // cooldown", which would otherwise re-probe a known-poisoned
+            // swarm on every watchdog tick - the exact waste the quarantine
+            // exists to stop. One probe per max(cooldown, tick) keeps that
+            // bounded however the knobs are set.
+            let floor = chrono::Duration::from_std(
+                self.cfg
+                    .scan
+                    .quarantine_check_interval
+                    .max(self.cfg.scan.quarantine_cooldown),
+            )
+            .unwrap_or_else(|_| chrono::Duration::weeks(520));
+            let until = now
+                .checked_add_signed(cooldown.max(floor))
+                .unwrap_or_else(|| crate::engine::quarantine::far_future(now));
+            if let Err(e) = self.state.quarantine_put(
+                hex.clone(),
+                state::Quarantine {
+                    cooldown_until: until,
+                    ..q
+                },
+            ) {
+                tracing::error!("failed to re-arm quarantine cooldown for {hex}: {e:#}");
+            }
+        }
+    }
+
+    /// Broken-piece quarantine watchdog pass: detect broken swarms, lift
+    /// entries whose re-probe completed, GC orphaned entries, and re-probe
+    /// lapsed ones. Public so tests can drive the pass deterministically
+    /// (the production caller is [`Engine::run`]'s periodic arm, whose
+    /// cadence floors at 60s).
+    pub async fn quarantine_pass(&mut self, shutdown: &tokio::sync::watch::Receiver<bool>) {
         if self.cfg.scan.quarantine_check_interval <= Duration::ZERO {
             return;
         }
@@ -1129,6 +1293,9 @@ impl Engine {
                 Ok(_) => {}
             }
         }
+        // Re-probe lapsed entries HERE, on the watchdog's cadence — not at
+        // scan time. Runs regardless of whether this pass tripped anything.
+        self.quarantine_reprobe(shutdown).await;
         if trips.is_empty() {
             // A lift or GC still changes the live quarantined count — push
             // it before bailing, or `status` shows a stale count until the

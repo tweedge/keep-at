@@ -340,3 +340,253 @@ async fn orphan_gc_body() {
         .expect("run task joins")
         .expect("run returns Ok");
 }
+
+/// A registry entry whose cooldown has LAPSED — eligible for re-probe.
+fn lapsed_quarantine_entry(title: &str, attempts: u32) -> keep_at::state::Quarantine {
+    keep_at::state::Quarantine {
+        title: title.to_string(),
+        reason: format!("discarded 300 MiB across 2 zero-progress passes (attempt {attempts})"),
+        quarantined_at: chrono::Utc::now() - chrono::Duration::try_hours(6).unwrap(),
+        cooldown_until: chrono::Utc::now() - chrono::Duration::try_minutes(5).unwrap(),
+        attempts,
+        wasted_bytes: 300 * 1024 * 1024,
+    }
+}
+
+/// The re-probe must run on the quarantine watchdog, not wait for a scan.
+///
+/// This is the regression the v0.8.31 deployment exposed: the cooldown
+/// expiry is documented to BE the periodic re-probe, but the re-add lived
+/// only inside the scan's candidate evaluation — so on a host with a 7-day
+/// scan interval a 3-day cooldown meant "re-probe after up to 10 days".
+/// Mercury sat in exactly that gap: cooldown lapsed Oct 7, next scan Oct 10.
+///
+/// No scan runs here (`scan.interval` is an hour away and the pass is
+/// driven directly), so anything added is the watchdog's doing.
+#[tokio::test(flavor = "multi_thread")]
+async fn watchdog_reprobes_lapsed_entry_without_a_scan() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    // 2000 seeders: the availability veto (at least one live seed) passes,
+    // but the seed-scarcity chance underflows to exactly 0.0 — so only the
+    // probe bypass can admit it. This makes the test pin the bypass too, not
+    // just the timer.
+    let fx = Fixture::new("lapsed-reprobe", 200_000, 2000);
+    let state = Arc::new(Mutex::new(StubState::default()));
+    let stub = Stub::start(Stub::catalog_xml(&[]), state.clone());
+    let raw = common::torrent_bytes(&fx, &stub.tracker_url());
+    let hex = common::torrent_info_hash(&raw);
+    {
+        let mut st = state.lock().unwrap();
+        st.torrents.insert(hex.clone(), raw.clone());
+        st.scrapes.insert(hex.clone(), (2000, 0));
+    }
+    let (catalog_base, _srv) = common::serve_catalog(Stub::catalog_xml(&[(
+        fx.title.clone(),
+        hex.clone(),
+        fx.size,
+    )]));
+    std::mem::forget(_srv);
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    let cache_dir = data_dir.join("torrent-cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join(format!("{hex}.torrent")), &raw).unwrap();
+    {
+        let mut st = keep_at::state::State::load(&data_dir.join("state.json")).expect("state");
+        st.quarantine_put(hex.clone(), lapsed_quarantine_entry(&fx.title, 1))
+            .expect("registry seed");
+    }
+
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(97),
+        1 << 30,
+    );
+    cfg.aggressiveness = 0.5; // 0.5^(2000-1) underflows to 0.0
+                              // A scan must not be able to explain the add: its next due is an hour
+                              // out, and we drive the watchdog pass directly.
+    cfg.scan.interval = Duration::from_secs(3600);
+    cfg.scan.quarantine_check_interval = Duration::from_secs(60);
+    // The sharp case: "no cooldown" is a legal config, and without a re-arm
+    // floor it would re-probe a known-poisoned swarm on every watchdog tick.
+    cfg.scan.quarantine_cooldown = Duration::ZERO;
+    let mut engine =
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&catalog_base, &stub.base_url))
+            .await
+            .expect("engine new");
+
+    let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+    engine.quarantine_pass(&sd_rx).await;
+
+    let held: Vec<String> = engine
+        .held_torrents()
+        .into_iter()
+        .map(|t| t.info_hash)
+        .collect();
+    assert!(
+        held.contains(&hex),
+        "the watchdog must re-probe a lapsed entry on its own timer, without a \
+         scan — a cooldown that only re-probes at scan time means a 3-day \
+         cooldown on a 7-day scan cadence waits up to 10 days. held: {held:?}"
+    );
+
+    // Probing is not a new attempt: attempts counts QUARANTINES (trips), and
+    // the 3-day cooldown stays the clock that paces retry exhaustion. If
+    // probing incremented attempts, probing sooner would exhaust max_retries
+    // faster and lock out a recoverable torrent.
+    let st = keep_at::state::State::load(&data_dir.join("state.json")).expect("state");
+    let q = st
+        .quarantine_get(&hex)
+        .expect("entry survives its own probe");
+    assert_eq!(q.attempts, 1, "a probe must NOT increment attempts");
+
+    // Churn guard: probing re-arms the cooldown, so the next probe is a
+    // cooldown away rather than on the next watchdog tick.
+    assert!(
+        q.cooldown_until > chrono::Utc::now(),
+        "the probe must re-arm the cooldown (floored at the watchdog cadence, \
+         so `quarantine_cooldown: 0` cannot churn) — otherwise a stuck probe \
+         is re-added every watchdog tick (cooldown_until={})",
+        q.cooldown_until
+    );
+
+    // Second pass must not double-add.
+    let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+    engine.quarantine_pass(&sd_rx).await;
+    let held2: Vec<String> = engine
+        .held_torrents()
+        .into_iter()
+        .map(|t| t.info_hash)
+        .collect();
+    assert_eq!(held2.len(), 1, "a second pass must not re-add: {held2:?}");
+    engine.close().await;
+}
+
+/// The safety rule must hold on the new timer path exactly as it does on the
+/// scan path: a probe is speculative and `try_swap` DELETES the displaced
+/// torrent's data, so a probe must never displace a healthy held torrent.
+///
+/// The setup is the mirror of tests/scan_gate.rs::quarantine_probe_never_displaces_held,
+/// which pins the same rule for the scan path — the victim fills the
+/// location first (phase 1), then a lapsed probe arrives that only fits by
+/// displacing it (phase 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn watchdog_probe_never_displaces_held() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    let held_fx = Fixture::new("held-safe", 100_000_000, 10);
+    let probe_fx = Fixture::new("probe-lapsed", 51_200_000, 5);
+    let state = Arc::new(Mutex::new(StubState::default()));
+    let stub = Stub::start(Stub::catalog_xml(&[]), state.clone());
+
+    let mut rows = Vec::new();
+    let mut raws = Vec::new();
+    for fx in [&held_fx, &probe_fx] {
+        let raw = common::torrent_bytes(fx, &stub.tracker_url());
+        let hex = common::torrent_info_hash(&raw);
+        {
+            let mut st = state.lock().unwrap();
+            st.torrents.insert(hex.clone(), raw.clone());
+            st.scrapes.insert(hex.clone(), (fx.seeders, 0));
+        }
+        rows.push((fx.title.clone(), hex.clone(), fx.size));
+        raws.push((hex, raw));
+    }
+    let (victim_hex, probe_hex) = (raws[0].0.clone(), raws[1].0.clone());
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let storage_dir = tempfile::tempdir().unwrap().keep();
+    let cache_dir = data_dir.join("torrent-cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    for (hex, raw) in &raws {
+        std::fs::write(cache_dir.join(format!("{hex}.torrent")), raw).unwrap();
+    }
+
+    // Phase 1: ONLY the victim is listed, so it fills the location alone
+    // (100 MB into a 150 MB limit leaves ~50 MB free).
+    let (cat1, _s1) = common::serve_catalog(Stub::catalog_xml(&[rows[0].clone()]));
+    std::mem::forget(_s1);
+    let mut cfg = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(98),
+        150_000_000,
+    );
+    // Force the scarcity gate open: this test is about displacement, and the
+    // victim must actually be held before there is anything to displace.
+    cfg.aggressiveness = 0.999999;
+    cfg.scan.interval = Duration::from_secs(3600);
+    cfg.scan.quarantine_check_interval = Duration::from_secs(60);
+    cfg.scan.min_seed_margin = 4;
+    let mut engine =
+        keep_at::engine::Engine::new_with_options(cfg, test_options(&cat1, &stub.base_url))
+            .await
+            .expect("engine new");
+    engine.scan_once().await.expect("scan holds the victim");
+    let out_dir = storage_dir.join(&victim_hex);
+    assert!(out_dir.exists(), "victim data on disk after phase 1");
+    engine.close().await;
+
+    // Phase 2: the lapsed probe is listed too. It needs 51.2 MB + buffer
+    // against ~50 MB free, so only a swap could fit it — and a swap would
+    // be legal on margin (probe 5 seeders vs victim 10 with margin 4), so
+    // the probe guard is the only thing standing between it and the victim.
+    {
+        let mut st = keep_at::state::State::load(&data_dir.join("state.json")).expect("state");
+        st.quarantine_put(
+            probe_hex.clone(),
+            lapsed_quarantine_entry(&probe_fx.title, 1),
+        )
+        .expect("registry seed");
+    }
+    let (cat2, _s2) = common::serve_catalog(Stub::catalog_xml(&rows));
+    std::mem::forget(_s2);
+    let mut cfg2 = test_config(
+        data_dir.clone(),
+        storage_dir.clone(),
+        test_port(99),
+        150_000_000,
+    );
+    cfg2.aggressiveness = 0.999999;
+    cfg2.scan.interval = Duration::from_secs(3600);
+    cfg2.scan.quarantine_check_interval = Duration::from_secs(60);
+    cfg2.scan.min_seed_margin = 4;
+    let mut engine2 =
+        keep_at::engine::Engine::new_with_options(cfg2, test_options(&cat2, &stub.base_url))
+            .await
+            .expect("engine2 new");
+
+    let (_sd_tx2, sd_rx2) = tokio::sync::watch::channel(false);
+    engine2.quarantine_pass(&sd_rx2).await;
+
+    let held: Vec<String> = engine2
+        .held_torrents()
+        .into_iter()
+        .map(|t| t.info_hash)
+        .collect();
+    assert!(
+        held.contains(&victim_hex),
+        "the healthy held torrent must survive a timer-driven re-probe (held: {held:?})"
+    );
+    assert!(
+        !held.contains(&probe_hex),
+        "the probe must be deferred, not added via swap — probes never displace          held torrents, on the timer path as on the scan path (held: {held:?})"
+    );
+    assert!(
+        out_dir.exists(),
+        "victim data intact — no displacement deleted it"
+    );
+
+    let st = keep_at::state::State::load(&data_dir.join("state.json")).expect("state");
+    assert_eq!(
+        st.quarantine_get(&probe_hex)
+            .expect("entry survives")
+            .attempts,
+        1,
+        "a deferred probe must not count as an attempt"
+    );
+    engine2.close().await;
+}
