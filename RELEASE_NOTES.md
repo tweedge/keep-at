@@ -1,5 +1,49 @@
 # keep-at release notes
 
+## v0.8.34-beta - vendored rqbit mainline: peers-map bound and 25 upstream fixes
+
+This is a beta release for field validation; the next stable cut will be identical apart from the version tag.
+
+keep-at no longer builds rqbit from crates.io. It now builds `librqbit`,
+`librqbit-bencode` and `librqbit-core` from a vendored branch of our rqbit
+fork (`vendor/` submodule; see `docs/VENDORING.md`), based on upstream
+mainline (v9.0.1 + 25 fixes) with our three open upstream PRs merged:
+
+- **#667 — bound the peers map.** `PeerStates` grew without bound: entries
+  were created for every incoming connection and every address learned from
+  trackers/DHT/PEX and never removed. On long-lived daemons this showed up as
+  creeping RSS. Incoming peers are now bounded and finished torrents with
+  upload disabled stop accepting them.
+- **#670 — deferred integrity checks (`check_after_load`) and an on-demand
+  recheck API.** Opt-in; keep-at's boot behavior is unchanged (every boot
+  still re-verifies the library). Also carries `fix(storage): re-open released
+  files on demand` and `fix(session): preserve streams across recheck`.
+- **#701 — BEP-52 hybrid `.pad/<length>` filenames.** Hybrid v1+v2 torrents
+  whose v1 compatibility list repeats a padding path are now accepted
+  (padding files are never materialized, so equal pad names are legal per
+  BEP 47/52). This replaces the minimal in-tree fix from v0.8.33-beta with
+  the full upstream-ready implementation and its end-to-end tests.
+
+Plus 25 upstream fixes since v9.0.1, notably: no panic in the incoming
+connection listener, `pwritev` past 2 GiB, chunk-tracker queue correctness,
+bencode recursion-depth limits, incoming-handshake capability detection, and
+several storage-wrapper regressions.
+
+### What did not change
+
+- Boot restore still re-verifies the library on every start; the deferred-check
+  API is available but not adopted.
+- Tracker/announce policy, quarantine, scanning, and selection behavior are
+  untouched; this release is dependency and correctness work.
+
+### Verification
+
+The vendored branch passes upstream's check sequence (`cargo check`, `fmt`,
+`clippy`, `test`) and keep-at's full test suite passes against it (123 lib
+tests plus every integration suite).
+
+
+
 ## v0.8.32-beta - quarantine re-probe runs on the watchdog, not at scan time
 
 This is a beta release for field validation; the next stable cut will be identical apart from the version tag.

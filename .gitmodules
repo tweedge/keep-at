@@ -1,0 +1,4 @@
+[submodule "vendor"]
+	path = vendor
+	url = https://github.com/tweedge/rqbit.git
+	branch = vendored-rqbit-9.0.1-keep-at-0

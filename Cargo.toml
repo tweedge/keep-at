@@ -1,6 +1,6 @@
 [package]
 name = "keep-at"
-version = "0.8.32"
+version = "0.8.34"
 edition = "2021"
 description = "A smart node that seeds Academic Torrents"
 license = "MIT"
@@ -63,3 +63,13 @@ strip = true
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# Vendored rqbit: keep-at builds the rqbit crates from the
+# vendored-rqbit-9.0.1-keep-at-0 branch of https://github.com/tweedge/rqbit
+# (upstream mainline + our pending upstream PRs) via the vendor/ submodule.
+# See docs/VENDORING.md for the branch naming scheme, contents, and upgrade
+# procedure.
+[patch.crates-io]
+librqbit = { path = "vendor/crates/librqbit" }
+librqbit-bencode = { path = "vendor/crates/bencode" }
+librqbit-core = { path = "vendor/crates/librqbit_core" }

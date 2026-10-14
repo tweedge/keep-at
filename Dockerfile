@@ -8,6 +8,7 @@ ARG TARGETARCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY vendor ./vendor
 RUN apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
     && rm -rf /var/lib/apt/lists/* \
     && case "$TARGETARCH" in \

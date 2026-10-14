@@ -362,6 +362,33 @@ mod tests {
         assert_eq!(md.total_length, 1000);
     }
 
+    #[test]
+    fn hybrid_duplicate_pad_paths_parse() {
+        // BEP-52 hybrid v1+v2 torrents put alignment padding in
+        // ".pad/<length>" with a BEP-47 "p" attr. Pad length is the FILE
+        // NAME, so two equal-length pads (the common case around same-sized
+        // files) collide - legitimately: padding is never materialized on
+        // disk, so the paths cannot clash. The parser must accept these
+        // (observed live: Cloud Telescope August 2023, 57 pads / 41 distinct
+        // paths, rejected as "duplicate filenames in torrent" and silently
+        // skipped at every resume), still count only real files for the fd
+        // guard, and still reject duplicate REAL filenames.
+        let pads_and_files = harness_padded_multi(
+            "hybrid",
+            &[("a.bin", 1000), ("b.bin", 1000)],
+            &[("42", 42), ("42", 42)],
+        );
+        let md = parse_torrent_bytes(&pads_and_files).expect("duplicate pad paths parse");
+        assert_eq!(md.file_count, 2);
+        assert_eq!(md.total_length, 2084);
+
+        let dup_real = harness_multi_named("dup", &[("same.bin", 10), ("same.bin", 10)]);
+        assert!(
+            parse_torrent_bytes(&dup_real).is_err(),
+            "duplicate real filenames must still be rejected"
+        );
+    }
+
     // Minimal local bencode helpers (mirrors of tests/common builders, kept
     // here so the unit test needs no harness dependency).
     fn bstr(b: &[u8]) -> Vec<u8> {
@@ -402,21 +429,77 @@ mod tests {
     }
 
     fn harness_multi(name: &str, lens: &[u64]) -> Vec<u8> {
+        let named: Vec<(String, u64)> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, len)| (format!("f{i}.bin"), *len))
+            .collect();
+        let refs: Vec<(&str, u64)> = named.iter().map(|(n, l)| (n.as_str(), *l)).collect();
+        harness_multi_named(name, &refs)
+    }
+
+    fn harness_multi_named(name: &str, files: &[(&str, u64)]) -> Vec<u8> {
         let pieces = vec![0u8; 20];
-        let mut files = vec![b'l'];
-        for (i, len) in lens.iter().enumerate() {
-            let fname = format!("f{i}.bin");
+        let mut flist = vec![b'l'];
+        for (fname, len) in files {
             let mut path = vec![b'l'];
             path.extend_from_slice(&bstr(fname.as_bytes()));
             path.push(b'e');
-            files.extend_from_slice(&bdict(&[
+            flist.extend_from_slice(&bdict(&[
                 (b"length".as_slice(), bint(*len as i64)),
                 (b"path".as_slice(), path),
             ]));
         }
-        files.push(b'e');
+        flist.push(b'e');
         let info = bdict(&[
-            (b"files".as_slice(), files),
+            (b"files".as_slice(), flist),
+            (b"name".as_slice(), bstr(name.as_bytes())),
+            (b"piece length".as_slice(), bint(16384)),
+            (b"pieces".as_slice(), bstr(&pieces)),
+        ]);
+        let mut top = vec![b'd'];
+        top.extend_from_slice(&bstr(b"announce"));
+        top.extend_from_slice(&bstr(b"http"));
+        top.extend_from_slice(&bstr(b"info"));
+        top.extend_from_slice(&info);
+        top.push(b'e');
+        top
+    }
+
+    /// Multi-file metainfo with BEP-47 padding entries: each pad is
+    /// ".pad/<len>" with attr "p", interleaved with the real files.
+    fn harness_padded_multi(name: &str, files: &[(&str, u64)], pads: &[(&str, u64)]) -> Vec<u8> {
+        let pieces = vec![0u8; 20];
+        let mut flist = vec![b'l'];
+        let push = |flist: &mut Vec<u8>, fname: &[&[u8]], len: i64, attr: Option<&[u8]>| {
+            let mut path = vec![b'l'];
+            for bit in fname {
+                path.extend_from_slice(&bstr(bit));
+            }
+            path.push(b'e');
+            let mut entries: Vec<(&[u8], Vec<u8>)> = vec![
+                (b"length".as_slice(), bint(len)),
+                (b"path".as_slice(), path),
+            ];
+            if let Some(a) = attr {
+                entries.push((b"attr".as_slice(), bstr(a)));
+            }
+            flist.extend_from_slice(&bdict(&entries));
+        };
+        for (fname, len) in files {
+            push(&mut flist, &[fname.as_bytes()], *len as i64, None);
+        }
+        for (fname, len) in pads {
+            push(
+                &mut flist,
+                &[b".pad", fname.as_bytes()],
+                *len as i64,
+                Some(b"p"),
+            );
+        }
+        flist.push(b'e');
+        let info = bdict(&[
+            (b"files".as_slice(), flist),
             (b"name".as_slice(), bstr(name.as_bytes())),
             (b"piece length".as_slice(), bint(16384)),
             (b"pieces".as_slice(), bstr(&pieces)),
