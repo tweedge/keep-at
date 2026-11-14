@@ -31,9 +31,11 @@ fn releases_list_url() -> String {
 /// decides channel membership, so a development build must keep it to
 /// stay off the stable channel.
 ///
-/// Legacy tags from before the scheme change still classify: two-component
-/// stable tags (`v0.7.2`) are stable, and suffixed beta tags
-/// (`v0.8.8-beta`) are beta via the suffix rule below.
+/// Every tag this project has published is three-component: legacy stable
+/// tags (`v0.1.0`..`v0.7.2`) and legacy beta tags (`v0.7.1-beta`,
+/// `v0.8.8-beta`) all classify by the same rules. Two-component tags are
+/// also accepted as stable, because the pre-1.0.0 documentation described
+/// the stable shape as `x.y` even though none was ever cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     Stable,
@@ -41,36 +43,43 @@ pub enum Channel {
 }
 
 /// Classify a tag into its release channel. Strips a leading `v`, then:
-/// a `-beta`/`-rc`/`-alpha` suffix means beta (covers both the current
-/// `x.y.z-beta` shape and legacy `x.y-beta` tags); no suffix with exactly
-/// two or three dot-separated components means stable (three since v1.0.0,
-/// two for legacy stable tags). Anything else (unknown suffixes, other
-/// component counts, unparseable shapes) is neither — failing closed so an
-/// unknown shape can never leak across channels.
+/// a `-beta`/`-rc`/`-alpha` suffix means beta; no suffix with two or three
+/// all-numeric dot-separated components means stable. Anything else
+/// (unknown suffixes, other component counts, non-numeric components) is
+/// neither — failing closed so an unknown shape can never leak across
+/// channels.
 pub fn channel_of(tag: &str) -> Option<Channel> {
     let t = tag.trim_start_matches('v');
     let (core, suffix) = match t.split_once('-') {
         Some((c, s)) => (c, Some(s)),
         None => (t, None),
     };
-    if let Some(s) = suffix {
-        let s = s.to_ascii_lowercase();
-        if s.starts_with("beta") || s.starts_with("rc") || s.starts_with("alpha") {
-            return Some(Channel::Beta);
-        }
-        // Unknown suffix: not ours, exclude from both channels — whatever
-        // the component count. (Development builds always ship -beta, so
-        // an unknown suffix is a shape this project does not publish.)
-        // Failing closed keeps an unknown shape from ever leaking across
-        // channels in either direction.
+    // A version core counts only if it has two or three components, each a
+    // plain number. Requiring numeric components (not just a component
+    // count) is what makes the fail-closed claim below real: `v1..0`,
+    // `v1.x.0` and `v1.0.0.1` are never classified.
+    let parts: Vec<&str> = core.split('.').collect();
+    let versionish = matches!(parts.len(), 2 | 3)
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if !versionish {
         return None;
     }
-    match core.split('.').count() {
-        // Two or three components, no suffix: a stable release (x.y.z
-        // since v1.0.0; two components covers legacy stable tags).
-        2 | 3 => Some(Channel::Stable),
-        // Anything else: fail closed — unclassified, never leaks.
-        _ => None,
+    match suffix {
+        Some(s) => {
+            let s = s.to_ascii_lowercase();
+            if s.starts_with("beta") || s.starts_with("rc") || s.starts_with("alpha") {
+                Some(Channel::Beta)
+            } else {
+                // Unknown suffix: not ours, exclude from both channels.
+                // (Development builds always ship -beta, so an unknown
+                // suffix is a shape this project does not publish.)
+                None
+            }
+        }
+        // No suffix: a stable release.
+        None => Some(Channel::Stable),
     }
 }
 
@@ -87,8 +96,8 @@ async fn fetch_latest(
     // Both channels resolve through the list endpoint with an explicit
     // tag-shape filter. The old stable path trusted /releases/latest
     // directly - whatever GitHub serves as "latest non-draft, non-prerelease"
-    // gets installed, so a mis-shaped release (a bare x.y.z published
-    // without the prerelease flag, or a legacy -beta published non-prerelease)
+    // gets installed, so a mis-shaped release (an unknown suffix published
+    // without the prerelease flag, or a -beta published non-prerelease)
     // crossed channels, and list order is created_at, not version, which
     // made a re-published older beta a downgrade candidate on the beta
     // channel too.
@@ -302,26 +311,35 @@ mod tests {
     #[test]
     fn channel_classification() {
         use Channel::{Beta, Stable};
-        // Current scheme: three components stable, three + suffix beta.
+        // Stable: three components, no suffix.
         assert_eq!(channel_of("v1.0.0"), Some(Stable));
         assert_eq!(channel_of("1.0.0"), Some(Stable));
         assert_eq!(channel_of("v1.2.3"), Some(Stable));
-        assert_eq!(channel_of("v1.0.1-beta"), Some(Beta));
-        assert_eq!(channel_of("v1.2.4-beta"), Some(Beta));
-        // Legacy stable tags (two components, pre-1.0.0 stable scheme).
+        // Legacy stable tags are also three-component.
+        assert_eq!(channel_of("v0.7.2"), Some(Stable));
+        assert_eq!(channel_of("v0.1.0"), Some(Stable));
+        // Two components count as stable too (the documented pre-1.0.0
+        // stable shape, even though no such tag was ever cut).
         assert_eq!(channel_of("v0.9"), Some(Stable));
         assert_eq!(channel_of("0.10"), Some(Stable));
-        // Legacy beta tags (two components + suffix, pre-scheme-change).
+        // Beta: three components plus a prerelease suffix (legacy betas
+        // share this shape).
+        assert_eq!(channel_of("v1.0.1-beta"), Some(Beta));
+        assert_eq!(channel_of("v1.2.4-beta"), Some(Beta));
         assert_eq!(channel_of("v0.8.34-beta"), Some(Beta));
         assert_eq!(channel_of("v0.8.8-beta"), Some(Beta));
         assert_eq!(channel_of("v0.7.2-rc"), Some(Beta));
         // Unknown shapes classify as neither (never leak across channels):
-        // unknown suffixes and other component counts are NOT ours, so they
-        // stay unclassified rather than risk crossing channels.
+        // unknown suffixes, wrong component counts, and non-numeric or empty
+        // components are NOT ours, so they stay unclassified rather than
+        // risk crossing channels.
         assert_eq!(channel_of("v0.9-experimental"), None);
         assert_eq!(channel_of("v0.9.1-next"), None);
         assert_eq!(channel_of("v1"), None);
         assert_eq!(channel_of("v1.0.0.1"), None);
+        assert_eq!(channel_of("v1..0"), None);
+        assert_eq!(channel_of("v1.x.0"), None);
+        assert_eq!(channel_of("v1.0.0-beta"), Some(Beta));
         assert_eq!(channel_of("nightly"), None);
         assert_eq!(channel_of(""), None);
     }

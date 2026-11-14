@@ -14,7 +14,7 @@ keep-at 1.0.0 is the first stable release since v0.7.2, and it promotes the Rust
 
 ### Versioning and self-update: stable tags are now `x.y.z`
 
-Stable releases are now three components (`v1.0.0`) and development builds are the same plus `-beta` (`v1.0.1-beta`); legacy two-component tags still classify (`v0.7.2` stable, `v0.8.8-beta` beta). This is a change from the previous "two components stable" rule, which would have classified a bare `v1.0.0` as neither channel and hidden this release from `self-update`.
+Stable releases are three components (`v1.0.0`) and development builds are the same plus `-beta` (`v1.0.1-beta`). Every earlier tag already has that shape (`v0.7.2` stable, `v0.8.8-beta` beta) and classifies under the same rules. What changes is the *classification rule*: the previous code treated a bare three-component tag as neither channel (only suffixed ones were recognized), which would have hidden `v1.0.0` from every `self-update` client. Unsuffixed two- or three-component version tags are now stable, with non-numeric components and unknown suffixes still failing closed.
 
 ### Upgrading from v0.7.2 (Go) or from 0.8.x-beta
 

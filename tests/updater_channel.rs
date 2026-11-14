@@ -98,8 +98,8 @@ async fn self_update_channel_guards() {
 
     // A list containing a mis-shaped tag (an unknown suffix, published
     // without the prerelease flag - GitHub would serve it as
-    // /releases/latest) alongside the real stable v1.0.0. Three-component
-    // tags WITHOUT a suffix are stable under the current scheme, so the
+    // /releases/latest) alongside the real stable v1.0.0. Unsuffixed
+    // three-component tags are stable under the current scheme, so the
     // fail-closed case is now an unrecognized shape, not a bare x.y.z.
     let non_stable = release_json("v1.1.0-experimental", asset, "http://127.0.0.1:1/x");
     let stable = release_json("v1.0.0", asset, "http://127.0.0.1:1/y");

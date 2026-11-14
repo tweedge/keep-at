@@ -84,7 +84,7 @@ And to update to the latest release:
 keep-at self-update
 ```
 
-By default this only considers stable releases (`x.y.z`, e.g. `v1.0.0`; legacy stable tags are `x.y`, e.g. `v0.7.2`). To track development builds (`x.y.z-beta`, e.g. `v1.0.1-beta`), add `--beta`:
+By default this only considers stable releases (`x.y.z`, e.g. `v1.0.0`, and legacy tags like `v0.7.2`). To track development builds (`x.y.z-beta`, e.g. `v1.0.1-beta`), add `--beta`:
 
 ```
 keep-at self-update --beta
@@ -220,7 +220,7 @@ The smoke test downloads two real files from Academic Torrents (a few KB each) i
 
 ## Releasing
 
-Update `RELEASE_NOTES.md` at the repo root, commit it, then push a matching version tag. Versioning scheme: stable releases are `x.y.z` (e.g. `v1.0.0`), development builds are `x.y.z-beta` (e.g. `v1.0.1-beta`) — three components, with the `-beta` suffix distinguishing development builds from stable ones. Legacy `x.y` tags (e.g. `v0.7.2`) still classify as stable and legacy `x.y-beta` tags as beta. Always soft-wrap every markdown file in the repo - each paragraph or bullet on one line, no matter how long, letting the renderer wrap it - never hard-wrap with manual line breaks partway through a paragraph. GitHub's release view renders single trailing newlines as literal breaks, so a hard-wrapped paragraph shows up as a jagged staircase instead of a normal paragraph.
+Update `RELEASE_NOTES.md` at the repo root, commit it, then push a matching version tag. Versioning scheme: stable releases are `x.y.z` (e.g. `v1.0.0`), development builds are `x.y.z-beta` (e.g. `v1.0.1-beta`) — three components, with the `-beta` suffix distinguishing development builds from stable ones. All earlier tags are three-component too (`v0.7.2` stable, `v0.8.8-beta` beta) and classify under the same rules. Always soft-wrap every markdown file in the repo - each paragraph or bullet on one line, no matter how long, letting the renderer wrap it - never hard-wrap with manual line breaks partway through a paragraph. GitHub's release view renders single trailing newlines as literal breaks, so a hard-wrapped paragraph shows up as a jagged staircase instead of a normal paragraph.
 
 `RELEASE_NOTES.md` describes ONLY the release being cut: a single `## <tag>` section at the top of the file, containing that release's changes and nothing else. Never accumulate past releases in the file - earlier releases' notes live in their GitHub releases and in git history, not in the current release's notes (an earlier workflow published the whole file with every release, which rolled years of notes into each release page; the workflow now extracts exactly the `## <tag>` section and fails the release if it is missing, so this cannot recur). Keep the standard beta preamble line as the first line of the section for beta tags.
 
