@@ -43,11 +43,12 @@ pub enum Channel {
 }
 
 /// Classify a tag into its release channel. Strips a leading `v`, then:
-/// a `-beta`/`-rc`/`-alpha` suffix means beta; no suffix with two or three
-/// all-numeric dot-separated components means stable. Anything else
-/// (unknown suffixes, other component counts, non-numeric components) is
-/// neither — failing closed so an unknown shape can never leak across
-/// channels.
+/// the version core must first be two or three all-numeric dot-separated
+/// components; given that core, a `-beta`/`-rc`/`-alpha` suffix means beta
+/// and no suffix means stable. Anything else (unknown suffixes, other
+/// component counts, non-numeric or empty components — even with a beta
+/// suffix) is neither — failing closed so an unknown shape can never leak
+/// across channels.
 pub fn channel_of(tag: &str) -> Option<Channel> {
     let t = tag.trim_start_matches('v');
     let (core, suffix) = match t.split_once('-') {
@@ -329,17 +330,20 @@ mod tests {
         assert_eq!(channel_of("v0.8.34-beta"), Some(Beta));
         assert_eq!(channel_of("v0.8.8-beta"), Some(Beta));
         assert_eq!(channel_of("v0.7.2-rc"), Some(Beta));
+        assert_eq!(channel_of("v1.0.0-beta"), Some(Beta));
         // Unknown shapes classify as neither (never leak across channels):
         // unknown suffixes, wrong component counts, and non-numeric or empty
         // components are NOT ours, so they stay unclassified rather than
-        // risk crossing channels.
+        // risk crossing channels. The numeric-core gate applies before the
+        // suffix rule, so a beta suffix cannot rescue a malformed core.
         assert_eq!(channel_of("v0.9-experimental"), None);
         assert_eq!(channel_of("v0.9.1-next"), None);
         assert_eq!(channel_of("v1"), None);
         assert_eq!(channel_of("v1.0.0.1"), None);
         assert_eq!(channel_of("v1..0"), None);
         assert_eq!(channel_of("v1.x.0"), None);
-        assert_eq!(channel_of("v1.0.0-beta"), Some(Beta));
+        assert_eq!(channel_of("v1-beta"), None);
+        assert_eq!(channel_of("v1.x.0-beta"), None);
         assert_eq!(channel_of("nightly"), None);
         assert_eq!(channel_of(""), None);
     }
