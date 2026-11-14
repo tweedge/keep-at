@@ -96,11 +96,13 @@ async fn self_update_channel_guards() {
     let client = http_client();
     let ua = "keep-at-test";
 
-    // A list containing a bare three-component tag (v0.9.1, published
+    // A list containing a mis-shaped tag (an unknown suffix, published
     // without the prerelease flag - GitHub would serve it as
-    // /releases/latest) alongside the real stable v0.8.9.
-    let non_stable = release_json("v0.9.1", asset, "http://127.0.0.1:1/x");
-    let stable = release_json("v0.9", asset, "http://127.0.0.1:1/y");
+    // /releases/latest) alongside the real stable v1.0.0. Three-component
+    // tags WITHOUT a suffix are stable under the current scheme, so the
+    // fail-closed case is now an unrecognized shape, not a bare x.y.z.
+    let non_stable = release_json("v1.1.0-experimental", asset, "http://127.0.0.1:1/x");
+    let stable = release_json("v1.0.0", asset, "http://127.0.0.1:1/y");
     let routes: Routes = Arc::new(Mutex::new(
         [(
             "/releases".to_string(),
@@ -116,7 +118,7 @@ async fn self_update_channel_guards() {
         .await
         .expect("latest");
     assert_eq!(
-        latest, "v0.9",
+        latest, "v1.0.0",
         "stable channel must pick the stable-classified tag, never the mis-shaped one"
     );
     drop(handle);

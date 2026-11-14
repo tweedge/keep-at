@@ -25,14 +25,15 @@ fn releases_list_url() -> String {
     std::env::var("KEEPAT_RELEASES_LIST_URL").unwrap_or_else(|_| RELEASES_LIST_URL.to_string())
 }
 
-/// Versioning scheme: stable releases are `x.y` (two components, e.g.
-/// `v0.9`), development builds are `x.y.z-beta` (three components plus the
-/// `-beta` suffix for GitHub clarity, e.g. `v0.9.1-beta`). The suffix is
-/// display-only: channel membership is decided by component COUNT, so a
-/// missing suffix can never promote a beta to stable.
+/// Versioning scheme: stable releases are `x.y.z` (three components, e.g.
+/// `v1.0.0`), development builds are `x.y.z-beta` (the same three
+/// components plus a `-beta` suffix, e.g. `v1.0.1-beta`). The suffix
+/// decides channel membership, so a development build must keep it to
+/// stay off the stable channel.
 ///
-/// Legacy tags (`v0.8.8-beta`, two components + suffix, from before the
-/// scheme change) classify as beta via the suffix rule below.
+/// Legacy tags from before the scheme change still classify: two-component
+/// stable tags (`v0.7.2`) are stable, and suffixed beta tags
+/// (`v0.8.8-beta`) are beta via the suffix rule below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     Stable,
@@ -40,11 +41,12 @@ pub enum Channel {
 }
 
 /// Classify a tag into its release channel. Strips a leading `v`, then:
-/// a `-beta`/`-rc`/`-alpha` suffix means beta (covers both the new
+/// a `-beta`/`-rc`/`-alpha` suffix means beta (covers both the current
 /// `x.y.z-beta` shape and legacy `x.y-beta` tags); no suffix with exactly
-/// two dot-separated components means stable. Anything else (bare
-/// three-component tags, unknown suffixes, unparseable shapes) is neither —
-/// failing closed so an unknown shape can never leak across channels.
+/// two or three dot-separated components means stable (three since v1.0.0,
+/// two for legacy stable tags). Anything else (unknown suffixes, other
+/// component counts, unparseable shapes) is neither — failing closed so an
+/// unknown shape can never leak across channels.
 pub fn channel_of(tag: &str) -> Option<Channel> {
     let t = tag.trim_start_matches('v');
     let (core, suffix) = match t.split_once('-') {
@@ -57,17 +59,17 @@ pub fn channel_of(tag: &str) -> Option<Channel> {
             return Some(Channel::Beta);
         }
         // Unknown suffix: not ours, exclude from both channels — whatever
-        // the component count. (A bare three-component tag without suffix
-        // is likewise NOT ours: the scheme always ships -beta on
-        // development builds. Failing closed keeps an unknown shape from
-        // ever leaking across channels in either direction.)
+        // the component count. (Development builds always ship -beta, so
+        // an unknown suffix is a shape this project does not publish.)
+        // Failing closed keeps an unknown shape from ever leaking across
+        // channels in either direction.
         return None;
     }
     match core.split('.').count() {
-        // Two components, no suffix: a stable release (x.y).
-        2 => Some(Channel::Stable),
-        // Three components WITHOUT suffix: NOT ours (development builds
-        // always ship -beta). Fail closed — unclassified, never leaks.
+        // Two or three components, no suffix: a stable release (x.y.z
+        // since v1.0.0; two components covers legacy stable tags).
+        2 | 3 => Some(Channel::Stable),
+        // Anything else: fail closed — unclassified, never leaks.
         _ => None,
     }
 }
@@ -300,22 +302,26 @@ mod tests {
     #[test]
     fn channel_classification() {
         use Channel::{Beta, Stable};
-        // New scheme: two components stable, three + suffix beta.
+        // Current scheme: three components stable, three + suffix beta.
+        assert_eq!(channel_of("v1.0.0"), Some(Stable));
+        assert_eq!(channel_of("1.0.0"), Some(Stable));
+        assert_eq!(channel_of("v1.2.3"), Some(Stable));
+        assert_eq!(channel_of("v1.0.1-beta"), Some(Beta));
+        assert_eq!(channel_of("v1.2.4-beta"), Some(Beta));
+        // Legacy stable tags (two components, pre-1.0.0 stable scheme).
         assert_eq!(channel_of("v0.9"), Some(Stable));
         assert_eq!(channel_of("0.10"), Some(Stable));
-        assert_eq!(channel_of("v1.0"), Some(Stable));
-        assert_eq!(channel_of("v0.9.1-beta"), Some(Beta));
-        assert_eq!(channel_of("v0.10.2-beta"), Some(Beta));
-        assert_eq!(channel_of("v1.0.1-beta"), Some(Beta));
-        // Legacy tags (two components + suffix, pre-scheme-change).
+        // Legacy beta tags (two components + suffix, pre-scheme-change).
+        assert_eq!(channel_of("v0.8.34-beta"), Some(Beta));
         assert_eq!(channel_of("v0.8.8-beta"), Some(Beta));
         assert_eq!(channel_of("v0.7.2-rc"), Some(Beta));
         // Unknown shapes classify as neither (never leak across channels):
-        // a bare three-component tag or an unknown suffix is NOT ours, so
-        // both stay unclassified rather than risk promoting them.
-        assert_eq!(channel_of("v0.9.1"), None);
+        // unknown suffixes and other component counts are NOT ours, so they
+        // stay unclassified rather than risk crossing channels.
         assert_eq!(channel_of("v0.9-experimental"), None);
         assert_eq!(channel_of("v0.9.1-next"), None);
+        assert_eq!(channel_of("v1"), None);
+        assert_eq!(channel_of("v1.0.0.1"), None);
         assert_eq!(channel_of("nightly"), None);
         assert_eq!(channel_of(""), None);
     }
