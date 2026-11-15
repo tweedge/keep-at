@@ -84,7 +84,7 @@ And to update to the latest release:
 keep-at self-update
 ```
 
-By default this only considers stable releases (`x.y`, e.g. `v0.9`). To track development builds (`x.y.z-beta`, e.g. `v0.9.1-beta`), add `--beta`:
+By default this only considers stable releases (`x.y.z`, e.g. `v1.0.0`, and legacy tags like `v0.7.2`). To track development builds (`x.y.z-beta`, e.g. `v1.0.1-beta`), add `--beta`:
 
 ```
 keep-at self-update --beta
@@ -220,20 +220,20 @@ The smoke test downloads two real files from Academic Torrents (a few KB each) i
 
 ## Releasing
 
-Update `RELEASE_NOTES.md` at the repo root, commit it, then push a matching version tag. Versioning scheme: stable releases are `x.y` (e.g. `v0.9`), development builds are `x.y.z-beta` (e.g. `v0.9.1-beta`) — two components stable, three plus the `-beta` suffix beta. Always soft-wrap every markdown file in the repo - each paragraph or bullet on one line, no matter how long, letting the renderer wrap it - never hard-wrap with manual line breaks partway through a paragraph. GitHub's release view renders single trailing newlines as literal breaks, so a hard-wrapped paragraph shows up as a jagged staircase instead of a normal paragraph.
+Update `RELEASE_NOTES.md` at the repo root, commit it, then push a matching version tag. Versioning scheme: stable releases are `x.y.z` (e.g. `v1.0.0`), development builds are `x.y.z-beta` (e.g. `v1.0.1-beta`) — three components, with the `-beta` suffix distinguishing development builds from stable ones. All earlier tags are three-component too (`v0.7.2` stable, `v0.8.8-beta` beta) and classify under the same rules. Always soft-wrap every markdown file in the repo - each paragraph or bullet on one line, no matter how long, letting the renderer wrap it - never hard-wrap with manual line breaks partway through a paragraph. GitHub's release view renders single trailing newlines as literal breaks, so a hard-wrapped paragraph shows up as a jagged staircase instead of a normal paragraph.
 
 `RELEASE_NOTES.md` describes ONLY the release being cut: a single `## <tag>` section at the top of the file, containing that release's changes and nothing else. Never accumulate past releases in the file - earlier releases' notes live in their GitHub releases and in git history, not in the current release's notes (an earlier workflow published the whole file with every release, which rolled years of notes into each release page; the workflow now extracts exactly the `## <tag>` section and fails the release if it is missing, so this cannot recur). Keep the standard beta preamble line as the first line of the section for beta tags.
 
 ```
-git tag v0.9
-git push origin v0.9
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 or for a development beta:
 
 ```
-git tag v0.9.1-beta
-git push origin v0.9.1-beta
+git tag v1.0.1-beta
+git push origin v1.0.1-beta
 ```
 
 Two GitHub Actions workflows watch for tags matching `v*.*.*`: `.github/workflows/release.yml` cross-compiles Linux targets in `scripts/build-release.sh` (glibc-linked binaries for amd64/arm64/arm/386) and publishes them as a GitHub release using `RELEASE_NOTES.md` as the release notes, and `.github/workflows/docker.yml` builds a multi-arch (amd64/arm64) image and pushes it to `ghcr.io/tweedge/keep-at` tagged with the version, the `major.minor`, and `latest`. Neither needs any repo secrets - both run entirely on the `GITHUB_TOKEN` Actions provides automatically.

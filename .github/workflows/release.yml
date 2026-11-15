@@ -2,13 +2,14 @@ name: release
 
 # Builds Linux binaries (glibc-linked) and publishes them as a GitHub release
 # whenever a version tag is pushed. Versioning scheme: stable releases are
-# `x.y` (e.g. v0.9), development builds are `x.y.z-beta` (e.g. v0.9.1-beta).
-# Three-component tags publish as GitHub prereleases, so the updater's
-# default (non-beta) mode — which resolves via /releases/latest, skipping
-# prereleases — never pulls a development build. Examples:
+# `x.y.z` (e.g. v1.0.0), development builds are `x.y.z-beta` (e.g. v1.0.1-beta).
+# Suffixed tags publish as GitHub prereleases, and the updater's default
+# (non-beta) mode selects stable-classified tags from the releases list
+# (suffix-based, ignoring GitHub's prerelease flag), so it never pulls a
+# development build. Examples:
 #
-#   git tag v0.9 && git push origin v0.9           # stable
-#   git tag v0.9.1-beta && git push origin v0.9.1-beta  # development beta
+#   git tag v1.0.0 && git push origin v1.0.0            # stable
+#   git tag v1.0.1-beta && git push origin v1.0.1-beta  # development beta
 #
 # Needs no repo secrets: GITHUB_TOKEN is provided automatically by
 # Actions, and the `contents: write` permission below is what lets this
@@ -84,9 +85,9 @@ jobs:
           notes_file="release-notes-extracted.md"
           args=()
           # Development builds (x.y.z-beta) publish as GitHub prereleases
-          # so plain `keep-at self-update` never pulls them; stable x.y
+          # so plain `keep-at self-update` never pulls them; stable x.y.z
           # tags publish as full releases. The tag shape is the source of
-          # truth (mirrors updater::channel_of), not a suffix allowlist.
+          # truth (mirrors updater::channel_of).
           case "$tag" in
             *-beta|*-rc|*-alpha) args+=(--prerelease) ;;
           esac
